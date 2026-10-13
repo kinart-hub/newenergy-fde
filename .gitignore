@@ -1,0 +1,48 @@
+# 本机运行产物 —— 绝不上库
+output/
+dist/
+
+# 知识库：候选队列与自动备份属于运行态，出厂版本不带
+knowledge/inbox.jsonl
+knowledge/backups/
+knowledge/*.bak
+knowledge/*.bak-*
+
+# Tenant（企业内部知识的私有空间，各企业自建）
+tenants/*/knowledge/
+tenants/*/inbox.jsonl
+tenants/*/backups/
+
+# 运行态锁目录（进程被 kill 后会残留，绝不能进版本库）
+.lock/
+*.tmp-*
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 分析中间结果
+*_result.json
+r.json
+.eval_tmp/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+
+# 本地笔记（不进公开仓库）
+_local/
+*.local.md
+
+# ── 商业授权：签发私钥与客户许可证，绝对不能进版本库 ──
+# 私钥一旦进过 git，即使之后删除，历史里也永远留着，必须重新生成密钥对。
+_private/
+*.key
+license_key.json
+.license_state.json

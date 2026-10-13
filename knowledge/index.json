@@ -1,0 +1,94 @@
+{
+  "name": "新能源工艺知识库清单",
+  "doc_version": "1.0.0",
+  "assets": {
+    "specs": {
+      "path": "knowledge/process_specs.json",
+      "role": "机器可读：参数/工序/缺陷机理/数据索取规则",
+      "count": 141,
+      "version": "1.1.2",
+      "updated": "2026-10-10"
+    },
+    "cases": {
+      "path": "knowledge/improvement_library.json",
+      "role": "机器可读：现场验证过的改善措施库（PDCA/PFMEA）",
+      "count": 1,
+      "version": "1.0.1",
+      "updated": "2026-10-10"
+    },
+    "interp": {
+      "path": "knowledge/interp_rules.json",
+      "role": "机器可读：判读规则与分析方法条目",
+      "count": 4,
+      "version": "1.0.4",
+      "updated": "2026-10-10"
+    },
+    "guide_md": {
+      "path": "knowledge/分析方法与判读指南.md",
+      "role": "人类可读：判读指南全文（附录区由脚本追加）",
+      "count": 23,
+      "version": "1.0.0",
+      "updated": ""
+    },
+    "battery_md": {
+      "path": "knowledge/锂电池工序知识库.md",
+      "role": "人类可读：锂电工序工艺知识",
+      "count": 10,
+      "version": "1.0.0",
+      "updated": ""
+    },
+    "pv_md": {
+      "path": "knowledge/光伏工序知识库.md",
+      "role": "人类可读：光伏工序工艺知识",
+      "count": 10,
+      "version": "1.0.0",
+      "updated": ""
+    },
+    "dev": {
+      "path": "knowledge/device_profiles.json",
+      "role": "机器可读：检测设备导出版式档案与私有列名、单位约定",
+      "count": 10,
+      "version": "1.0.0",
+      "updated": "2026-10-10"
+    }
+  },
+  "history": [
+    {
+      "date": "2026-10-10",
+      "note": "同步 3 条候选"
+    },
+    {
+      "date": "2026-10-10",
+      "note": "同步 1 条候选"
+    },
+    {
+      "date": "2026-10-10",
+      "note": "同步 4 条候选"
+    },
+    {
+      "date": "2026-10-10",
+      "note": "初始化判读规则 4 条"
+    },
+    {
+      "date": "2026-10-10",
+      "note": "判读规则初始化并重建附录"
+    },
+    {
+      "date": "2026-10-10",
+      "note": "同步 1 条候选"
+    },
+    {
+      "date": "2026-10-10",
+      "note": "同步 1 条候选"
+    },
+    {
+      "date": "2026-10-10",
+      "note": "同步 1 条候选"
+    },
+    {
+      "date": "2026-10-10",
+      "note": "同步 2 条候选"
+    }
+  ],
+  "updated": "2026-10-10"
+}

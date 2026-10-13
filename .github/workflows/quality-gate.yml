@@ -1,0 +1,48 @@
+name: quality-gate
+
+# 每次 push / PR 都把三件事跑一遍：能不能算对、有没有退化、会不会泄漏。
+# 第三条是本项目最容易被忽略的一条——它保护的对象不是 upstream，而是客户。
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+jobs:
+  quality:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.11", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      # 本项目运行时零第三方依赖，这里也不装任何东西——
+      # 一旦有人引入 pandas/numpy 之类，这条会因为找不到包而红，
+      # 那正是我们想要的信号。
+      - name: 确认零依赖（不安装任何包）
+        run: python -c "import sys; print(sys.version)"
+
+      - name: 主自检
+        run: python scripts/selftest.py
+
+      - name: 护栏自检
+        run: python scripts/selftest_guard.py
+
+      - name: 审计规则自检（验证这些隐私检查本身没失效）
+        run: python scripts/prepublish_audit.py --selfcheck
+
+      - name: 上架前隐私面审计
+        run: python scripts/prepublish_audit.py --strict
+
+      - name: 知识库结构与打包完整性
+        run: python scripts/package.py

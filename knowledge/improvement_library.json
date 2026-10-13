@@ -1,0 +1,64 @@
+{
+  "meta": {
+    "name": "现场验证改善措施库",
+    "version": "1.0.2",
+    "updated": "2026-10-12",
+    "note": "仅收录经 PDCA / PFMEA / DOE 验证并在现场生效的措施。A 级可直接推荐，B 级推荐时标注待验证，C 级只作经验留存。本仓库随附条目一律为 `demo: true` 的结构示例，**示例中的数值均为占位值，不代表任何现场实测结论，严禁直接套用到产线**。真实案例请在本地 Tenant 空间中维护，不要提交到公开仓库。",
+    "revision": 2
+  },
+  "cases": [
+    {
+      "demo": true,
+      "defect": "针孔气泡",
+      "process": "battery_coating",
+      "symptom": "【示例描述】涂布极片边缘出现密集针孔，EL/目检不良率上升",
+      "root_cause_param": "oven_zone1_temp",
+      "countermeasure": {
+        "action": "【示例，非真实工艺参数】调整烘箱一区设定温度，并复核二区前段风速",
+        "type": "工艺参数调整",
+        "detail": "【示例】单次只变更一个变量，其余参数不动，便于单独归因；任何设定值必须来自本工序 DOE 并经企业工艺负责人审批"
+      },
+      "verification": {
+        "method": "PDCA",
+        "pdca": {
+          "plan": "【示例】提出假设并设定可量化的目标不良率，先写判据再动手",
+          "do": "【示例】设定连续班次窗口，按新参数执行并记录每卷缺陷数",
+          "check": "【示例】用 SPC 判异 + 前后样本量对比验收，不看单点、看分布",
+          "act": "【示例】验收通过后写入企业自有工艺卡编号，并纳入控制计划定期复核"
+        },
+        "fmea": {
+          "failure_mode": "【示例】填写失效模式",
+          "rpn_before": null,
+          "rpn_after": null
+        },
+        "result": {
+          "metric": "针孔不良率",
+          "unit": "%",
+          "before": null,
+          "after": null,
+          "sample_size": null,
+          "period": null
+        }
+      },
+      "standardization": {
+        "doc_no": null,
+        "control_plan_updated": false,
+        "date": null
+      },
+      "id": "DEMO-0001",
+      "evidence_level": "C",
+      "grade_reason": [
+        "占位示例：无量化的前后对比数据，按规则不得推荐"
+      ],
+      "can_recommend": false,
+      "_kbmeta": {
+        "source": "占位示例（不可再生字段已脱敏）",
+        "date": "2026-10-12",
+        "by": "skill-maintainer",
+        "candidate_id": "DEMO-0001",
+        "method": "PDCA",
+        "demo": true
+      }
+    }
+  ]
+}

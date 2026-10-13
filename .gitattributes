@@ -1,0 +1,14 @@
+# CI 同时跑 Ubuntu 与 Windows，仓库内一律存 LF，检出时按平台自动转换。
+# 不加的话 Windows 提交会把 CRLF 写进仓库，之后每次跨平台改动都产生整文件 diff 噪音。
+* text=auto eol=lf
+
+# 二进制不参与换行转换
+*.zip binary
+*.png binary
+*.jpg binary
+*.xlsx binary
+*.xls binary
+
+# 许可证与法律文本：保持原始字节，禁止任何自动改写
+LICENSE -text
+NOTICE -text

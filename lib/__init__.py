@@ -1,0 +1,3 @@
+# -*- coding: utf-8 -*-
+"""newenergy-fde 分析引擎（零第三方依赖，仅标准库）"""
+__version__ = "1.0.0"

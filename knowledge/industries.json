@@ -1,0 +1,45 @@
+{
+  "meta": {
+    "name": "行业作用域登记表",
+    "version": "1.0.0",
+    "updated": "2026-10-10",
+    "note": "企业端按购买的行业模块配置作用域。domain 必须与 process_specs.json 中 processes[*].domain 一致；processes 列表用于显式认领（domain 缺失时兜底）。新增行业只需在此追加一条，并在 process_specs.json 中给工序标注对应 domain。",
+    "derivable": "本文件缺失时，scope.py 会从 process_specs.json 的 domain 字段自动推导，不会中断分析。"
+  },
+  "industries": {
+    "battery": {
+      "name": "锂电池",
+      "alias": ["锂电", "电池", "lithium", "battery", "LIB"],
+      "domain": "battery",
+      "processes": [
+        "battery_coating",
+        "battery_calendering",
+        "battery_winding",
+        "battery_filling",
+        "battery_formation"
+      ],
+      "docs": ["knowledge/锂电池工序知识库.md"],
+      "note": "涂布/辊压/卷绕/注液/化成。开路电压在此行业指电芯 OCV（典型 3.0-4.2 V 单芯）。"
+    },
+    "pv": {
+      "name": "光伏",
+      "alias": ["太阳能", "组件", "photovoltaic", "pv", "solar"],
+      "domain": "pv",
+      "processes": [
+        "pv_wafer",
+        "pv_cell_el",
+        "pv_module_iv"
+      ],
+      "docs": ["knowledge/光伏工序知识库.md"],
+      "note": "硅片检测/电池片 EL/组件 IV。开路电压在此行业指组件 Voc（典型 30-50 V 量级），与锂电 OCV 相差一个数量级，不可混用。"
+    }
+  },
+  "shared_assets": {
+    "note": "以下资产为跨行业通用方法论，任何作用域下都不裁剪。裁掉它们属于负收益。",
+    "files": [
+      "knowledge/interp_rules.json",
+      "knowledge/分析方法与判读指南.md"
+    ],
+    "sections": ["unit_conversions", "unit_aliases", "_fallback"]
+  }
+}

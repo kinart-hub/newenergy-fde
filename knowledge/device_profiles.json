@@ -1,0 +1,1265 @@
+{
+  "meta": {
+    "version": "1.0.0",
+    "updated": "2026-10-10",
+    "note": "产线检测设备档案。用于识别导出文件来自哪台设备、把不同版式归一成标准宽表，并把设备私有列名映射到工艺参数。同一份数据若能被多台设备档案命中，取得分最高者；全部未命中时走 _fallback 的通用版式侦测。",
+    "layout_vocab": {
+      "wide": "标准宽表：一行一样本，一列一检测项",
+      "long": "竖表 / Key-Value：检测项名在一列、数值在另一列，需要先 pivot 成宽表",
+      "blocked": "单文件内多区块：同一张表里纵向堆叠了若干张子表（例如每个电芯一个区块）"
+    }
+  },
+  "unit_conversions": {
+    "mm_to_um": {
+      "from": "mm",
+      "to": "μm",
+      "factor": 1000.0
+    },
+    "um_to_mm": {
+      "from": "μm",
+      "to": "mm",
+      "factor": 0.001
+    },
+    "A_to_mA": {
+      "from": "A",
+      "to": "mA",
+      "factor": 1000.0
+    },
+    "mA_to_A": {
+      "from": "mA",
+      "to": "A",
+      "factor": 0.001
+    },
+    "ohm_to_mohm": {
+      "from": "Ω",
+      "to": "mΩ",
+      "factor": 1000.0
+    },
+    "mohm_to_ohm": {
+      "from": "mΩ",
+      "to": "Ω",
+      "factor": 0.001
+    },
+    "pct_to_ppm": {
+      "from": "%",
+      "to": "ppm",
+      "factor": 10000.0
+    },
+    "ppm_to_pct": {
+      "from": "ppm",
+      "to": "%",
+      "factor": 0.0001
+    },
+    "V_to_mV": {
+      "from": "V",
+      "to": "mV",
+      "factor": 1000.0
+    },
+    "mV_to_V": {
+      "from": "mV",
+      "to": "V",
+      "factor": 0.001
+    },
+    "kW_to_W": {
+      "from": "kW",
+      "to": "W",
+      "factor": 1000.0
+    },
+    "mAh_to_Ah": {
+      "from": "mAh",
+      "to": "Ah",
+      "factor": 0.001
+    },
+    "Ah_to_mAh": {
+      "from": "Ah",
+      "to": "mAh",
+      "factor": 1000.0
+    },
+    "mW_to_W": {
+      "from": "mW",
+      "to": "W",
+      "factor": 0.001
+    },
+    "W_to_mW": {
+      "from": "W",
+      "to": "mW",
+      "factor": 1000.0
+    }
+  },
+  "devices": {
+    "hioki_bt356x": {
+      "name": "日置 HIOKI BT3562/BT3563 电池内阻测试仪",
+      "vendor": "HIOKI",
+      "category": "electrical_test",
+      "processes": [
+        "battery_formation",
+        "battery_winding"
+      ],
+      "export_note": "支持面板直接存 CSV 或用 Communicator 导出；多为每个判定项一行的竖表。",
+      "format": {
+        "layout": "long",
+        "meta_rows": 0,
+        "header_rows": 1,
+        "unit_row": false,
+        "footer_markers": [
+          "平均",
+          "最大",
+          "最小",
+          "σ",
+          "σn-1",
+          "Average",
+          "MAX",
+          "MIN",
+          "判定結果"
+        ],
+        "skip_row_regex": [
+          "^;",
+          "^#",
+          "^＊",
+          "^\\*"
+        ],
+        "long_key_col": [
+          "項目",
+          "项目",
+          "Item",
+          "PARAMETER"
+        ],
+        "long_value_col": [
+          "測定値",
+          "测定值",
+          "値",
+          "Value",
+          "MEASURED"
+        ],
+        "long_group_col": [
+          "No.",
+          "No",
+          "番号",
+          "SAMPLE",
+          "电池编号"
+        ]
+      },
+      "aliases": {
+        "電池電圧": "ocv",
+        "电池电压": "ocv",
+        "OCV(V)": "ocv",
+        "内部抵抗": "acir",
+        "内部电阻": "acir",
+        "交流内阻": "acir",
+        "IR(mΩ)": "acir",
+        "判定": "qa_judgement",
+        "測定レンジ": null
+      },
+      "unit_map": {
+        "内部抵抗(Ω)": {
+          "read_unit": "Ω",
+          "target_unit": "mΩ",
+          "conversion": "ohm_to_mohm"
+        },
+        "交流内阻(Ω)": {
+          "read_unit": "Ω",
+          "target_unit": "mΩ",
+          "conversion": "ohm_to_mohm"
+        }
+      },
+      "drop_cols": [
+        "測定レンジ",
+        "测量量程",
+        "比較器",
+        "RANGE"
+      ],
+      "signature": {
+        "meta_regex": [
+          "HIOKI",
+          "BT3562",
+          "BT3563",
+          "BT3554",
+          "3562-01"
+        ],
+        "col_any": [
+          "内部抵抗",
+          "内部电阻",
+          "交流内阻",
+          "電池電圧",
+          "测定值",
+          "測定値"
+        ],
+        "filename_regex": [
+          "BT35",
+          "hioki",
+          "HIOKI",
+          "IR_",
+          "ACIR"
+        ],
+        "weights": {
+          "meta_regex": 3.0,
+          "col_any": 1.0,
+          "filename_regex": 1.5
+        }
+      },
+      "key_unit_map": {
+        "内部抵抗": {
+          "read_unit": "Ω",
+          "target_unit": "mΩ"
+        },
+        "内部电阻": {
+          "read_unit": "Ω",
+          "target_unit": "mΩ"
+        }
+      }
+    },
+    "neware_bts": {
+      "name": "新威 NEWARE BTS 化成/分容柜",
+      "vendor": "NEWARE",
+      "category": "formation",
+      "processes": [
+        "battery_formation"
+      ],
+      "export_note": "BTS Client 导出为宽表，首行常含设备/通道/工步信息；同一文件可能含多个工步。",
+      "format": {
+        "layout": "wide",
+        "meta_rows": 0,
+        "header_rows": 1,
+        "unit_row": true,
+        "unit_row_mode": "suffix",
+        "footer_markers": [
+          "Total",
+          "总计",
+          "Summary",
+          "平均值"
+        ],
+        "skip_row_regex": [
+          "^=",
+          "^Test",
+          "^Battery"
+        ]
+      },
+      "aliases": {
+        "Cell ID": "cell_id",
+        "电芯编号": "cell_id",
+        "Step Time": "step_time",
+        "工步时间": "step_time",
+        "Capacity(Ah)": "capacity",
+        "容量(Ah)": "capacity",
+        "Cap(Ah)": "capacity",
+        "Energy(Wh)": "energy",
+        "Voltage(V)": "formation_voltage",
+        "电压(V)": "formation_voltage",
+        "Current(A)": "formation_current",
+        "电流(A)": "formation_current",
+        "Temperature(℃)": "formation_temperature",
+        "温度(℃)": "formation_temperature",
+        "Cabinet": "formation_cabinet",
+        "柜号": "formation_cabinet",
+        "Channel": "channel",
+        "通道": "channel"
+      },
+      "unit_map": {
+        "Current(mA)": {
+          "read_unit": "mA",
+          "target_unit": "A",
+          "conversion": "mA_to_A"
+        },
+        "Capacity(mAh)": {
+          "read_unit": "mAh",
+          "target_unit": "Ah",
+          "conversion": "mA_to_A"
+        }
+      },
+      "drop_cols": [
+        "Step Index",
+        "工步号",
+        "Record Number",
+        "记录号",
+        "Date Time"
+      ],
+      "signature": {
+        "meta_regex": [
+          "NEWARE",
+          "BTS",
+          "BTS-",
+          "Neware"
+        ],
+        "col_any": [
+          "Step Time",
+          "Capacity(Ah)",
+          "Channel",
+          "柜号",
+          "工步"
+        ],
+        "filename_regex": [
+          "NEWARE",
+          "BTS",
+          "^ch",
+          "Formation"
+        ],
+        "weights": {
+          "meta_regex": 3.0,
+          "col_any": 1.0,
+          "filename_regex": 1.5
+        }
+      }
+    },
+    "lanhe_ct3002": {
+      "name": "蓝电 Land CT3002 电池测试系统",
+      "vendor": "LANHE",
+      "category": "formation",
+      "processes": [
+        "battery_formation"
+      ],
+      "export_note": "导出 csv 带若干行中文头信息，正文之前有 [Step] 区段说明。",
+      "format": {
+        "layout": "wide",
+        "meta_rows": 0,
+        "header_rows": 1,
+        "unit_row": false,
+        "footer_markers": [
+          "总计",
+          "汇总",
+          "平均值"
+        ],
+        "skip_row_regex": [
+          "^\\[",
+          "^#",
+          "^=",
+          "^文件",
+          "^file"
+        ]
+      },
+      "aliases": {
+        "电池": "cell_id",
+        "通道号": "channel",
+        "柜号": "formation_cabinet",
+        "充电容量": "capacity",
+        "放电容量": "capacity",
+        "终止电压": "formation_voltage",
+        "搁置时间": "standing_time",
+        "首效": "first_coulombic_efficiency",
+        "库伦效率": "first_coulombic_efficiency"
+      },
+      "unit_map": {
+        "充电容量(mAh)": {
+          "read_unit": "mAh",
+          "target_unit": "Ah",
+          "conversion": "mA_to_A"
+        },
+        "放电容量(mAh)": {
+          "read_unit": "mAh",
+          "target_unit": "Ah",
+          "conversion": "mA_to_A"
+        }
+      },
+      "drop_cols": [
+        "序号",
+        "工步",
+        "状态"
+      ],
+      "signature": {
+        "meta_regex": [
+          "Land",
+          "LAND",
+          "蓝电",
+          "CT3002",
+          "CT2001"
+        ],
+        "col_any": [
+          "充电容量",
+          "放电容量",
+          "蓝电",
+          "柜号"
+        ],
+        "filename_regex": [
+          "CT30",
+          "CT20",
+          "LanHe",
+          "蓝电"
+        ],
+        "weights": {
+          "meta_regex": 3.0,
+          "col_any": 1.0,
+          "filename_regex": 1.5
+        }
+      }
+    },
+    "keyence_lk_g": {
+      "name": "基恩士 KEYENCE LK-G 系列激光位移/测厚",
+      "vendor": "KEYENCE",
+      "category": "metrology",
+      "processes": [
+        "battery_coating",
+        "battery_calendering",
+        "pv_wafer"
+      ],
+      "export_note": "测厚在线扫描常导出竖表：每个测点一行，形如 项目/测定值。也有配置为宽表。",
+      "format": {
+        "layout": "long",
+        "meta_rows": 0,
+        "header_rows": 1,
+        "unit_row": false,
+        "footer_markers": [
+          "平均",
+          "最大",
+          "最小",
+          "标准偏差",
+          "MAX",
+          "MIN",
+          "AVE"
+        ],
+        "skip_row_regex": [
+          "^!",
+          "^#"
+        ],
+        "long_key_col": [
+          "項目",
+          "项目",
+          "CH",
+          "チャンネル",
+          "Channel"
+        ],
+        "long_value_col": [
+          "測定値",
+          "测定值",
+          "VALUE",
+          "值"
+        ],
+        "long_group_col": [
+          "No.",
+          "No",
+          "番号",
+          "トリガ"
+        ]
+      },
+      "aliases": {
+        "厚み": "coating_thickness",
+        "厚度": "coating_thickness",
+        "測定値1": "coating_thickness",
+        "THICKNESS": "coating_thickness",
+        "OUT1": "coating_thickness"
+      },
+      "unit_map": {
+        "厚み(mm)": {
+          "read_unit": "mm",
+          "target_unit": "μm",
+          "conversion": "mm_to_um"
+        },
+        "厚度(mm)": {
+          "read_unit": "mm",
+          "target_unit": "μm",
+          "conversion": "mm_to_um"
+        }
+      },
+      "drop_cols": [
+        "判定",
+        "JUDGE",
+        "OUT2"
+      ],
+      "signature": {
+        "meta_regex": [
+          "KEYENCE",
+          "LK-G",
+          "LK-H",
+          "基恩士"
+        ],
+        "col_any": [
+          "測定値",
+          "测定值",
+          "厚み",
+          "OUT1",
+          "CH"
+        ],
+        "filename_regex": [
+          "LK-G",
+          "LK-H",
+          "KEYENCE",
+          "thick"
+        ],
+        "weights": {
+          "meta_regex": 3.0,
+          "col_any": 1.0,
+          "filename_regex": 1.5
+        }
+      },
+      "key_unit_map": {
+        "厚み": {
+          "read_unit": "mm",
+          "target_unit": "μm"
+        },
+        "厚度": {
+          "read_unit": "mm",
+          "target_unit": "μm"
+        },
+        "THICKNESS": {
+          "read_unit": "mm",
+          "target_unit": "μm"
+        },
+        "OUT1": {
+          "read_unit": "mm",
+          "target_unit": "μm"
+        }
+      }
+    },
+    "coating_mes_cn": {
+      "name": "国产涂布机 MES 导出（浩能/科晶/新嘉拓类）",
+      "vendor": "generic_cn_coater",
+      "category": "process_mes",
+      "processes": [
+        "battery_coating"
+      ],
+      "export_note": "宽表为主，常带两行表头（第一行分组、第二行明细），末行可能有合计。",
+      "format": {
+        "layout": "wide",
+        "meta_rows": 0,
+        "header_rows": "auto",
+        "unit_row": false,
+        "header_join": "_",
+        "footer_markers": [
+          "合计",
+          "平均",
+          "汇总",
+          "小计",
+          "Total"
+        ],
+        "skip_row_regex": [
+          "^=",
+          "^报表",
+          "^制表"
+        ],
+        "header_detail_only": true
+      },
+      "aliases": {
+        "面密度": "areal_density",
+        "涂布面密度": "areal_density",
+        "湿膜厚度": "coating_thickness",
+        "固含量": "solid_content",
+        "走带速度": "coating_speed",
+        "一区温度": "oven_zone1_temp",
+        "二区温度": "oven_zone2_temp",
+        "三区温度": "oven_zone3_temp",
+        "四区温度": "oven_zone_last_temp",
+        "泵转速": "pump_speed",
+        "张力": "web_tension_coating",
+        "间隙": "gap_ratio",
+        "烘后水分": "moisture_after_dry"
+      },
+      "unit_map": {},
+      "drop_cols": [
+        "备注",
+        "操作员",
+        "班次代码"
+      ],
+      "signature": {
+        "col_any": [
+          "面密度",
+          "固含量",
+          "走带速度",
+          "烘箱",
+          "一区温度",
+          "一致性"
+        ],
+        "filename_regex": [
+          "coat",
+          "涂布",
+          "Coating"
+        ],
+        "weights": {
+          "col_any": 1.0,
+          "filename_regex": 1.0
+        }
+      }
+    },
+    "winding_mes_cn": {
+      "name": "国产卷绕机 MES 导出（先导/赢合/格林晟类）",
+      "vendor": "generic_cn_winder",
+      "category": "process_mes",
+      "processes": [
+        "battery_winding"
+      ],
+      "export_note": "宽表；Hi-pot 结果常放在单独一列，用 OK/NG 或 PASS/FAIL 表示。",
+      "format": {
+        "layout": "wide",
+        "meta_rows": 0,
+        "header_rows": 1,
+        "unit_row": false,
+        "footer_markers": [
+          "合计",
+          "汇总",
+          "良品数"
+        ],
+        "skip_row_regex": [
+          "^=",
+          "^报表"
+        ]
+      },
+      "aliases": {
+        "卷针": "winding_needle",
+        "卷绕速度": "winding_speed",
+        "收卷张力": "web_tension_coating",
+        "隔膜张力": "tension_separator",
+        "正极张力": "tension_cathode",
+        "负极张力": "tension_anode",
+        "CCD错位": "ccd_offset",
+        "Hi-Pot": "hi_pot_pass",
+        "高压测试": "hi_pot_pass",
+        "短路测试": "hi_pot_pass",
+        "测试结果": "qa_judgement"
+      },
+      "attr_maps": {
+        "hi_pot_pass": {
+          "ok": [
+            "OK",
+            "PASS",
+            "合格",
+            "ok"
+          ],
+          "ng": [
+            "NG",
+            "FAIL",
+            "不合格",
+            "短路"
+          ]
+        }
+      },
+      "unit_map": {},
+      "drop_cols": [
+        "备注"
+      ],
+      "signature": {
+        "col_any": [
+          "卷绕",
+          "Hi-Pot",
+          "HiPot",
+          "极片张力",
+          "隔膜张力",
+          "CCD错位",
+          "短路测试"
+        ],
+        "filename_regex": [
+          "wind",
+          "卷绕",
+          "Winding"
+        ],
+        "weights": {
+          "col_any": 1.0,
+          "filename_regex": 1.0
+        }
+      }
+    },
+    "wafer_thickness_sorter": {
+      "name": "硅片厚度/TTV 分选检测机（国产在线式）",
+      "vendor": "generic_wafer_sorter",
+      "category": "pv_metrology",
+      "processes": [
+        "pv_wafer"
+      ],
+      "export_note": "宽表一行一片；厚度多为 μm，部分机型导出 mm；末尾常带批次统计行。",
+      "format": {
+        "layout": "wide",
+        "meta_rows": 0,
+        "header_rows": 1,
+        "unit_row": false,
+        "footer_markers": [
+          "平均",
+          "Max",
+          "Min",
+          "最大",
+          "最小",
+          "Std",
+          "CPK"
+        ],
+        "skip_row_regex": [
+          "^#",
+          "^Lot",
+          "^批号："
+        ]
+      },
+      "aliases": {
+        "硅片编号": "wafer_id",
+        "厚度均值": "thickness",
+        "平均厚度": "thickness",
+        "THK": "thickness",
+        "Thickness": "thickness",
+        "TTV": "ttv",
+        "厚度公差": "ttv",
+        "翘曲": "warp",
+        "Warpage": "warp",
+        "弯曲": "bow",
+        "Bow": "bow",
+        "线痕": "wire_mark",
+        "崩边": "edge_chip",
+        "来料供应商": "supplier"
+      },
+      "unit_map": {
+        "THK(mm)": {
+          "read_unit": "mm",
+          "target_unit": "μm",
+          "conversion": "mm_to_um"
+        },
+        "Thickness(mm)": {
+          "read_unit": "mm",
+          "target_unit": "μm",
+          "conversion": "mm_to_um"
+        },
+        "厚度(mm)": {
+          "read_unit": "mm",
+          "target_unit": "μm",
+          "conversion": "mm_to_um"
+        },
+        "TTV(mm)": {
+          "read_unit": "mm",
+          "target_unit": "μm",
+          "conversion": "mm_to_um"
+        }
+      },
+      "drop_cols": [
+        "等级代码"
+      ],
+      "signature": {
+        "col_any": [
+          "TTV",
+          "翘曲",
+          "Warpage",
+          "Bow",
+          "硅片编号"
+        ],
+        "filename_regex": [
+          "wafer",
+          "硅片",
+          "THK",
+          "Sorter"
+        ],
+        "weights": {
+          "col_any": 1.0,
+          "filename_regex": 1.0
+        }
+      }
+    },
+    "halm_iv_tester": {
+      "name": "HALM / PASAN 组件 IV 测试仪",
+      "vendor": "HALM",
+      "category": "pv_iv",
+      "processes": [
+        "pv_module_iv"
+      ],
+      "export_note": "多为一张正表 + 一张汇总；列名常带单位后缀，Irr/温度等环境变量与主表并列。",
+      "format": {
+        "layout": "wide",
+        "meta_rows": 0,
+        "header_rows": 1,
+        "unit_row": false,
+        "footer_markers": [
+          "Mean",
+          "Average",
+          "Std dev",
+          "平均"
+        ],
+        "skip_row_regex": [
+          "^#",
+          "^Module Type",
+          "^Operator"
+        ]
+      },
+      "aliases": {
+        "Module ID": "module_id",
+        "组件条码": "module_id",
+        "Serial No": "module_id",
+        "Pmax": "pmax",
+        "Pmpp": "pmax",
+        "最大功率": "pmax",
+        "Voc": "voc",
+        "Isc": "isc",
+        "FF": "fill_factor",
+        "填充因子": "fill_factor",
+        "Vmpp": "vmpp",
+        "Impp": "impp",
+        "Rs": "rs",
+        "串联电阻": "rs",
+        "Rsh": "rsh",
+        "并联电阻": "rsh",
+        "Eff": "cell_efficiency",
+        "效率": "cell_efficiency",
+        "Irr": "irradiance",
+        "辐照度": "irradiance",
+        "Tmod": "module_temp",
+        "组件温度": "module_temp"
+      },
+      "unit_map": {
+        "Isc(mA)": {
+          "read_unit": "mA",
+          "target_unit": "A",
+          "conversion": "mA_to_A"
+        },
+        "Impp(mA)": {
+          "read_unit": "mA",
+          "target_unit": "A",
+          "conversion": "mA_to_A"
+        },
+        "Pmax(mW)": {
+          "read_unit": "mW",
+          "target_unit": "W",
+          "conversion": "kW_to_W"
+        }
+      },
+      "drop_cols": [
+        "Class",
+        "Grade"
+      ],
+      "signature": {
+        "meta_regex": [
+          "HALM",
+          "PASAN",
+          "cetisPV"
+        ],
+        "col_any": [
+          "Pmax",
+          "Pmpp",
+          "Vmpp",
+          "Impp",
+          "Irr",
+          "FF"
+        ],
+        "filename_regex": [
+          "HALM",
+          "PASAN",
+          "IV_",
+          "cetis"
+        ],
+        "weights": {
+          "meta_regex": 3.0,
+          "col_any": 1.0,
+          "filename_regex": 1.5
+        }
+      }
+    },
+    "el_scanner_cn": {
+      "name": "组件/电池片 EL 缺陷检测机（国产在线式）",
+      "vendor": "generic_el_scanner",
+      "category": "pv_el",
+      "processes": [
+        "pv_cell_el"
+      ],
+      "export_note": "多为缺陷清单（一片可能多行）或汇总表（一片一行计数）。清单需按片号聚合后再分析。",
+      "format": {
+        "layout": "wide",
+        "meta_rows": 0,
+        "header_rows": 1,
+        "unit_row": false,
+        "footer_markers": [
+          "合计",
+          "总计"
+        ],
+        "skip_row_regex": [
+          "^#"
+        ],
+        "aggregate": {
+          "by": [
+            "组件条码",
+            "Module ID",
+            "电池片编号"
+          ],
+          "how": "count_and_categories"
+        }
+      },
+      "aliases": {
+        "组件条码": "module_id",
+        "电池片编号": "cell_id_el",
+        "缺陷类型": "el_defect_type",
+        "缺陷名称": "el_defect_type",
+        "隐裂": "el_crack",
+        "黑心": "el_black_core",
+        "断栅": "el_broken_grid",
+        "碎片": "el_fragment",
+        "虚焊": "el_solder_defect",
+        "污染": "el_contamination",
+        "边缘漏电": "el_edge_leakage",
+        "缺陷面积": "el_defect_area",
+        "灰度均值": "el_gray_mean"
+      },
+      "attr_maps": {
+        "el_defect_type": {
+          "隐裂": [
+            "隐裂",
+            "crack",
+            "裂纹"
+          ],
+          "黑心": [
+            "黑心",
+            "black core",
+            "黑斑"
+          ],
+          "断栅": [
+            "断栅",
+            "broken grid",
+            "断线"
+          ],
+          "碎片": [
+            "碎片",
+            "fragment",
+            "破片"
+          ],
+          "虚焊": [
+            "虚焊",
+            "焊接不良",
+            "solder"
+          ],
+          "污染": [
+            "污染",
+            "脏污",
+            "contamination"
+          ],
+          "边缘漏电": [
+            "边缘漏电",
+            "edge leakage",
+            "边漏"
+          ]
+        }
+      },
+      "unit_map": {},
+      "drop_cols": [
+        "图像路径",
+        "Image Path"
+      ],
+      "signature": {
+        "col_any": [
+          "缺陷类型",
+          "缺陷名称",
+          "隐裂",
+          "EL",
+          "灰度"
+        ],
+        "filename_regex": [
+          "EL",
+          "el_",
+          "缺陷"
+        ],
+        "weights": {
+          "col_any": 1.0,
+          "filename_regex": 1.0
+        }
+      }
+    },
+    "mettler_kf_titrator": {
+      "name": "梅特勒托利多卡氏水分仪",
+      "vendor": "Mettler-Toledo",
+      "category": "lab",
+      "processes": [
+        "battery_coating"
+      ],
+      "export_note": "导出竖表，一行一个样品的结果项；也可能一行一样品。",
+      "format": {
+        "layout": "long",
+        "meta_rows": 0,
+        "header_rows": 1,
+        "unit_row": false,
+        "footer_markers": [
+          "平均值",
+          "标准偏差",
+          "Mean",
+          "srel"
+        ],
+        "skip_row_regex": [
+          "^#",
+          "^--"
+        ],
+        "long_key_col": [
+          "样品名",
+          "Sample",
+          "ID"
+        ],
+        "long_value_col": [
+          "水分含量",
+          "Result",
+          "H2O"
+        ],
+        "long_group_col": [
+          "序号",
+          "No"
+        ]
+      },
+      "aliases": {
+        "水分含量": "moisture_after_dry",
+        "含水量": "moisture_after_dry",
+        "H2O": "moisture_after_dry",
+        "样品质量": "sample_mass",
+        "烘干后水分": "moisture_after_dry"
+      },
+      "unit_map": {
+        "水分含量(%)": {
+          "read_unit": "%",
+          "target_unit": "ppm",
+          "conversion": "pct_to_ppm"
+        }
+      },
+      "drop_cols": [
+        "滴定度",
+        "漂移值"
+      ],
+      "signature": {
+        "meta_regex": [
+          "METTLER",
+          "Mettler",
+          "TOLEDO",
+          "梅特勒",
+          "Karl Fischer"
+        ],
+        "col_any": [
+          "水分含量",
+          "含水量",
+          "H2O",
+          "滴定度"
+        ],
+        "filename_regex": [
+          "KF",
+          "moisture",
+          "水分",
+          "MT"
+        ],
+        "weights": {
+          "meta_regex": 3.0,
+          "col_any": 1.0,
+          "filename_regex": 1.5
+        }
+      },
+      "key_unit_map": {
+        "水分含量": {
+          "read_unit": "%",
+          "target_unit": "ppm"
+        },
+        "含水量": {
+          "read_unit": "%",
+          "target_unit": "ppm"
+        },
+        "H2O": {
+          "read_unit": "%",
+          "target_unit": "ppm"
+        }
+      }
+    }
+  },
+  "_fallback": {
+    "name": "未识别设备（通用处理）",
+    "vendor": "unknown",
+    "category": "unknown",
+    "processes": [],
+    "format": {
+      "layout": "auto",
+      "meta_rows": 0,
+      "header_rows": 1,
+      "unit_row": "auto",
+      "footer_markers": [
+        "合计",
+        "平均",
+        "汇总",
+        "小计",
+        "总计",
+        "Total",
+        "Mean",
+        "Average",
+        "Max",
+        "Min",
+        "最大",
+        "最小",
+        "标准偏差",
+        "Std dev",
+        "Std",
+        "σ"
+      ],
+      "skip_row_regex": [
+        "^#",
+        "^;",
+        "^=",
+        "^--"
+      ]
+    },
+    "aliases": {},
+    "unit_map": {},
+    "drop_cols": [],
+    "signature": {}
+  },
+  "unit_aliases": {
+    "wt%": [
+      "%",
+      "wt%",
+      "wt％",
+      "wt.%",
+      "%wt",
+      "wt"
+    ],
+    "vol%": [
+      "vol%",
+      "vol.%",
+      "%vol"
+    ],
+    "μm": [
+      "μm",
+      "um",
+      "µm",
+      "micron",
+      "um.",
+      "μm."
+    ],
+    "mm": [
+      "mm",
+      "毫米"
+    ],
+    "nm": [
+      "nm",
+      "纳米"
+    ],
+    "℃": [
+      "℃",
+      "°c",
+      "degc",
+      "c"
+    ],
+    "V": [
+      "v",
+      "volt",
+      "伏"
+    ],
+    "mV": [
+      "mv",
+      "毫伏"
+    ],
+    "A": [
+      "a",
+      "amp",
+      "安"
+    ],
+    "mA": [
+      "ma",
+      "毫安"
+    ],
+    "mΩ": [
+      "mω",
+      "mohm",
+      "毫欧",
+      "mr"
+    ],
+    "Ω": [
+      "ω",
+      "ohm",
+      "欧姆",
+      "r"
+    ],
+    "kΩ": [
+      "kω",
+      "kohm",
+      "千欧"
+    ],
+    "W": [
+      "w",
+      "watt",
+      "瓦"
+    ],
+    "mW": [
+      "mw",
+      "毫瓦"
+    ],
+    "kW": [
+      "kw",
+      "千瓦"
+    ],
+    "Ah": [
+      "ah",
+      "安时"
+    ],
+    "mAh": [
+      "mah",
+      "毫安时"
+    ],
+    "Wh": [
+      "wh",
+      "瓦时"
+    ],
+    "ppm": [
+      "ppm",
+      "ppma",
+      "ppmv",
+      "ppmw"
+    ],
+    "g/m²": [
+      "g/m2",
+      "g/m²",
+      "g/m^2",
+      "gsm"
+    ],
+    "mg/cm²": [
+      "mg/cm2",
+      "mg/cm²"
+    ],
+    "m/min": [
+      "m/min",
+      "mpm",
+      "米/分"
+    ],
+    "mPa·s": [
+      "mpa·s",
+      "mpa.s",
+      "mpas",
+      "cps",
+      "cp",
+      "mpa s"
+    ],
+    "N": [
+      "n",
+      "牛",
+      "牛顿"
+    ],
+    "kgf": [
+      "kgf",
+      "kg"
+    ],
+    "kPa": [
+      "kpa",
+      "千帕"
+    ],
+    "Pa": [
+      "pa",
+      "帕"
+    ],
+    "s": [
+      "s",
+      "sec",
+      "second",
+      "秒"
+    ],
+    "ms": [
+      "ms",
+      "毫秒"
+    ],
+    "min": [
+      "min",
+      "分钟"
+    ],
+    "h": [
+      "h",
+      "hr",
+      "hour",
+      "小时"
+    ],
+    "μs": [
+      "μs",
+      "us",
+      "µs",
+      "微秒"
+    ],
+    "W/m²": [
+      "w/m2",
+      "w/m²",
+      "w/m^2"
+    ],
+    "Ω·cm": [
+      "ω·cm",
+      "ω.cm",
+      "ohm·cm",
+      "ohm.cm",
+      "ωcm"
+    ],
+    "gray": [
+      "gray",
+      "灰度",
+      "lsb",
+      "gl"
+    ]
+  }
+}

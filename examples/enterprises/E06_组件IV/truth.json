@@ -1,0 +1,26 @@
+{
+  "title": "组件厂·IV 终测（短路电流以 mA 计）",
+  "industry": "pv",
+  "process": "pv_module_iv",
+  "device": "HALM 类 IV 测试仪",
+  "format_traps": [
+    "Isc 单位 mA 而库内为 A（需换算）"
+  ],
+  "n": 200,
+  "primary_cause": "焊带直流电阻偏高（均值 2.6 mΩ/m，spec 2.8）→ 串联电阻 Rs 上升 → Pmax 衰减",
+  "mechanism": "Rs = 0.28 + 0.09×(焊带电阻-2.2)；Pmax = 545 - 120×(Rs-0.30)，Rs 0.32→0.42 时 Pmax 掉约 12W",
+  "expected": [
+    "焊带电阻与 Rs 强正相关",
+    "Rs 与 Pmax 强负相关",
+    "Pmax/CTM Cpk 不足",
+    "Isc 换算为 A 后不应异常"
+  ],
+  "traps": [
+    {
+      "name": "Isc 列单位是 mA（值约 13500）",
+      "why_not": "若不换算，Isc 会被当成异常大值；且 Isc 本身与 Pmax 无因果关系"
+    }
+  ],
+  "biz_value": "换低阻焊带/优化焊接参数可挽回约 10W 功率损失，直接提升组件档位售价",
+  "spec_file": "spec_企业规格书.json"
+}
