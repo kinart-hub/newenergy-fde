@@ -8,6 +8,13 @@ package.py —— 把 Skill 打包为可分发的 zip
 
 import os
 import sys
+
+# 同 selftest.py：Windows 重定向输出时强制 UTF-8，避免中文被 cp1252 卡死。
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
 import json
 import zipfile
 import hashlib

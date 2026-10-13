@@ -16,6 +16,15 @@ selftest.py —— newenergy-fde 端到端自检
 
 import os
 import sys
+
+# Windows 上 stdout 一旦被重定向（CI 写日志就是这种），Python 会改用系统
+# ANSI 编码输出；英文版 runner 是 cp1252，打印中文直接 UnicodeEncodeError。
+# 这里强制 UTF-8，保证在任何 Windows 环境下都不因中文输出崩掉。
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
 import io
 import math
 import glob

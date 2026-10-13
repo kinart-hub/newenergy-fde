@@ -15,6 +15,15 @@ pipeline.py —— 工艺数据分析主流水线
 
 import os
 import sys
+
+# Windows 上 stdout 被重定向到文件/管道时（CI、> log.txt）Python 会切到
+# 系统 ANSI 编码，英文 runner 上是 cp1252，输出中文会抛 UnicodeEncodeError。
+# 强制 UTF-8，保证任何 Windows 环境下 CLI 都不因中文崩掉。
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
 import io
 import json
 import math

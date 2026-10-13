@@ -6,6 +6,13 @@ v1.10 质量护栏回归测试（独立于 selftest.py，便于快速验证护�
 """
 import os
 import sys
+
+# 同 selftest.py：Windows 重定向输出时强制 UTF-8，避免中文被 cp1252 卡死。
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
 import re
 import json
 import shutil
