@@ -1406,6 +1406,11 @@ def test_hotswap():
                     _json.loads(HS.read_text_retry(spec))
                 except Exception:
                     pass
+                # 让出 1ms。真实读者读完还要解析、算指标、写报告，不存在
+                # 100% 忙等的读进程；而 2 核 CI runner 上忙等会把 writer 线程
+                # 直接饿死——那样测出来的是调度器，不是原子写的健壮性。
+                # 留 1ms 后每秒仍有数百次并发读，压力依然足够。
+                time.sleep(0.001)
 
         def _writer():
             n = 0

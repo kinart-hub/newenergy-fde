@@ -67,13 +67,21 @@ def read_text_retry(path, encoding="utf-8", retries=8, base_delay=0.01):
     raise last
 
 
-def atomic_write_text(path, text, retries=12, base_delay=0.02):
+def atomic_write_text(path, text, retries=20, base_delay=0.01, max_delay=0.05):
     """
     写入文本：tmp + os.replace，Windows 上 replace 失败则退避重试。
 
     重试是必需的不是保守：实测 Windows 并发读场景下 replace 失败率约 1/3，
     不重试的话基线更新会随机失败，而调用方往往以为写成功了。
+
+    两个实测教训（2026-10-15 CI 上暴露，此前只在本地跑所以没发现）：
+    1. 线性退避 0.02*(i+1) 到最后几次会睡 0.24s，总耗时 1.5s+，
+       在慢机器上反而撑不过测试窗口。这里改成**封顶 + 抖动**：
+       单次最多睡 0.05s，20 次总耗时约 0.9s，覆盖更密。
+    2. 抖动不可省：两个进程同时写同一文件时，固定步长的退避会让它们
+       **同步重试、反复对撞**（惊群），加了抖动才能错开。
     """
+    import random
     d = os.path.dirname(path)
     if d:
         os.makedirs(d, exist_ok=True)
@@ -88,14 +96,24 @@ def atomic_write_text(path, text, retries=12, base_delay=0.02):
             return path
         except OSError as e:
             last = e
+            # 只重试"只是撞上共享冲突"的情况：Windows errno 13 / WinError 5。
+            # 磁盘满、路径非法这类重试多少次都不会好，尽早把真错误抛给调用方，
+            # 免得把 ENOSPC 之类伪装成"并发冲突"拖上 20 次再报。
+            if e.errno not in (13, 5) and e.errno is not None:
+                _cleanup(tmp)
+                raise
             # tmp 可能已生成但没换上，下一次重试会覆盖它
-            time.sleep(base_delay * (i + 1))
+            time.sleep(min(base_delay * (i + 1), max_delay) * (0.5 + random.random()))
+    _cleanup(tmp)
+    raise IOError("原子写失败（已重试 %d 次）：%s —— %s" % (retries, path, last))
+
+
+def _cleanup(tmp):
     try:
         if os.path.exists(tmp):
             os.remove(tmp)
     except Exception:
         pass
-    raise IOError("原子写失败（已重试 %d 次）：%s —— %s" % (retries, path, last))
 
 
 def atomic_write_json(path, data, retries=12, base_delay=0.02):
