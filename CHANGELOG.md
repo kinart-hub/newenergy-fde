@@ -43,6 +43,52 @@ Windows 上另一进程做 tmp+replace 的瞬间，读打开会被拒（Errno 13
 
 ---
 
+## 1.14.1 — 2026-10-18｜audit 规则带上判据，并加反向验证
+
+**为什么改**：`audit` 原来只有规则名和一段检查函数。名字叫"锁含 PID 存活探测"，
+判据却可能只是"文件里出现过 `_pid_alive`"——把代码改名成 `_pid_alive2`，
+或把 `class _Heartbeat` 改成 `class _HeartbeatOff`，规则照样判通过。
+**名字和判据是两回事，只有判据写得出来才算真规则。**
+
+- 规则数据结构改为 `Rule(desc, fn, criterion, target, mutants)`：
+  `criterion` 写清"什么算过、什么算不过"，`mutants` 写清"怎么人为破坏它"
+- 新增 `audit --selftest`：在**临时副本**上把每条规则人为破坏一遍
+  （18 条规则 / 24 个变异），没喊 FAIL 的就是没有判别力。
+  副本隔离是硬要求，注入缺陷绝不碰真实源码
+- 新增 `audit --show-criteria`：打印每条规则的判据清单
+
+**反向验证当场抓出的 5 处"假判据"**（改完才发现，改之前一律判通过）
+
+| 规则 | 旧判据 | 怎么蒙混过去的 |
+|---|---|---|
+| 入口 UTF-8 兜底 | 文件里含 `reconfigure` | 改成 `sys.stdout._no_reconfigure` 仍含子串 |
+| 原子写抖动/封顶 | 含 `random` / `max_delay` | 改成 `rand0m` / `max_delay_removed` 照样过 |
+| 锁心跳类 | `^class _Heartbeat` | `class _HeartbeatOff(` 照样匹配行首 |
+| 打包审计闸门 | 含 `prepublish_audit` | 改成 `prepublish_audit_removed` 照样过 |
+| D5 不下发设定值 | 含 `设定值` | 改成"给出建议设定值"照样过 |
+
+判据一律改成**调用形态**：`max_delay\s*=`、`class _Heartbeat\s*\(`、
+`sys\.(stdout|stderr)\.reconfigure\s*\(\s*encoding\s*=`、
+`不(?:含|给|下发)[^。\n]{0,12}设定值`。
+
+**新增 3 条规则**（补的是实测踩过的坑）
+- `Windows 上不用 os.kill 判活`：`_pid_alive` 里 os.kill 必须在平台判定之后。
+  判据只看行首缩进后的真实调用——否则会先命中 docstring 里那句
+  "Windows 上不写 os.kill(pid, 0)"，把正确实现判成违规（这条一开始就这么误报过）
+- `SKILL.md 引用的路径真实存在`：安装目录里 `scripts/fde_run.py`、
+  `scripts/prepublish_audit.py` **当时真的不存在**，SKILL.md 却在叫人先跑编排器
+- `编排器存在且被声明为第一动作`
+
+**修缺陷**
+- `rule_no_secret_in_repo` 原来"不是 git 仓库就记 SKIP"，于是安装目录里这条
+  永远不验证。改为非仓库环境走文件扫描，判据不变、覆盖范围不再有洞
+- 反向验证已接进 `verify` / `release` 的第 1 步和 CI，跑不掉
+
+验证：仓库与安装目录双向 `audit --selftest` 均 36 步全绿（0 失败 0 跳过）；
+`verify` 6 步全绿 47.8s。
+
+---
+
 ## 1.13.0 — 2026-10-12｜8D 完整化与交叉校验
 
 **新增**

@@ -39,6 +39,9 @@ jobs:
       - name: 确认零依赖（不安装任何包）
         run: python -c "import sys; print(sys.version)"
 
+      - name: 约定规则反向验证（把每条规则破坏一遍，看它喊不喊）
+        run: python scripts/fde_run.py audit --selftest --report output/_rules_selftest.json
+
       - name: 主自检
         run: python scripts/selftest.py
 

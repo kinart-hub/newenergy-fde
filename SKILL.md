@@ -38,8 +38,10 @@ allowed-tools: Read, Write, Edit, Glob, Grep, Bash(python:*), AskUserQuestion
 
 ```bash
 cd <skill_dir>
-python scripts/fde_run.py audit                       # 约定落地核查（15 条硬判据）
-python scripts/fde_run.py verify                      # 质量闸门全套
+python scripts/fde_run.py audit                       # 约定落地核查（18 条硬判据）
+python scripts/fde_run.py audit --show-criteria       # 打印每条规则的判据
+python scripts/fde_run.py audit --selftest            # 反向验证：故意破坏，看规则喊不喊
+python scripts/fde_run.py verify                      # 质量闸门全套（含反向验证）
 python scripts/fde_run.py analyze -i <数据> -o <输出>   # 交付主流程（含 8D）
 python scripts/fde_run.py release                     # 闸门 + 分发包指纹
 ```
@@ -54,9 +56,21 @@ python scripts/fde_run.py release                     # 闸门 + 分发包指纹
 
 退出码：`0 = PASS`  `1 = FAIL`  `3 = PARTIAL`
 
-每次优化和修复都要**同步固化进编排器的一条规则**（`audit` 的 15 条），
-否则下次仍然靠记忆，等于没学。新规则第一次跑真实数据必出误报，
-降噪时两条都要验：既验误报消失，也验注入的真缺陷仍能被抓到。
+每次优化和修复都要**同步固化进编排器的一条规则**（`audit` 的 18 条），
+否则下次仍然靠记忆，等于没学。
+
+## 加规则的三条硬规矩
+
+1. **规则 = 判据，不是规则名。** 每条规则必须写清"什么算过、什么算不过"，
+   并配 `mutants`（怎么人为破坏它）。只加规则不配变异，等于声明自己永远正确。
+2. **判据要看调用形态，不看词根。** 实测教训：判据写 `max_delay` 子串，
+   把代码改成 `max_delay_removed` 照样判过；写 `class _Heartbeat`，
+   改成 `class _HeartbeatOff` 照样判过。判据必须写成
+   `max_delay\s*=`、`class _Heartbeat\s*\(` 这种形态。
+3. **双向验证，缺一不算验过。** 新规则第一次跑真实数据必出误报，降噪时两条都要验：
+   既验误报消失（真实仓库 `audit` 全绿），也验注入的真缺陷仍能被抓到
+   （`audit --selftest`：在临时副本上把规则破坏一遍，没喊 FAIL 的就是没判别力）。
+   反向验证已接进 `verify` 的第 1 步，跑不掉的。
 
 ---
 
