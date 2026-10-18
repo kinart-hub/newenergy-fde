@@ -22,6 +22,7 @@ import os
 import time
 import errno
 import contextlib
+import threading
 
 SKILL_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -281,16 +282,91 @@ def write_layered(path, data):
 
 # --------------------------------------------------------------- 跨进程锁
 
+def _pid_alive(pid):
+    """进程是否还活着。跨平台，只用标准库。
+
+    为什么 Windows 上不写 os.kill(pid, 0)：
+    Windows 版 os.kill 的实现是 OpenProcess + TerminateProcess，
+    传 0 不是"探测一下"而是**真的会去终止那个进程**。
+    所以 Windows 走 ctypes 的 OpenProcess，只申请查询权限、绝不动手。
+
+    拿不到确定结论时一律返回 True——宁可多等，也不能抢活人的锁。
+    """
+    try:
+        pid = int(pid)
+    except Exception:
+        return True
+    if pid <= 0:
+        return False
+    if os.name != "nt":
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True          # 存在，只是没权限发信号
+        except OSError:
+            return True
+        return True
+    try:
+        import ctypes
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        ERROR_INVALID_PARAMETER = 87
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        h = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if h:
+            k32.CloseHandle(h)
+            return True
+        if ctypes.get_last_error() == ERROR_INVALID_PARAMETER:
+            return False         # 这个 pid 根本不存在
+        return True              # 拒绝访问等其它情况：保守当作活着
+    except Exception:
+        return True
+
+
+class _Heartbeat(threading.Thread):
+    """持锁期间定期刷新锁目录 mtime。
+
+    没有它，一个跑了 3 分钟的大库同步会被自己的 stale 规则判成"陈旧锁"
+    而被后来者抢掉，两个写者同时进场——那正是锁要防的事。
+    """
+    def __init__(self, path, interval):
+        threading.Thread.__init__(self)
+        self.daemon = True
+        self.path = path
+        self.interval = max(1.0, float(interval))
+        self._stop = threading.Event()
+
+    def run(self):
+        while not self._stop.wait(self.interval):
+            try:
+                os.utime(self.path, None)
+            except Exception:
+                return
+
+    def stop(self):
+        self._stop.set()
+
+
 @contextlib.contextmanager
 def lock(name="kb", timeout=15.0, stale=180.0):
     """
     基于 os.mkdir 原子性的互斥锁（POSIX 与 NTFS 上 mkdir 都是原子的）。
     拿不到就抛 TimeoutError 而不是死等——云端请求挂着比失败更糟。
-    stale 用于清理进程被 kill 后残留的锁目录。
+
+    破除陈旧锁必须有两条路，缺一条就会出事：
+      · 【快路】owner 文件里记着 pid，那个进程已经死了 → 立即破除。
+        产线上 Ctrl+C 中断后立刻重跑是常态，让人白等 15 秒再报错，
+        这种"莫名其妙卡一下"最伤信任，比直接失败更糟。
+      · 【慢路】mtime 超过 stale → 破除。兜底用，应对 pid 被复用、
+        owner 文件没写成功等边界情况。
+
+    心跳（_Heartbeat）保证慢路不会误伤真在跑的长任务。
     """
     base = os.path.join(tenant_root() or SKILL_ROOT, ".lock")
     d = os.path.join(base, _safe_id(name))
     os.makedirs(base, exist_ok=True)
+    owner_file = os.path.join(d, "owner")
     deadline = time.time() + timeout
     got = False
     while True:
@@ -301,30 +377,47 @@ def lock(name="kb", timeout=15.0, stale=180.0):
         except OSError as e:
             if e.errno not in (errno.EEXIST, 183, 17):
                 raise
+            dead_owner = False
+            try:
+                with io.open(owner_file, encoding="utf-8") as f:
+                    dead_owner = not _pid_alive(f.read().strip())
+            except Exception:
+                dead_owner = False
             try:
                 age = time.time() - os.path.getmtime(d)
             except Exception:
-                age = 0
-            if age > stale:                       # 陈旧锁：上一进程没来得及清
+                age = 0.0
+            if dead_owner or age > stale:
                 try:
+                    for p in os.listdir(d):
+                        try:
+                            os.remove(os.path.join(d, p))
+                        except Exception:
+                            pass
                     os.rmdir(d)
                     continue
                 except Exception:
                     pass
             if time.time() >= deadline:
-                raise TimeoutError("获取知识库锁超时（%.0fs），可能正有其它任务在写库" % timeout)
+                raise TimeoutError(
+                    "获取知识库锁超时（%.0fs），可能正有其它任务在写库。"
+                    "若确认没有其它任务在跑，可手动删除 %s 后重试。" % (timeout, d))
             time.sleep(0.05)
+    hb = None
     try:
-        with io.open(os.path.join(d, "owner"), "w", encoding="utf-8") as f:
+        with io.open(owner_file, "w", encoding="utf-8") as f:
             f.write("%d" % os.getpid())
         os.utime(d, None)
+        hb = _Heartbeat(d, stale / 4.0)
+        hb.start()
         yield d
     finally:
+        if hb is not None:
+            hb.stop()
         if got:
             try:
-                p = os.path.join(d, "owner")
-                if os.path.exists(p):
-                    os.remove(p)
+                if os.path.exists(owner_file):
+                    os.remove(owner_file)
                 os.rmdir(d)
             except Exception:
                 pass

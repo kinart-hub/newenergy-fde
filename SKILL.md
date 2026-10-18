@@ -30,6 +30,36 @@ allowed-tools: Read, Write, Edit, Glob, Grep, Bash(python:*), AskUserQuestion
 不需要 pandas / numpy / matplotlib / openpyxl —— 这是刻意的，保证分发到企业端时无需 pip install。
 不要在脚本里 import 第三方库。
 
+## 第一动作：先跑编排器，不要自己拼命令
+
+接到任务后**先跑编排器**，不要凭记忆挑脚本。多步流程只写在文档里时，
+靠临场记忆决定"这步该跑哪个"，漏掉的步骤没有人发现——
+实测有脚本在两个真实项目里一次都没跑过。
+
+```bash
+cd <skill_dir>
+python scripts/fde_run.py audit                       # 约定落地核查（15 条硬判据）
+python scripts/fde_run.py verify                      # 质量闸门全套
+python scripts/fde_run.py analyze -i <数据> -o <输出>   # 交付主流程（含 8D）
+python scripts/fde_run.py release                     # 闸门 + 分发包指纹
+```
+
+编排器用代码保证三件事，不靠自觉：
+
+1. 一条命令串完所有步骤，不漏项
+2. 每步记录命令 / 退出码 / 耗时 / 输出，写进 `<outdir>/_fde_run_report.json`
+   ——**跑没跑由文件证明，不是口头声称**
+3. 状态分 PASS / PARTIAL / FAIL。**有步骤被跳过就是 PARTIAL（退出码 3），
+   绝不报成通过**。"别的步骤都过了"推不出"整体已验证"
+
+退出码：`0 = PASS`  `1 = FAIL`  `3 = PARTIAL`
+
+每次优化和修复都要**同步固化进编排器的一条规则**（`audit` 的 15 条），
+否则下次仍然靠记忆，等于没学。新规则第一次跑真实数据必出误报，
+降噪时两条都要验：既验误报消失，也验注入的真缺陷仍能被抓到。
+
+---
+
 ## 工作流
 
 ### 第 1 步：拿到数据，判断形态

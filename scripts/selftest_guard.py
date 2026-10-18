@@ -437,6 +437,55 @@ if True:
 
     shutil.rmtree(_pdir, ignore_errors=True)
 
+
+# --------------------------------------------------------------- Q 组
+print("\nQ. 流程代码化：编排器与锁健壮性")
+
+_RUN = os.path.join(ROOT, "scripts", "fde_run.py")
+check("编排器脚本存在（多步流程必须有唯一入口）", os.path.exists(_RUN), _RUN)
+
+_rc = subprocess.run(
+    [sys.executable, _RUN, "audit",
+     "--report", os.path.join(ROOT, "output", "_guard_audit.json")],
+    cwd=ROOT, capture_output=True, text=True,
+    encoding="utf-8", errors="replace", timeout=300)
+check("编排器 audit 全通过（约定落在代码里，不是只写在文档里）",
+      _rc.returncode == 0, "退出码=%s" % _rc.returncode)
+
+# PARTIAL 语义：跳过就是跳过，不许报成通过
+sys.path.insert(0, os.path.join(ROOT, "scripts"))
+try:
+    import importlib
+    _fr = importlib.import_module("fde_run")
+    _st, _code, _ = _fr._status_of([{"status": "PASS"}, {"status": "SKIP"}])
+    check("有步骤被跳过时判定 PARTIAL（退出码 3）而非 PASS",
+          _st == "PARTIAL" and _code == 3, "%s/%s" % (_st, _code))
+    _st2, _code2, _ = _fr._status_of([{"status": "PASS"}, {"status": "FAIL"}])
+    check("有步骤失败时判定 FAIL（退出码 1）",
+          _st2 == "FAIL" and _code2 == 1, "%s/%s" % (_st2, _code2))
+except Exception as _e:
+    check("编排器可导入且状态判定可用", False, "%s: %s" % (type(_e).__name__, _e))
+
+# 锁：死进程残留锁必须立即破除。产线上 Ctrl+C 后立刻重跑是常态，
+# 让人白等 15 秒再报错，这种"莫名其妙卡一下"最伤信任。
+from lib import tenancy as _TN
+_lk = tempfile.mkdtemp(prefix="guardlk-")
+_TN.set_root(_lk)
+_ld = os.path.join(_lk, ".lock", "kb")
+os.makedirs(_ld, exist_ok=True)
+_dead = subprocess.run([sys.executable, "-c", "import os;print(os.getpid())"],
+                       capture_output=True, text=True).stdout.strip()
+with open(os.path.join(_ld, "owner"), "w", encoding="utf-8") as _f:
+    _f.write(_dead)
+_t0 = time.time()
+with _TN.lock("kb", timeout=15.0):
+    pass
+_cost = time.time() - _t0
+check("死进程残留锁立即破除（不得让人白等 15 秒）", _cost < 3.0, "%.2fs" % _cost)
+check("锁实现了 PID 存活探测", hasattr(_TN, "_pid_alive"))
+check("锁实现了心跳（防长任务被 stale 规则误抢）", hasattr(_TN, "_Heartbeat"))
+shutil.rmtree(_lk, ignore_errors=True)
+
 print("")
 fails = [r for r in RESULTS if not r[1]]
 print("通过 %d 项，失败 %d 项" % (len(RESULTS) - len(fails), len(fails)))
