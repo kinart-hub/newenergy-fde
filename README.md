@@ -759,6 +759,23 @@ python scripts/package.py       # 生成 dist/newenergy-fde-<version>.zip
 | **知识库覆盖有限** | 93 参数覆盖主流工序，但各厂配方/机型差异大 | 用 `--spec` 传企业规格；缺漏字段用 `kb_manage.py` 补参数/别名，改动走审核且可回滚 |
 
 
+## 10. 联系与商业授权
+
+| 事项 | 渠道 |
+| --- | --- |
+| **商业授权 / 内网部署 / 定制工序包 / 托管服务** | 邮箱 **kinartcn@gmail.com** |
+| **使用交流 / 试用反馈 / 想拿脱敏数据看效果** | 微信扫码 ↓ |
+| 缺陷报告与需求 | [Discussions](https://github.com/kinart-hub/newenergy-fde/discussions) |
+
+<p align="center">
+  <img src="assets/wechat-contact.jpg" alt="微信联系：扫码加好友" width="240">
+</p>
+
+> 来信请写清楚：要解决的问题、数据规模、部署形态（单机 / 内网 / 云端）。
+> 微信请备注来意（如「FDE 试用」）。
+> **有脱敏数据想看效果？直接发过来，我出一份报告给你。**
+
+
 ## 11. 版本
 
 ### `1.13.0` — 2026-10-12（8D 完整 D1–D8：录入卡交叉校验 + 确审闸门）
