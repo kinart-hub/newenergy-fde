@@ -6,6 +6,39 @@
 
 相关性分析 → 不良 Pareto → 根因定位 → DOE 寻优 → 标准化报告。
 
+![License](https://img.shields.io/badge/license-Elastic--2.0-blue)
+![Python](https://img.shields.io/badge/python-3.8%2B-blue)
+![Dependencies](https://img.shields.io/badge/dependencies-0-brightgreen)
+![Self-test](https://img.shields.io/badge/selftest-279%20passing-brightgreen)
+
+![newenergy-fde](assets/social-preview.png)
+
+> **许可一句话**：Elastic License 2.0，**源码可得（source-available），不是 OSI 开源**。
+> 个人与企业内部自用免费；对外提供托管服务需商业授权。详见[第 0 节](#0-先说清楚许可这不是开源项目)。
+
+---
+
+## 30 秒跑通
+
+```bash
+git clone https://github.com/kinart-hub/newenergy-fde.git
+cd newenergy-fde
+
+python scripts/selftest.py          # 279 项端到端自检，应全部通过
+python scripts/fde_run.py analyze -i examples/01_涂布工艺数据.csv -o output/try
+```
+
+跑完看 `output/try/`：工艺分析报告、8D 初稿（D1–D8）、图表、结构化 `result.json`。
+**不需要 `pip install` 任何东西**——全部用 Python 标准库实现，内网离线可用。
+
+## 三种用法
+
+| 形态 | 怎么用 | 适合谁 |
+| --- | --- | --- |
+| **AI Skill**（推荐） | 装进支持 Skill 的 AI 客户端，直接说"分析这份涂布数据" | 不想碰命令行的工艺/质量工程师 |
+| **命令行** | `python scripts/fde_run.py analyze -i <数据> -o <输出>` | 要批量跑、要接定时任务的场景 |
+| **编程集成** | 调用 `lib/pipeline.py` | 集成进自有系统（**对外提供服务需商业授权**） |
+
 ---
 
 ## 0. 先说清楚许可（这不是开源项目）
@@ -104,7 +137,7 @@ python lib/pipeline.py --input data.xlsx --target "不良率(%)" \
 # 传入企业规格（强烈建议，Cpk 才有效力）
 python lib/pipeline.py --input data.csv --spec spec.json --outdir out
 
-# 自检（246 项，含设备适配层、跨工序追溯、多企业隔离、行业作用域、基线热更新、设备记忆与知识库演进）
+# 自检（279 项，含设备适配层、跨工序追溯、多企业隔离、行业作用域、基线热更新、设备记忆与知识库演进）
 python scripts/selftest.py
 ```
 
@@ -160,7 +193,7 @@ newenergy-fde/
 │       ├── kb_manage.py              知识库管理台（status/list/propose/intake/harvest/
 │   │                             review/sync/verify/cases/devices/industries/update/rollback/patch）
 │   ├── make_device_samples.py    生成多厂商版式的对照样例（同一真值、不同导出）
-│   └── selftest.py               246 项端到端自检（含设备适配层、跨工序追溯、多企业隔离、行业作用域、基线热更新、设备记忆与知识库演进）
+│   └── selftest.py               279 项端到端自检（含设备适配层、跨工序追溯、多企业隔离、行业作用域、基线热更新、设备记忆与知识库演进）
 └── examples/
     ├── *.csv                     七类示例数据（含一个私有列名导出样例）
     └── devices/*.csv             六类设备导出样例（竖表/双行表头/单位行/合计行/未知设备)
@@ -867,7 +900,7 @@ python scripts/package.py       # 生成 dist/newenergy-fde-<version>.zip
 实测同一设备四种导出形态，Cpk 由 0.36~~0.41 跳动收敛为 1.26~~1.33（真值 1.33）。  
 新增单元级异常检验（逐水平 + Bonferroni 校正）抓「个别通道/卷针/供应商跑偏」，  
 补共线剔除与链式传导归因。建立 sweep 自我完善闭环（10 种子 × 7 套 = 70 套全命中）。  
-自检 246 项全通过。
+自检 279 项全通过。
 
 `1.7.0` — 2026-10-10
 
