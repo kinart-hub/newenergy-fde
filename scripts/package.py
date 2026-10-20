@@ -26,8 +26,11 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # 把 A 企业的私有参数发给 B 企业是最严重的一种数据泄露
 # .lock：进程被 kill 后残留的锁目录，无信息量，随包分发只会让接收方困惑
 # _private：签发私钥 / 客户许可证 / 授权工具，绝不可随任何包外发
+# pandas_reference：仅供对照阅读的 pandas 版参考实现，依赖第三方库，
+# 随包分发会与「零第三方依赖」的交付口径冲突，也会污染接收方的依赖扫描。
 EXCLUDE_DIRS = {"output", "dist", "__pycache__", ".git", ".vscode", ".idea",
-                "backups", "tenants", "promotion", ".lock", "_private"}
+                "backups", "tenants", "promotion", ".lock", "_private",
+                "pandas_reference"}
 EXCLUDE_EXT = {".pyc", ".pyo", ".DS_Store"}
 # prepublish_audit.py 是仓库/CI 侧的治理工具，不属于 Skill 运行时；
 # 而且它内部就带着一整套「不许出现的东西」的正则字面量，随包分发会污染接收方的扫描。
