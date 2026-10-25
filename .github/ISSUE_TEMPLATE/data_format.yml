@@ -1,0 +1,46 @@
+name: 数据格式适配请求
+description: "我们的设备/系统导出格式 FDE 认不出或认错——这是别名库与设备档案的直接来源，欢迎提"
+labels: ["device-adaptation"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        这个模板**只需要列名，不需要数据值**。每一条被采纳的格式请求都会
+        进入内置设备档案/别名库，并随下个版本发布。
+  - type: input
+    id: device
+    validations:
+      required: true
+    attributes:
+      label: 设备 / 系统名称
+      description: 型号或软件名（如不愿透露品牌，写"国产面密度仪"这类泛称也可以）
+  - type: dropdown
+    id: industry
+    validations:
+      required: true
+    attributes:
+      label: 行业
+      options:
+        - 锂电池
+        - 光伏
+        - 其他（备注里说明）
+  - type: textarea
+    id: columns
+    validations:
+      required: true
+    attributes:
+      label: 导出列名清单（原样复制即可）
+      description: 直接把表头一行（或多级表头的全部几行）粘贴进来，含单位行
+      placeholder: |
+        例：
+        批次,点位,面密度(g/m2),厚度(μm),时间
+  - type: textarea
+    id: quirks
+    attributes:
+      label: 导出的"怪癖"
+      description: 统计尾行？合并单元格？逗号小数点？GBK 编码？同名参数多种叫法？
+  - type: textarea
+    id: alias
+    attributes:
+      label: 现场叫法
+      description: 这个参数在你们现场/邮件里通常怎么称呼（这是别名库最缺的信息）

@@ -1,0 +1,52 @@
+name: 缺陷报告
+description: 报告一个分析结果错误或运行缺陷（结论错误比崩溃更有价值，请优先报告）
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **结论类问题（静默错结论）比崩溃更受欢迎**——能复现的错误结论是最有价值的反馈。
+        请贴出可直接复现的最小信息；涉及企业数据请先脱敏（列名、规格上下限可保留，数值可缩放）。
+  - type: textarea
+    id: what-happened
+    validations:
+      required: true
+    attributes:
+      label: 发生了什么
+      description: 期望结果 vs 实际结果。若是结论错误：真实情况是什么（如"真因应是 X，报告给了 Y"）
+  - type: textarea
+    id: repro
+    validations:
+      required: true
+    attributes:
+      label: 复现步骤
+      placeholder: |
+        命令 / 提示词：
+        python scripts/fde_run.py analyze -i examples/01_涂布工艺数据.csv -o output/try
+        （或 AI 客户端内的原话）
+  - type: textarea
+    id: data-desc
+    validations:
+      required: true
+    attributes:
+      label: 数据概况（脱敏）
+      description: 工序 / 设备型号 / 大致行数 / 表头形态（单行表头？多级？含单位行？）/ 目标参数名
+      placeholder: 例：涂布面密度，某 laserscribe 导出，约 2000 行，多级表头含单位行
+  - type: input
+    id: version
+    validations:
+      required: true
+    attributes:
+      label: FDE 版本
+      placeholder: 例：v1.14.3（报告 result.json 里 analyzer_version 字段）
+  - type: dropdown
+    id: consent
+    validations:
+      required: true
+    attributes:
+      label: 是否愿意提供脱敏数据样例
+      description: 愿意的话我们会开私人通道（邮件），数据仅用于修复验证，不入库、不公开
+      options:
+        - 愿意
+        - 仅口头描述
+        - 暂不方便

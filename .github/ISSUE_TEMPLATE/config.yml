@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 使用问题 / 交流
+    about: 不确定是不是缺陷？先到 Discussions 的 Q&A 分类问
+    url: https://github.com/kinart-hub/newenergy-fde/discussions
+  - name: 商业授权咨询
+    about: 对外托管服务、内网批量部署、定制工序与设备档案
+    url: https://github.com/kinart-hub/newenergy-fde/discussions/categories/commercial-licensing
