@@ -56,6 +56,59 @@ _BAD_HINT = ("不良", "缺陷", "报废", "返工", "次品", "reject", "defect
              "裂纹", "毛刺", "短路", "起皱", "褶皱", "色差", "氧化", "水印", "缺口")
 
 
+# 「现场叫法 → 标准条目」的别名索引（懒构建 + 缓存）
+_DEFECT_NAMES_CACHE = {}
+
+
+def _defect_alias_names(dk, dv):
+    """返回某缺陷的全部叫法（已归一化）：键名 + 自身 aliases + param_key 的 aliases。
+
+    为什么需要这一层：知识库按**机理**命名（「隔膜褶皱」「黑心」），
+    现场按**现象**叫（「极片起皱」「黑斑」）。同一个缺陷两个名字对不上号，
+    匹配就断链 —— 库里明明有机理，却走了「未收录」兜底，
+    工程师拿到的 8D 报告 D4 栏只能写着「机理未收录」。
+
+    别名有三个来源，合并去重：
+      1. 条目键名本身
+      2. 条目的 aliases 字段（现场叫法，最直接）
+      3. param_key 指向的 params 条目的 aliases（复用，避免两处维护）
+
+    **但第 3 条有个前提**：param_key 必须是一个「缺陷计量列」。
+    「功率衰减」「内阻偏高」「容量一致性差」这类缺陷是由**结果指标本身的漂移**
+    定义的，它们的 param_key 指向 pmax / acir / capacity —— 那是**被分析的目标量**，
+    不是缺陷计数列。把目标量的别名（Pmax / 功率 / 峰值功率）当成缺陷叫法，
+    会让 identify_defects 把功率列本身识别成「功率衰减」缺陷列，
+    进而让目标列 == 缺陷列、共线排除判据失效（实测踩过：E06 组件IV 用例直接翻红）。
+    所以这类条目的别名只认键名与显式 aliases，不继承结果指标的别名。
+    """
+    hit = _DEFECT_NAMES_CACHE.get(dk)
+    if hit is not None:
+        return hit
+    kb = _kb()
+    names = [dk] + list(dv.get("aliases") or [])
+    pk = dv.get("param_key")
+    if pk and not dv.get("response_defect"):
+        pv = (kb.get("params") or {}).get(pk) or {}
+        names += list(pv.get("aliases") or [])
+    out, seen = [], set()
+    for n in names:
+        if not n:
+            continue
+        nn = PP._norm_name(n)
+        if nn and nn not in seen:
+            seen.add(nn)
+            out.append(nn)
+    _DEFECT_NAMES_CACHE[dk] = out
+    return out
+
+
+def _name_hits(alias_norm, col_norm):
+    """别名是否命中列名：精确相等，或别名是列名的子串（长度≥2 防单字误命中）。"""
+    if alias_norm == col_norm:
+        return True
+    return len(alias_norm) >= 2 and alias_norm in col_norm
+
+
 def identify_defects(table, hint=None, process=None):
     """从数据列中识别缺陷类型（含 EL 缺陷分类），返回 [(缺陷名, 列名, 计数/率)]
 
@@ -64,24 +117,40 @@ def identify_defects(table, hint=None, process=None):
     """
     kb = _kb()
     found = []
-    # 1. 直接命中知识库缺陷名
+    # 1. 命中知识库缺陷名（含「现场叫法」别名反查）
+    #
+    #    先做一次「列 → 最具体条目」的裁决，再按条目顺序收录。
+    #    为什么必须先裁决：别名一多就会出现交叉命中 ——
+    #    「边缘短路」同时含「短路」（内短路的别名）和「边缘漏电」，
+    #    不裁决就会把同一列算进两个缺陷，Pareto 总量虚高、根因指向也跟着错。
+    #    裁决规则：**最长别名优先**，别名越长越具体。
+    col_best = {}
+    for c in table.columns:
+        nc = PP._norm_name(c)
+        best_dk, best_len = None, 0
+        for dk, dv in kb["defect_rootcause"].items():
+            for nn in _defect_alias_names(dk, dv):
+                if _name_hits(nn, nc) and len(nn) > best_len:
+                    best_dk, best_len = dk, len(nn)
+        if best_dk:
+            col_best[c] = best_dk
+
     for dk, dv in kb["defect_rootcause"].items():
-        nd = PP._norm_name(dk)
         for c in table.columns:
-            nc = PP._norm_name(c)
-            if nd == nc or (len(nd) >= 2 and nd in nc):
-                vals = table.numeric_column(c)
-                valid = [v for v in vals if v is not None]
-                if valid:
-                    found.append({"defect": dk, "column": c,
-                                  "total": sum(valid), "n_records": len(valid),
-                                  # v1.13：不良「件数」是"有多少个件出现了该缺陷"，
-                                  # 不是缺陷计数之和。一个组件上有 3 处隐裂，
-                                  # 那是 1 件不良、不是 3 件 —— 用 total 算不良率会
-                                  # 算出 200%+ 的荒唐值（8D D2 直接踩到）。
-                                  "n_positive": len([v for v in valid if v > 0]),
-                                  "mean": S.mean(valid), "process": dv["process"],
-                                  "is_count": _is_count_series(valid)})
+            if col_best.get(c) != dk:
+                continue
+            vals = table.numeric_column(c)
+            valid = [v for v in vals if v is not None]
+            if valid:
+                found.append({"defect": dk, "column": c,
+                              "total": sum(valid), "n_records": len(valid),
+                              # v1.13：不良「件数」是"有多少个件出现了该缺陷"，
+                              # 不是缺陷计数之和。一个组件上有 3 处隐裂，
+                              # 那是 1 件不良、不是 3 件 —— 用 total 算不良率会
+                              # 算出 200%+ 的荒唐值（8D D2 直接踩到）。
+                              "n_positive": len([v for v in valid if v > 0]),
+                              "mean": S.mean(valid), "process": dv["process"],
+                              "is_count": _is_count_series(valid)})
     # 1b. 数据驱动补充：知识库没有的缺陷叫法（企业自定义），只要确实是计数列就纳入。
     #     否则「掉料」这类现场常用名会被整列忽略，Pareto 与根因都会跑偏。
     known_cols = {f.get("column") for f in found}
@@ -107,9 +176,10 @@ def identify_defects(table, hint=None, process=None):
     # 2. 分类列中包含缺陷名称作为取值
     for c in table.text_columns():
         vals = [str(v) for v in table.column(c) if v not in (None, "")]
-        for dk in kb["defect_rootcause"]:
-            nd = PP._norm_name(dk)
-            hits = sum(1 for v in vals if nd in PP._norm_name(v))
+        for dk, dv in kb["defect_rootcause"].items():
+            dnames = _defect_alias_names(dk, dv)
+            hits = sum(1 for v in vals
+                       if any(_name_hits(nn, PP._norm_name(v)) for nn in dnames))
             if hits:
                 found.append({"defect": dk, "column": c, "count": hits,
                               "n_records": len(vals), "as_category": True,
@@ -117,7 +187,7 @@ def identify_defects(table, hint=None, process=None):
     if hint:
         nd = PP._norm_name(hint)
         for dk, dv in kb["defect_rootcause"].items():
-            if PP._norm_name(dk) in nd or nd in PP._norm_name(dk):
+            if any(nn in nd or nd in nn for nn in _defect_alias_names(dk, dv)):
                 found.insert(0, {"defect": dk, "column": None, "from_hint": True,
                                  "process": dv["process"]})
     # 去重
@@ -447,6 +517,29 @@ def rank_root_causes(defect_name, table, target_col=None, top=5,
 
 # ------------------------------------------------------------------ 5Why
 
+def _unregistered_hint(defect_name, layer="defect"):
+    """缺陷未收录时的可行动提示（分「工序层」与「机理层」两种措辞）。
+
+    只回一句「机理未收录」等于把问题原样丢回给工程师 —— 他早就看见了，
+    他真正需要知道的是两件事：
+      1. 这份报告还能信到哪一步（答：第 3 层以下的数据证据不受影响）
+      2. 怎么把这条补进知识库（答：给可直接复制的命令）
+
+    两层用不同措辞：第 1 层说「定位不到工序」，第 2 层说「机理缺失」，
+    否则工程师会看到同一句话印两遍，反而以为报告出错了。
+    """
+    if layer == "process":
+        return ("「%s」尚未收录进根因知识库，无法自动定位所属工序，"
+                "故本层无工序机理可引用。可运行时用 `--process <工序>` 显式指定，"
+                "或按第 2 层提示补录该缺陷条目。" % defect_name)
+    return ("「%s」尚未收录进根因知识库，机理先验缺失。"
+            "但请注意：第 3 层以下的数据证据不受影响 —— 关联强度、分组差异、"
+            "时序吻合度都是从你的数据直接算出的，仍然可用。"
+            "补录方式：先 `python scripts/kb_manage.py scaffold --type defect_new` 取骨架，"
+            "填 key / process / mechanism 后 propose，"
+            "再由负责人 review --approve 并 sync 生效。" % defect_name)
+
+
 def build_5why(defect_name, top_causes, table=None, target_col=None):
     """生成 5Why 链条（基于知识库机理 + 数据事实），并标注哪些层有数据支撑"""
     kb = _kb()
@@ -454,18 +547,24 @@ def build_5why(defect_name, top_causes, table=None, target_col=None):
     proc = kb["processes"].get(info.get("process", ""), {})
     lead = top_causes[0] if top_causes else None
     chain = []
+    pnotes = proc.get("notes")
+    known = bool(info)
+    # 未收录时不能只回「机理未收录」——那是把问题原样丢回给工程师。
+    # 要同时说清：本报告剩余部分还能信到哪一步、以及怎么把这条补上。
+    fallback = _unregistered_hint(defect_name, "process") if not known else \
+        "该工序的工艺机理尚未在知识库中细化"
 
     chain.append({
         "level": 1,
         "why": "为什么出现「%s」？" % defect_name,
-        "because": proc.get("notes", "该工序的工艺机理尚未在知识库中细化"),
-        "evidence": "知识库工序机理",
-        "supported": bool(proc.get("notes")),
+        "because": pnotes or fallback,
+        "evidence": "知识库工序机理" if pnotes else "知识库未收录（可补录）",
+        "supported": bool(pnotes),
     })
     chain.append({
         "level": 2,
         "why": "为什么该工序会出现这种状态？",
-        "because": info.get("mechanism", "机理未收录"),
+        "because": info.get("mechanism") or _unregistered_hint(defect_name),
         "evidence": "知识库缺陷机理",
         "supported": bool(info.get("mechanism")),
     })

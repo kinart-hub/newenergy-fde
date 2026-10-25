@@ -524,7 +524,8 @@
         "涂布车速",
         "coating line speed",
         "Speed",
-        "speed"
+        "speed",
+        "CoatSpeed"
       ],
       "typical_range": [
         10,
@@ -1388,7 +1389,10 @@
         "泵速",
         "螺杆泵转速",
         "pump speed",
-        "供料泵转速"
+        "供料泵转速",
+        "PumpRPM",
+        "Pump RPM",
+        "泵转速"
       ],
       "control": {
         "mode": "deviation_pct",
@@ -1406,7 +1410,9 @@
         "辊间隙",
         "gap ratio",
         "涂布间隙",
-        "垫片厚度"
+        "垫片厚度",
+        "Gap",
+        "辊缝"
       ],
       "control": {
         "mode": "deviation_pct",
@@ -2907,6 +2913,56 @@
       },
       "note": "电芯厚度超差会影响壳体装配与内部压力，结果指标。",
       "role": "response"
+    },
+    "foil_exposure": {
+      "name": "极片露箔",
+      "process": "battery_coating",
+      "unit": "处",
+      "role": "response",
+      "aliases": [
+        "露箔",
+        "漏箔",
+        "露箔数",
+        "箔材外露",
+        "foil exposure",
+        "漏涂",
+        "漏涂点",
+        "空箔",
+        "露基材"
+      ],
+      "typical_range": [
+        0,
+        50
+      ],
+      "control": {
+        "mode": null
+      },
+      "note": "涂布局部未覆盖浆料而露出箔材。判定阈值由企业内控标准决定，本库不预设。"
+    },
+    "gas_swelling": {
+      "name": "化成产气鼓包",
+      "process": "battery_formation",
+      "unit": "只",
+      "role": "response",
+      "aliases": [
+        "鼓包",
+        "产气",
+        "胀气",
+        "气胀",
+        "swelling",
+        "gas",
+        "电池鼓包",
+        "厚度超标",
+        "膨胀"
+      ],
+      "typical_range": [
+        0,
+        50
+      ],
+      "control": {
+        "mode": null
+      },
+      "note": "化成/搁置期间产气导致电芯厚度超出公差。判定阈值由企业内控标准决定，本库不预设。"
     }
   },
   "defect_rootcause": {
@@ -2935,6 +2991,13 @@
       "carry_over_from": [],
       "clearing_evidence": [
         "本工序为整线该指标的源头工序，追溯目标指向浆料制备（未在本库中建模）"
+      ],
+      "param_key": "areal_density",
+      "aliases": [
+        "面密度异常",
+        "涂布量超差",
+        "AD超差",
+        "面密度偏差"
       ]
     },
     "针孔气泡": {
@@ -2960,6 +3023,14 @@
       "carry_over_from": [],
       "clearing_evidence": [
         "浆料脱泡记录与静置时间（浆料工序未在本库中建模，需另行索取）"
+      ],
+      "aliases": [
+        "气泡",
+        "针孔",
+        "气孔",
+        "pinhole",
+        "麻点",
+        "气泡点"
       ]
     },
     "厚边": {
@@ -2983,6 +3054,13 @@
       "carry_over_from": [],
       "clearing_evidence": [
         "浆料粘度批次检验记录"
+      ],
+      "param_key": "edge_thickness",
+      "aliases": [
+        "厚边高度",
+        "边缘偏厚",
+        "edge buildup",
+        "边缘厚"
       ]
     },
     "极片错位": {
@@ -3011,7 +3089,8 @@
       "clearing_evidence": [
         "上游极片厚度一致性（同批次压后厚度分布）",
         "上游是否有波浪边/厚度不均的不良记录"
-      ]
+      ],
+      "param_key": "electrode_misalignment"
     },
     "隔膜褶皱": {
       "process": "battery_winding",
@@ -3034,6 +3113,14 @@
       "carry_over_from": [],
       "clearing_evidence": [
         "隔膜来料批次与放卷张力设定"
+      ],
+      "aliases": [
+        "极片起皱",
+        "隔膜起皱",
+        "褶皱",
+        "起皱",
+        "wrinkle",
+        "打折"
       ]
     },
     "内短路": {
@@ -3059,6 +3146,14 @@
       "carry_over_from": [],
       "clearing_evidence": [
         "分切毛刺抽检记录（分切工序未在本库中建模，需另行索取）"
+      ],
+      "param_key": "hi_pot_pass",
+      "aliases": [
+        "短路",
+        "微短路",
+        "hi-pot不良",
+        "耐压不良",
+        "internal short"
       ]
     },
     "自放电超标": {
@@ -3091,6 +3186,13 @@
         "上游卷绕的毛刺/异物检出记录",
         "上游注液的极片含水量与露点记录",
         "上游内短路检出率（同批次电芯）"
+      ],
+      "param_key": "self_discharge_k",
+      "aliases": [
+        "K值超标",
+        "自放电大",
+        "压降超标",
+        "self discharge高"
       ]
     },
     "容量一致性差": {
@@ -3121,7 +3223,15 @@
         "上游涂布面密度的批次均值与 Cpk（容量对涂布量最敏感）",
         "上游注液量偏差的分布",
         "化成柜各温区的实际温度分布"
-      ]
+      ],
+      "param_key": "capacity",
+      "aliases": [
+        "容量离散",
+        "容量一致性",
+        "一致性差",
+        "容量偏差大"
+      ],
+      "response_defect": true
     },
     "内阻偏高": {
       "process": "battery_formation",
@@ -3151,7 +3261,15 @@
         "上游辊压的压实密度与是否过压",
         "上游注液后的浸润时间与浸润效果",
         "焊接工序接触电阻（未在本库中建模）"
-      ]
+      ],
+      "param_key": "acir",
+      "aliases": [
+        "内阻大",
+        "内阻超标",
+        "ACIR偏高",
+        "DCR偏高"
+      ],
+      "response_defect": true
     },
     "TTV超差": {
       "process": "pv_wafer",
@@ -3176,7 +3294,14 @@
       "carry_over_from": [],
       "clearing_evidence": [
         "本工序为硅片几何量的源头；再往上需索取切片线锯参数（未在本库中建模）"
-      ]
+      ],
+      "param_key": "ttv",
+      "aliases": [
+        "TTV偏大",
+        "厚度偏差超差",
+        "总厚度偏差"
+      ],
+      "response_defect": true
     },
     "隐裂": {
       "process": "pv_cell_el",
@@ -3207,6 +3332,12 @@
         "上游硅片的翘曲度 Warp 与厚度分布",
         "来料批次与供应商是否变更",
         "EL 隐裂是否集中在某一来料批次"
+      ],
+      "param_key": "el_crack",
+      "aliases": [
+        "微裂纹",
+        "裂纹",
+        "隐裂片"
       ]
     },
     "断栅": {
@@ -3235,6 +3366,12 @@
       "clearing_evidence": [
         "上游硅片厚度一致性与TTV",
         "印刷浆料粘度批次记录"
+      ],
+      "param_key": "el_broken_grid",
+      "aliases": [
+        "断线",
+        "栅线断裂",
+        "断栅线"
       ]
     },
     "FF偏低": {
@@ -3263,7 +3400,14 @@
       "clearing_evidence": [
         "上游 EL 检出的隐裂/断栅比例",
         "串联电阻 Rs 的分档分布"
-      ]
+      ],
+      "param_key": "fill_factor",
+      "aliases": [
+        "填充因子低",
+        "FF低",
+        "FF不足"
+      ],
+      "response_defect": true
     },
     "热斑": {
       "process": "pv_module_iv",
@@ -3291,6 +3435,12 @@
       "clearing_evidence": [
         "上游是否有功率失配分拣",
         "组件内电池片的电流分档一致性"
+      ],
+      "param_key": "hotspot_temp",
+      "aliases": [
+        "热点",
+        "hotspot",
+        "局部发热"
       ]
     },
     "功率衰减": {
@@ -3319,6 +3469,428 @@
       "clearing_evidence": [
         "上游电池片的初始效率与衰减曲线（LeTID/PID）",
         "封装材料批次"
+      ],
+      "param_key": "pmax",
+      "aliases": [
+        "功率衰减超标",
+        "衰减率",
+        "功率下降"
+      ],
+      "response_defect": true
+    },
+    "黑心": {
+      "param_key": "el_black_core",
+      "aliases": [
+        "黑斑",
+        "黑心片",
+        "暗片",
+        "黑斑片",
+        "black core",
+        "dark area"
+      ],
+      "process": "pv_cell_el",
+      "likely_params": [
+        "minority_lifetime",
+        "oxygen_content",
+        "carbon_content",
+        "sintering_peak_temp",
+        "resistivity"
+      ],
+      "mechanism": "硅片本体缺陷（间隙氧/碳含量偏高、位错密度高）导致少子寿命偏低，或烧结峰值温度过高造成局部过烧、金属化复合加剧，EL 下呈团状或片状发暗",
+      "verify_data": [
+        "硅片来料少子寿命分布",
+        "间隙氧 Oi / 碳 Cs 含量",
+        "烧结炉各温区峰值温度曲线",
+        "EL 图像灰度分布（暗区占比）"
+      ],
+      "quick_checks": [
+        "黑心是否集中在某一硅片来料批次（→硅片本体）",
+        "整片均匀发暗 vs 局部团状（前者→少子寿命，后者→位错/污染）",
+        "是否与烧结炉特定温区/特定炉带位置对应（→过烧）",
+        "按硅片供应商与单晶炉台分层"
+      ],
+      "carry_over_from": [
+        "pv_wafer"
+      ],
+      "clearing_evidence": [
+        "上游硅片少子寿命与氧碳含量检验记录",
+        "来料批次与供应商是否发生变更",
+        "黑心是否集中在某一来料批次"
+      ]
+    },
+    "碎片": {
+      "param_key": "el_fragment",
+      "aliases": [
+        "断片",
+        "破片",
+        "fragment",
+        "broken",
+        "裂片",
+        "破损",
+        "崩裂"
+      ],
+      "process": "pv_cell_el",
+      "likely_params": [
+        "edge_chip",
+        "warp",
+        "ttv",
+        "laminate_pressure",
+        "laminate_temp",
+        "string_tension"
+      ],
+      "mechanism": "来料崩边或边缘微裂纹在层压/搬运应力下扩展，或吸盘负压不足、串焊压具局部受力导致机械破损。关键在于先区分来料与过程：层压前后 EL 对比是分界线",
+      "verify_data": [
+        "硅片来料崩边检验记录",
+        "硅片 Warp / TTV 数据",
+        "层压机压力与温度曲线",
+        "串焊机压具状态与压力、串焊张力",
+        "层压前 EL 与层压后 EL 对比图"
+      ],
+      "quick_checks": [
+        "层压前 EL 是否已有碎片（→来料）",
+        "层压后新增（→层压/搬运）",
+        "碎片是否集中在组件边缘/角落（→层压与搬运）",
+        "是否集中在固定线体/班次（→设备或作业）"
+      ],
+      "carry_over_from": [
+        "pv_wafer"
+      ],
+      "clearing_evidence": [
+        "上游硅片崩边率与翘曲度记录",
+        "层压参数（压力/温度/时间）记录",
+        "层压前后 EL 对比结果"
+      ]
+    },
+    "虚焊": {
+      "param_key": "el_solder_defect",
+      "aliases": [
+        "焊接不良",
+        "过焊",
+        "false solder",
+        "假焊",
+        "脱焊",
+        "焊点不良"
+      ],
+      "process": "pv_cell_el",
+      "likely_params": [
+        "solder_temp",
+        "string_tension",
+        "solder_peel_strength",
+        "solder_resistance",
+        "laminate_temp"
+      ],
+      "mechanism": "串焊温度/压力/时间不足、焊带涂层氧化或助焊剂失效，导致焊料与栅线结合不良（虚焊）；温度过高则过焊，焊带过熔或电池片受应力损伤。两者在 EL 上都表现为栅线局部发暗，需用剥离力区分",
+      "verify_data": [
+        "串焊机焊接头温度-压力-时间曲线与点检记录",
+        "焊带剥离力测试数据",
+        "焊带涂层批次与库存期",
+        "助焊剂浓度与更换记录",
+        "焊接头磨损/更换台账"
+      ],
+      "quick_checks": [
+        "虚焊是否集中在固定焊接头（→单点设备）",
+        "是否集中在某一焊带批次（→焊带来料）",
+        "剥离力实测是否低于规格（→过焊/虚焊判定）",
+        "EL 暗区是否沿栅线分布（→焊接）vs 随机（→电池片本体）",
+        "按焊接头编号与班次分层"
+      ],
+      "carry_over_from": [],
+      "clearing_evidence": [
+        "焊带剥离力测试数据",
+        "焊接头与焊带来料批次记录",
+        "助焊剂更换与浓度记录"
+      ]
+    },
+    "脏污": {
+      "param_key": "el_contamination",
+      "aliases": [
+        "污染",
+        "污渍",
+        "dirty",
+        "脏污片",
+        "脏点",
+        "异物",
+        "脏污不良",
+        "手指印",
+        "水印"
+      ],
+      "process": "pv_cell_el",
+      "likely_params": [
+        "paste_viscosity",
+        "printing_pressure",
+        "el_gray_mean",
+        "el_defect_area"
+      ],
+      "mechanism": "环境洁净度不足、手套/吸盘/传送带污染，或印刷网版残留与浆料飞溅，在电池片表面形成污染层，EL 下呈暗斑。位置聚集性是主要判据：固定位置→工装，随机分布→环境",
+      "verify_data": [
+        "车间洁净度/悬浮粒子监测记录",
+        "手套、吸盘、传送带清洁与更换记录",
+        "网版清洗记录与使用次数",
+        "浆料粘度记录与飞溅点检",
+        "EL 暗斑面积与位置分布热图"
+      ],
+      "quick_checks": [
+        "脏污是否集中在固定位置（→网版/吸盘/工装）",
+        "是否随机分布（→环境洁净度）",
+        "是否与手套/吸盘更换周期相关",
+        "清洗后批次是否同步改善（→验证措施有效性）",
+        "按线体与班次分层"
+      ],
+      "carry_over_from": [],
+      "clearing_evidence": [
+        "洁净度监测记录",
+        "网版清洗与吸盘/手套更换记录",
+        "清洗前后 EL 对比结果"
+      ]
+    },
+    "边缘漏电": {
+      "param_key": "el_edge_leakage",
+      "aliases": [
+        "边缘短路",
+        "漏电",
+        "edge leakage",
+        "边缘发亮",
+        "边漏电",
+        "边缘击穿"
+      ],
+      "process": "pv_cell_el",
+      "likely_params": [
+        "insulation_resistance",
+        "rsh",
+        "hotspot_temp",
+        "laminate_pressure"
+      ],
+      "mechanism": "边缘刻蚀或绝缘隔离不彻底，PN 结在切割边缘形成低阻通路；或层压后边缘残留、边框应力造成局部绝缘失效。常伴随 Rsh 下降与热斑温升",
+      "verify_data": [
+        "绝缘电阻/湿漏测试记录",
+        "并联电阻 Rsh 分布",
+        "EL 边缘发亮位置分布热图",
+        "刻蚀/边缘隔离工艺参数",
+        "热斑测试温升数据"
+      ],
+      "quick_checks": [
+        "漏电是否集中在组件某一侧边（→刻蚀不均或层压边缘）",
+        "是否随 Rsh 下降同步出现",
+        "绝缘电阻/湿漏是否达标",
+        "热斑测试是否伴随温升",
+        "按硅片来料与刻蚀批次分层"
+      ],
+      "carry_over_from": [],
+      "clearing_evidence": [
+        "绝缘电阻与 Rsh 测试数据",
+        "刻蚀/边缘隔离参数记录",
+        "热斑测试结果"
+      ]
+    },
+    "注液量偏差": {
+      "param_key": "electrolyte_weight",
+      "aliases": [
+        "注液量不足",
+        "注液量超差",
+        "注液偏差",
+        "电解液量",
+        "electrolyte fill",
+        "欠注",
+        "过注"
+      ],
+      "process": "battery_filling",
+      "likely_params": [
+        "electrolyte_weight",
+        "vacuum_level",
+        "resting_time",
+        "dew_point",
+        "moisture_before_filling"
+      ],
+      "mechanism": "计量泵/注液泵精度漂移、真空度与静置时间不足影响极片与隔膜浸润，或电解液温度/粘度变化导致实际注入量偏离设定值。表现为注液量超出公差带、电芯间一致性变差，进而抬高内阻、拉低容量",
+      "verify_data": [
+        "注液泵校准与点检记录",
+        "真空度与静置时间记录",
+        "电解液温度、粘度与批次记录",
+        "注液前后称重数据",
+        "手套箱露点记录"
+      ],
+      "quick_checks": [
+        "偏差是否集中在固定注液泵/工位（→单点设备）",
+        "是否与电解液批次切换同步（→来料）",
+        "真空度与静置时间是否达标",
+        "注液量与内阻、容量是否同步劣化",
+        "按注液机编号与班次分层"
+      ],
+      "carry_over_from": [
+        "battery_coating"
+      ],
+      "clearing_evidence": [
+        "注液泵校准记录",
+        "电解液批次与温度粘度记录",
+        "真空度与静置时间记录"
+      ]
+    },
+    "电芯水分超标": {
+      "param_key": "moisture_content",
+      "aliases": [
+        "水分超标",
+        "水分含量",
+        "含水率超标",
+        "cell moisture",
+        "极片残水",
+        "水分高"
+      ],
+      "process": "battery_filling",
+      "likely_params": [
+        "moisture_content",
+        "moisture_before_filling",
+        "moisture_after_dry",
+        "dew_point"
+      ],
+      "mechanism": "极片烘烤不足、注液前水分偏高，或手套箱露点失控、电解液含水。水分与 LiPF6 反应生成 HF，引发产气鼓包、内阻升高、容量衰减与自放电恶化，是化成段多数异常的上游根因",
+      "verify_data": [
+        "极片烘烤后含水量记录",
+        "注液前极片含水量记录",
+        "手套箱露点记录",
+        "电解液水分检验记录",
+        "化成产气/鼓包比例"
+      ],
+      "quick_checks": [
+        "烘烤温度-时间-真空度是否达标",
+        "手套箱露点是否在受控范围且连续记录",
+        "水分超标批次是否同步出现鼓包/产气",
+        "电解液开桶后暴露时长是否受控",
+        "按烘烤批次与露点分层"
+      ],
+      "carry_over_from": [
+        "battery_coating"
+      ],
+      "clearing_evidence": [
+        "极片烘烤后含水量检验记录",
+        "手套箱露点连续记录",
+        "电解液水分检验记录"
+      ]
+    },
+    "压实密度超差": {
+      "param_key": "compaction_density",
+      "aliases": [
+        "压实超差",
+        "压实不足",
+        "压实过度",
+        "压实密度异常",
+        "compaction",
+        "压实密度偏高",
+        "压实密度偏低"
+      ],
+      "process": "battery_calendering",
+      "likely_params": [
+        "compaction_density",
+        "roll_force",
+        "roll_temperature",
+        "thickness_after_roll",
+        "rebound_rate",
+        "areal_density"
+      ],
+      "mechanism": "辊压力/辊温波动、来料面密度波动与极片回弹共同导致压实密度偏离目标。过高会压溃活物质结构、降低孔隙率，使浸润变差、内阻升高；过低则剥离强度不足，后续卷绕易掉料",
+      "verify_data": [
+        "辊压力与辊温记录",
+        "辊压后厚度与压实密度实测",
+        "辊压反弹率数据",
+        "上游涂布面密度数据",
+        "剥离强度测试数据"
+      ],
+      "quick_checks": [
+        "压实密度与目标值的偏差方向（偏高→辊压过度，偏低→辊压不足）",
+        "是否与上游面密度波动同步（→来料）",
+        "反弹率是否异常（→极片回弹）",
+        "剥离强度是否随之下降（→过度压实）",
+        "按辊压机编号与班次分层"
+      ],
+      "carry_over_from": [
+        "battery_coating"
+      ],
+      "clearing_evidence": [
+        "辊压力与辊温记录",
+        "上游涂布面密度数据",
+        "剥离强度测试数据"
+      ]
+    },
+    "极片露箔": {
+      "param_key": "foil_exposure",
+      "aliases": [
+        "露箔",
+        "漏箔",
+        "漏涂",
+        "空箔",
+        "露基材",
+        "漏涂点",
+        "foil exposure",
+        "露箔数"
+      ],
+      "process": "battery_coating",
+      "likely_params": [
+        "pump_speed",
+        "gap_ratio",
+        "viscosity",
+        "solid_content",
+        "web_tension_coating",
+        "coating_speed"
+      ],
+      "mechanism": "供料中断或泵速波动、涂布间隙异常、箔材走带抖动，或浆料夹杂气泡/团聚颗粒，导致局部区域未被浆料覆盖而露出箔材",
+      "verify_data": [
+        "供料泵速与压力记录",
+        "涂布间隙设定与实测",
+        "走带张力记录",
+        "浆料粘度、固含与过滤记录",
+        "CCD/在线测厚露箔报警记录"
+      ],
+      "quick_checks": [
+        "露箔是否呈周期性出现（→走带/泵速波动）",
+        "是否集中在固定模头位置（→模头堵塞）",
+        "是否与浆料批次切换同步（→来料）",
+        "浆料粘度与过滤目数是否变更",
+        "按线体与班次分层"
+      ],
+      "carry_over_from": [],
+      "clearing_evidence": [
+        "供料泵速与压力记录",
+        "涂布间隙设定与实测",
+        "浆料粘度与过滤记录"
+      ]
+    },
+    "极耳焊接不良": {
+      "param_key": "weld_resistance",
+      "aliases": [
+        "极耳虚焊",
+        "焊接不良",
+        "焊点不良",
+        "极耳脱焊",
+        "焊接不牢",
+        "ultrasonic weld",
+        "极耳焊接"
+      ],
+      "process": "battery_winding",
+      "likely_params": [
+        "weld_resistance",
+        "solder_peel_strength",
+        "solder_temp",
+        "fixture_pressure"
+      ],
+      "mechanism": "超声焊功率/压力/时间不足、极耳表面氧化或残留电解液污染、焊头磨损，导致焊点结合面积不足。表现为焊接电阻偏高、剥离力不足，进而内阻升高、大电流下局部发热",
+      "verify_data": [
+        "焊接电阻测试数据",
+        "焊点剥离力测试数据",
+        "超声焊功率-压力-时间参数记录",
+        "焊头磨损与更换台账",
+        "极耳表面清洁度点检记录"
+      ],
+      "quick_checks": [
+        "焊接不良是否集中在固定焊头（→单点设备）",
+        "剥离力是否低于规格",
+        "焊接电阻是否与内阻升高同步",
+        "焊头使用次数是否超限",
+        "按焊机编号与班次分层"
+      ],
+      "carry_over_from": [],
+      "clearing_evidence": [
+        "焊接电阻与剥离力测试数据",
+        "超声焊参数记录",
+        "焊头更换台账"
       ]
     }
   },

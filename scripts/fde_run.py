@@ -180,6 +180,220 @@ def finish(flow, steps, report_path, extra=None, started=None):
     return code
 
 
+# ------------------------------------------------------- 产出清单（使用者视角）
+
+# XLSX/HTML 写入失败时，往往不报错、只留下几十字节的残骸文件。
+# 使用者兴冲冲打开才发现是空的——与其让他发现，不如我们量一下直接说出来。
+_SUSPICIOUS_SMALL = {".xlsx": 4096, ".html": 1024, ".md": 256, ".json": 128}
+
+
+def _human_size(n):
+    for unit in ("B", "KB", "MB"):
+        if n < 1024:
+            return "%d B" % n if unit == "B" else "%.0f %s" % (n, unit)
+        n = n / 1024.0
+    return "%.1f GB" % n
+
+
+def _artifact_kind(name):
+    """按使用者关心的方式分类，不按扩展名分类。
+
+    工艺工程师找 DOE、现场找作业单、质量找 8D——没人关心文件后缀。
+    """
+    low = name.lower()
+    if "8d" in low or "d2" in low:
+        return "8D"
+    if low.endswith((".xlsx", ".xls", ".csv")):
+        return "数据表"
+    if low.endswith(".svg"):
+        return "图表"
+    if low.endswith(".html"):
+        return "报告(网页)"
+    if low.endswith(".md"):
+        return "报告"
+    if low.endswith(".json"):
+        return "数据"
+    return "其它"
+
+
+def _print_deliverables(result_json, outdir, d2_card=None):
+    """跑完之后必须让使用者知道三件事：东西在哪、哪些要注意、下一步干什么。
+
+    之前 analyze 打印完 5 步 PASS 就结束：产出路径躺在 result.json 里没人读，
+    8D 录入卡生成了也没有任何引导。流程断在最后一米，前面 2.1 秒全白跑。
+    """
+    files = []
+
+    # 1) result.json 里的 outputs 是权威清单，优先用它
+    try:
+        outs = (json.load(io.open(result_json, encoding="utf-8")) or {}).get("outputs")
+        if isinstance(outs, dict):
+            for v in outs.values():
+                cands = v if isinstance(v, list) else [v]
+                for p in cands:
+                    if isinstance(p, str) and os.path.isfile(p):
+                        ap = os.path.abspath(p)
+                        if ap not in files:
+                            files.append(ap)
+    except Exception:
+        pass
+
+    # 2) 补 outputs 没覆盖到的产物（如 8D 录入卡）
+    for p in sorted(glob.glob(os.path.join(outdir, "*"))):
+        if os.path.isfile(p):
+            ap = os.path.abspath(p)
+            if ap not in files:
+                files.append(ap)
+
+    if not files:
+        return
+
+    print("")
+    print("=" * 68)
+    print("产出清单")
+    print("=" * 68)
+    for kind in ("报告", "报告(网页)", "数据表", "8D", "图表", "数据", "其它"):
+        group = [f for f in files if _artifact_kind(os.path.basename(f)) == kind]
+        if not group:
+            continue
+        if kind == "图表":
+            # 图表动辄十几张，逐个列路径会把产出清单撑成刷屏。
+            # 使用者关心的是"图在哪个目录"，不是第 7 张图叫什么。
+            print("  [图表     ] %d 张，目录：%s"
+                  % (len(group), os.path.dirname(group[0])))
+            continue
+        for f in group:
+            sz = os.path.getsize(f)
+            flag = ""
+            if sz <= _SUSPICIOUS_SMALL.get(os.path.splitext(f)[1].lower(), 0):
+                flag = "   ⚠ 疑似空文件"
+            print("  [%-7s] %-22s %8s%s"
+                  % (kind, os.path.basename(f), _human_size(sz), flag))
+            print("            %s" % f)
+
+    # 下一步：只写现在真能做的动作，不画饼
+    intakes = [f for f in files if _artifact_kind(os.path.basename(f)) == "8D"]
+    print("-" * 68)
+    print("  下一步")
+    print("    1) 打开报告第 1 节「结论摘要」，先确认首要候选根因符合不符合现场认知")
+    print("       数据说得再准，跟现场对不上就先信现场，再去查数据哪里取偏了")
+    if intakes:
+        print("    2) 填写 %s" % os.path.basename(intakes[0]))
+        print("       填完回传：`--d2-card <刚填的卡>`，即可出完整 D1–D8")
+    print("=" * 68)
+
+
+# 失败原因 -> 排查方向。按使用者会遇到的真实情况写，不写堆栈。
+_DIAGNOSE_RULES = (
+    ("输入文件不存在", (
+        "确认路径拼写；中文文件名或含空格的建议用英文双引号包起来",
+        "确认文件确实存在，且当前账号有读权限",
+        "换绝对路径重试，排除当前工作目录不是项目根目录的情况",
+    )),
+    ("读取结果为空", (
+        "确认文件里真的有数据行，不是只剩一个表头",
+        "检查表头是不是在第 1 行：有标题行、单位行、多行表头时，脚本会把说明行当成表头",
+        "检查合并单元格：导出前先取消合并",
+        "检查文件是否损坏：先用 Excel 手动打开一次再另存",
+    )),
+    ("过滤后数据为空", (
+        "检查筛选条件是不是过严，把所有行都剔掉了",
+        "检查关键列是否整列为空——列名识别到了，但数据没读进来",
+    )),
+    ("识别率", (
+        "列名跟知识库对不上：加 --auto-adapt 让脚本自动适配未知列名",
+        "或用 --spec 显式指定列与规格，跳过自动识别",
+    )),
+    ("结果 JSON", (
+        "确认输出目录可写（磁盘满 / 只读 / 被占用都会导致写盘失败）",
+        "确认上一轮没有残留锁文件：查看 .lock/ 目录",
+    )),
+)
+
+
+def _diagnose(fails):
+    """根据失败原因给出排查方向。命中多条就都列，宁可多说不可漏说。"""
+    blob = " ".join("%s %s" % (s.get("name", ""), s.get("reason") or "")
+                    for s in fails)
+    tips = []
+    for key, items in _DIAGNOSE_RULES:
+        if key in blob:
+            tips.extend(items)
+    # 一条都没命中时也要给个兜底方向，不能让使用者对着空白发呆
+    if not tips:
+        tips = [
+            "先看上面失败步骤里的「原因」列，定位是第几步断的",
+            "加 --verbose 重跑，看流水线内部各阶段执行到哪一步",
+            "跑 `python scripts/fde_run.py audit` 确认环境本身没问题",
+        ]
+    return tips
+
+
+def _write_failure_diagnosis(result_json, outdir, steps):
+    """失败时落盘一份诊断报告，而不是只打一行 ERROR 就消失。
+
+    吸取参考实现的教训（详见 promotion/参考代码研读笔记.md §2 缺陷 1）：
+    它也有兜底，但兜底把致命错误一并兜住了——使用者拿到"一份 Excel"看着像成功，
+    真正的 bug 藏了很久。所以兜底必须三样齐全：
+      ① 文件名含「诊断」字样  ② 正文带醒目红标  ③ 退出码非 0
+    缺任何一样，兜底就从"帮忙"变成"掩盖"。
+    """
+    fails = [s for s in steps if s.get("status") == "FAIL"]
+    try:
+        os.makedirs(outdir, exist_ok=True)
+    except Exception:
+        outdir = "."
+
+    path = os.path.abspath(os.path.join(outdir, "运行诊断.md"))
+    L = []
+    L.append("# 运行诊断 —— 本轮未通过")
+    L.append("")
+    L.append("> **这是失败产物，不是分析结果，请勿据此下结论或对外发出。**")
+    L.append("")
+    L.append("生成时间：%s" % time.strftime("%Y-%m-%d %H:%M:%S"))
+    L.append("")
+    L.append("## 1. 失败步骤")
+    L.append("")
+    L.append("| 步骤 | 原因 |")
+    L.append("|---|---|")
+    for s in fails:
+        why = (s.get("reason") or "-").replace("|", "/").replace("\n", " ")
+        L.append("| %s | %s |" % (s.get("name", ""), why))
+    L.append("")
+    L.append("## 2. 排查方向")
+    L.append("")
+    for t in _diagnose(fails):
+        L.append("- %s" % t)
+    L.append("")
+    L.append("## 3. 环境信息")
+    L.append("")
+    L.append("- Python：%s" % sys.version.split()[0])
+    L.append("- 技能根目录：%s" % ROOT)
+    L.append("- 输出目录：%s" % os.path.abspath(outdir))
+    L.append("")
+    L.append("---")
+    L.append("")
+    L.append("排查完重跑：")
+    L.append("")
+    L.append("```")
+    L.append("python scripts/fde_run.py analyze -i <你的数据文件> -o %s" % outdir)
+    L.append("```")
+
+    try:
+        with io.open(path, "w", encoding="utf-8") as f:
+            f.write("\n".join(L))
+    except Exception as e:
+        print("  [警告] 诊断报告写盘失败：%s" % e)
+        return None
+
+    print("")
+    print("=" * 68)
+    print("【本轮未通过】已生成运行诊断：%s" % path)
+    print("  该文件是失败产物，不是分析结果，请勿据此对外发出。")
+    print("=" * 68)
+    return path
+
+
 # --------------------------------------------------------------- 通用检查
 
 def _read(rel):
@@ -300,6 +514,57 @@ def _sub(old, new):
     return f
 
 
+def _re_sub(pattern, repl, flags=re.M):
+    """一个变异：按正则做替换（跨行也能命中）。
+
+    默认带 re.M：判据/变异里几乎都是 `^[ \t]+` 这种行首锚定，
+    不带 re.M 的话 `^` 只匹配全文开头，正则永远命中不了，
+    变异静默失效、退化为 SKIP——这个坑已经踩过。
+
+
+    为什么需要它：_sub 是逐字替换，源码一换行、一改缩进就匹配不上，于是返回 None，
+    自检把它记成 SKIP。SKIP 看着"没报错"，实际是这条规则的判别力根本没被验证过
+    ——这比 FAIL 更危险，因为它会让你以为门禁是好的。
+
+    repl 可以是字符串，也可以是函数（拿到 match 返回新串；返回 None 表示注入失败）。
+    凡是跨行、或源码结构以后可能变的，一律用正则注入，别用逐字替换。
+
+    实测教训：打包排除规则原本用 _sub 逐字匹配，后来往 EXCLUDE_DIRS 里加了一个新目录，
+    set 被改成跨三行，逐字匹配当场静默失效、退化为 SKIP，而门禁仍然显示"通过"。
+    """
+    rx = re.compile(pattern, flags)
+
+    def f(t):
+        m = rx.search(t)
+        if not m:
+            return None
+        if callable(repl):
+            new = repl(m)
+        else:
+            new = rx.sub(repl, m.group(0))
+        if new is None:
+            return None
+        return t[:m.start()] + new + t[m.end():]
+
+    return f
+
+
+def _drop_set_member(member):
+    """从 `EXCLUDE_DIRS = {...}` 里删掉一个成员。
+
+    用正则抓花括号内的整段，再在段内删，这样源码怎么换行都不影响注入成功率。
+    删不掉就返回 None，让自检把它暴露成 SKIP，绝不放过。
+    """
+    def repl(m):
+        body = m.group(1)
+        for pat in ('"%s",\n' % member, '"%s",' % member,
+                    ', "%s"' % member, '"%s"' % member):
+            if pat in body:
+                return m.group(0).replace(body, body.replace(pat, "", 1), 1)
+        return None
+    return _re_sub(r'EXCLUDE_DIRS\s*=\s*\{([^}]*)\}', repl)
+
+
 def _drop_line(needle):
     """一个变异：删掉含 needle 的第一行。"""
     def f(t):
@@ -336,6 +601,8 @@ AUDIT_FILES = [
     os.path.join("lib", "kbstore.py"),
     os.path.join("lib", "tenancy.py"),
     os.path.join("lib", "eightd.py"),
+    os.path.join("lib", "rootcause.py"),
+    os.path.join("knowledge", "process_specs.json"),
 ]
 
 SKILL_REF_RE = re.compile(
@@ -527,6 +794,77 @@ def rule_pid_no_windows_kill():
     return _r(not miss, "_pid_alive：" + "、".join(miss) if miss else "")
 
 
+def rule_deliverables_printed():
+    """analyze 成功后必须把产出路径打出来。
+
+    实测教训：编排器打印完 5 步 PASS 就结束，产出路径躺在 result.json 里没人读，
+    8D 录入卡生成了也没有任何引导——流程断在最后一米。
+
+    判据（可证伪）：全文件必须存在一处**行首缩进后的真实调用**
+    （函数名紧跟左括号，实参含 result_json 与 outdir）。
+    带行首锚定是为了排除文档字符串和注释里的同名文字——
+    只搜函数名会被蒙混，这点已经吃过亏。
+    """
+    t = _read(os.path.join("scripts", "fde_run.py")) or ""
+    if not re.search(r"^def _print_deliverables\s*\(", t, re.M):
+        return _r(False, "缺少 _print_deliverables 定义")
+    m = re.search(r"^[ \t]+_print_deliverables\s*\(\s*result_json\s*,\s*outdir",
+                  t, re.M)
+    return _r(m is not None,
+              "缺少缩进后的真实调用 _print_deliverables(result_json, outdir, ...)")
+
+
+def rule_failure_diagnosis():
+    """analyze 失败时必须落盘一份诊断文件，而不是只打一行 ERROR 就消失。
+
+    判据（可证伪）：
+      · cmd_analyze 的失败分支（else）内必须调用 _write_failure_diagnosis(
+      · 该函数体内必须真的写盘：出现 io.open( 且带 .md 后缀
+
+    为什么连"真的写盘"都要判：只检查调用存在，函数可以是个空壳，
+    门禁照样绿，使用者照样什么都拿不到。
+    """
+    t = _read(os.path.join("scripts", "fde_run.py")) or ""
+    # 锚点用"else: 换行 + 缩进 + 调用"这个完整形态，避免命中别处的 else:
+    if not re.search(r"^[ \t]*else\s*:\s*\n[ \t]+_write_failure_diagnosis\s*\(",
+                  t, re.M):
+        return _r(False, "analyze 失败分支没有调用 _write_failure_diagnosis")
+    body = _block(t, "def _write_failure_diagnosis(", "\ndef ", 4000)
+    if not body:
+        return _r(False, "找不到 _write_failure_diagnosis 定义")
+    if not (re.search(r"io\.open\s*\(", body) and ".md" in body):
+        return _r(False, "_write_failure_diagnosis 没有真正写盘（缺 io.open 或 .md）")
+    return _r(True, "")
+
+
+def rule_fallback_not_disguised():
+    """兜底产物必须让人一眼看出"这是失败产物"。
+
+    这条规则的来源值得记：参考实现也有兜底，但它把致命错误一起兜住了——
+    使用者拿到"一份 Excel"看着像成功，真正的 bug 藏了很久。
+    所以兜底必须三样齐全：文件名含"诊断"、正文带红标、退出码非 0。
+    本规则管前两样（退出码由 _status_of 保证）。
+
+    判据（可证伪）：
+      · _write_failure_diagnosis 体内必须出现 "失败产物" 这个醒目标记
+      · 输出文件名必须形如 "xxx诊断.md"
+    """
+    t = _read(os.path.join("scripts", "fde_run.py")) or ""
+    body = _block(t, "def _write_failure_diagnosis(", "\ndef ", 4000)
+    if not body:
+        return _r(False, "找不到 _write_failure_diagnosis 定义")
+    # 只判"写进 .md 文件正文"的那一行。
+    # 实测踩过：函数体里其实有两处红标——L.append(...) 写进文件、print(...) 打给屏幕。
+    # 若判据写 "失败产物" in body，变异只改掉其中一处时另一处仍满足，
+    # 规则照常判过，反向验证就成了走过场。
+    red = re.search(r'L\.append\("> \*\*[^"]*"\)', body)
+    if not red or "失败产物" not in red.group(0):
+        return _r(False, "诊断文件正文缺少『失败产物』醒目标记，会被误当成分析报告")
+    if not re.search(r'os\.path\.join\(outdir,\s*"[^"]*诊断\.md"\)', body):
+        return _r(False, "诊断文件名不含『诊断』，外观与分析报告无法区分")
+    return _r(True, "")
+
+
 def rule_skill_refs_exist():
     """SKILL.md 里写到的脚本/参考文档路径必须真实存在。
 
@@ -559,6 +897,191 @@ def rule_orchestrator_declared():
         return _r(False, "SKILL.md 没有『第一动作』小节（未声明先跑编排器）")
     return _r("fde_run.py" in t[i:i + 800],
               "『第一动作』小节里没有出现 fde_run.py（声明与入口脱节）")
+
+
+# ------------------------------------------------- 缺陷知识库（使用者视角第二批）
+#
+# 这一组来自「参考实现第三轮研读」的实测结论：
+#   主线的深度已经够了，缺的是**索引口径** —— 知识库用"机理命名"登记，
+#   现场用"车间叫法"提问，名字对不上就断链，
+#   工程师拿到的 8D 报告 D4 栏只能写着「机理未收录」。
+#   实测 examples/05_EL缺陷检测数据.csv：补齐前 51.8% 的缺陷没有机理支撑。
+
+def _load_specs():
+    """读 knowledge/process_specs.json。副本模式下读到的是副本（注入只改副本）。"""
+    raw = _read(os.path.join("knowledge", "process_specs.json"))
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except Exception:
+        return None
+
+
+def _json_mutate_defect_field(key, field, new_value):
+    """变异：改写某缺陷条目的字段值。
+
+    走 JSON 解析而不是文本正则 —— 文本替换对换行和缩进完全不免疫
+    （这个坑踩过两次），而 JSON 结构不会因为排版变化而失配。
+    """
+    def f(t):
+        try:
+            kb = json.loads(t)
+        except Exception:
+            return None
+        dv = (kb.get("defect_rootcause") or {}).get(key)
+        if not isinstance(dv, dict) or field not in dv:
+            return None
+        dv[field] = new_value
+        return json.dumps(kb, ensure_ascii=False, indent=2) + "\n"
+    return f
+
+
+def _json_drop_defect_field(key, field):
+    """变异：删掉某缺陷条目的字段。同走 JSON 解析，免疫排版变化。"""
+    def f(t):
+        try:
+            kb = json.loads(t)
+        except Exception:
+            return None
+        dv = (kb.get("defect_rootcause") or {}).get(key)
+        if not isinstance(dv, dict) or field not in dv:
+            return None
+        dv.pop(field)
+        return json.dumps(kb, ensure_ascii=False, indent=2) + "\n"
+    return f
+
+
+def _collect_dangling_refs():
+    """扫 defect_rootcause，返回 (缺陷条目数, 参数数, 悬空引用列表)。"""
+    kb = _load_specs()
+    if kb is None:
+        return 0, 0, None
+    params = kb.get("params") or {}
+    defects = kb.get("defect_rootcause") or {}
+    bad = []
+    for dk, dv in defects.items():
+        pk = dv.get("param_key")
+        if pk and pk not in params:
+            bad.append("%s.param_key=%s" % (dk, pk))
+        for lp in (dv.get("likely_params") or []):
+            if lp not in params:
+                bad.append("%s.likely_params=%s" % (dk, lp))
+        if not (dv.get("mechanism") or "").strip():
+            bad.append("%s.mechanism 为空" % dk)
+    return len(defects), len(params), bad
+
+
+def rule_defect_refs_not_dangling():
+    """缺陷条目的参数引用不得悬空，机理不得为空。
+
+    悬空引用不会抛异常——它只是让匹配静默查不到，
+    表现出来就是"库里明明登记了这条缺陷，报告却说机理未收录"，
+    而且从报告看不出是数据的问题还是库坏了。这种静默失效必须靠判据拦。
+    """
+    n_def, n_param, bad = _collect_dangling_refs()
+    if bad is None:
+        return _r(False, "读不到 knowledge/process_specs.json")
+    return _r(not bad, "悬空引用：%s" % "；".join(bad[:5]) if bad else "",
+              {"defects": n_def, "params": n_param, "bad": bad})
+
+
+ROOTCAUSE_FILE = os.path.join("lib", "rootcause.py")
+
+
+def rule_defect_alias_index_used():
+    """根因识别必须走「现场叫法 → 标准条目」的别名索引。
+
+    为什么这条要单独立：别名数据一直在库里（params[].aliases），
+    但匹配路径只要退回到"只按条目键名逐字比对"，别名就立刻全部失效，
+    而 audit 里所有规则照样全绿 —— 库看着完整，现场叫法一条都对不上。
+    所以判据落在**调用形态**上：函数必须存在，且 identify_defects 里真的调用了它。
+    """
+    t = _read(ROOTCAUSE_FILE) or ""
+    if not t:
+        return _r(False, "读不到 " + ROOTCAUSE_FILE)
+    has_def = re.search(r"^def _defect_alias_names\(", t, re.M) is not None
+    body = _block(t, "def identify_defects(", "\ndef ")
+    # 判据必须落在**具体调用形态**上，不能只查"函数体里有这个名字"。
+    # 实测教训：第一版判据只检查 `_defect_alias_names(` 是否出现，
+    # 结果把列匹配路径改回"只按键名比对"之后，函数体里其它位置的调用还在，
+    # 规则照常判过 —— 反向验证当场把它打成 FAIL。
+    # 真正的判据是：列匹配必须**遍历别名集合**（for nn in ...）。
+    # 注意正则要精确到「行尾是冒号」的列匹配循环：hint 分支里也有一段
+    # `for nn in _defect_alias_names(...)`（在 any(...) 里、后面跟 `)`），
+    # 判据若不区分，改坏了列匹配它照样判过 —— 实测已被反向验证抓到一次。
+    called = re.search(r"for\s+nn\s+in\s+_defect_alias_names\(dk,\s*dv\):",
+                       body, re.M) is not None
+    if not has_def:
+        return _r(False, "缺少别名索引函数 _defect_alias_names 的定义")
+    if not called:
+        return _r(False, "identify_defects 的列匹配未遍历别名集合"
+                        "（现场叫法将对不上标准条目）")
+    return _r(True, "", {"has_def": True, "called": True})
+
+
+def rule_response_defect_not_inherit():
+    """「响应型缺陷」不得继承目标量列名的别名。
+
+    背景（实测踩到的真回归，不是假想）：
+    「功率衰减」的 param_key 指向 pmax —— 那是**被分析的目标量**，不是缺陷计数列。
+    别名索引若照单继承 pmax 的 aliases（Pmax/功率/峰值功率/最大功率），
+    列名「Pmax_STC(W)」就会被识别成「功率衰减」缺陷列，
+    于是目标列 == 缺陷列，共线排除判据整条失效：
+    E06 组件IV 用例的 co_linear_excluded 从 ['CTM','Pmax',...] 变成空，
+    报告会把「功率低是因为功率低」当成根因。
+    判据落在两处：知识库要标记哪些条目是响应型；代码要遵守这个标记。
+    """
+    kb = _load_specs()
+    if kb is None:
+        return _r(False, "读不到 knowledge/process_specs.json")
+    defects = kb.get("defect_rootcause") or {}
+    # 哪些缺陷是「由结果指标漂移定义」的，无法从数据形态自动推断
+    # （面密度超差、厚边、毛刺高度也是 role=response，但它们各自是独立的量测缺陷，
+    #  继承自己的别名完全正确；而「功率衰减」继承 pmax 的别名就会把目标列当缺陷列）。
+    # 所以判据用**人工认定的显式清单**：这几个条目必须带标记。
+    # 清单要扩就得过审改到这里——这是有意的摩擦，避免又悄悄把目标量放进来。
+    MUST_FLAG = ["功率衰减", "内阻偏高", "容量一致性差", "TTV超差", "FF偏低"]
+    unflagged = [dk for dk in MUST_FLAG
+                 if dk in defects and not defects[dk].get("response_defect")]
+    t = _read(ROOTCAUSE_FILE) or ""
+    honor = 'not dv.get("response_defect")' in t
+    if unflagged:
+        return _r(False, "以下条目由结果指标漂移定义，却未标 response_defect：%s"
+                  % "、".join(unflagged))
+    if not honor:
+        return _r(False, "别名索引未遵守 response_defect 标记（会继承目标量别名，"
+                         "导致目标列被当成缺陷列）")
+    return _r(True, "", {"flagged": len(MUST_FLAG)})
+
+
+def rule_unregistered_hint_actionable():
+    """缺陷未收录时必须给出可行动提示，不能只写「机理未收录」。
+
+    工程师读到「机理未收录」时，他早就知道没收录了 ——
+    他需要的是两件事：这份报告剩下部分还能信到哪一步、以及怎么把这条补上。
+    所以判据要求：未收录分支确实调用了提示函数，且提示里带**可直接复制的补录命令**。
+    """
+    t = _read(ROOTCAUSE_FILE) or ""
+    if not t:
+        return _r(False, "读不到 " + ROOTCAUSE_FILE)
+    has_fn = re.search(r"^def _unregistered_hint\(", t, re.M) is not None
+    body = _block(t, "def build_5why(", "\ndef ")
+    # 同样要求落在**第 2 层 because 的具体形态**上：
+    # 只查"函数体里出现过 _unregistered_hint"是不够的 ——
+    # 第 1 层的 fallback 分支也在用它，改回硬编码后规则照样判过。
+    wired = re.search(
+        r'"level":\s*2,.*?"because":\s*info\.get\("mechanism"\)\s*or\s*_unregistered_hint\(',
+        body, re.S) is not None
+    hint = _block(t, "def _unregistered_hint(", "\ndef ")
+    has_cmd = ("kb_manage.py" in hint) and ("defect_new" in hint)
+    if not has_fn:
+        return _r(False, "缺少 _unregistered_hint（未收录时无提示）")
+    if not wired:
+        return _r(False, "build_5why 未接入未收录提示（缺失机理时只回『机理未收录』）")
+    if not has_cmd:
+        return _r(False, "未收录提示里没有可直接复制的补录命令（kb_manage.py / defect_new）")
+    return _r(True, "", {"has_fn": True, "wired": True, "has_cmd": True})
 
 
 AUDIT_RULES = [
@@ -644,8 +1167,7 @@ AUDIT_RULES = [
          "package.py 的 EXCLUDE_DIRS 段内必须含 tenants / output / _private / .lock",
          os.path.join("scripts", "package.py"),
          [_mutant("EXCLUDE_DIRS 里去掉 _private",
-                  _sub('"backups", "tenants", "promotion", ".lock", "_private"}',
-                       '"backups", "tenants", "promotion", ".lock"}'))]),
+                  _drop_set_member("_private"))]),
 
     Rule("打包接了隐私审计闸门", rule_audit_gate,
          "package.py 中必须出现 prepublish_audit（打包前跑隐私审计）",
@@ -677,6 +1199,93 @@ AUDIT_RULES = [
          [_mutant("SKILL.md 里的编排器入口被整体换掉",
                   _sub("fde_run.py", "zz_other.py")),
           _mutant("『第一动作』小节标题被删", _sub("第一动作：先跑编排器", "按需挑选脚本"))]),
+
+    # -- 以下三条来自「使用者视角」复盘（promotion/使用者视角架构设计.md）--
+    # 算法再准，使用者找不到产出、失败时只拿到一行 ERROR，等于白跑。
+
+    Rule("跑完必须告知产出位置", rule_deliverables_printed,
+         "fde_run.py 必须有 _print_deliverables 的定义，且在 cmd_analyze 收尾段"
+         "（'code = finish' 之后、'return code' 之前）存在一处缩进后的真实调用，"
+         "实参含 result_json 与 outdir",
+         os.path.join("scripts", "fde_run.py"),
+         [_mutant("去掉 analyze 成功分支的产出清单调用",
+                  _re_sub(r'^[ \t]+_print_deliverables\(result_json, outdir',
+                          "        pass  # 静默成功")),
+          _mutant("产出清单函数改名",
+                  _re_sub(r"^def _print_deliverables\(",
+                          "def _print_deliverables2("))]),
+
+    Rule("失败必须落盘诊断产物", rule_failure_diagnosis,
+         "cmd_analyze 的失败分支内必须调用 _write_failure_diagnosis(；"
+         "且该函数体内必须真的写盘（出现 io.open( 且带 .md）",
+         os.path.join("scripts", "fde_run.py"),
+         [_mutant("去掉 analyze 失败分支的诊断落盘",
+                  _re_sub(r'^[ \t]+_write_failure_diagnosis\(result_json',
+                          "        pass  # 只打 ERROR")),
+          _mutant("诊断函数改名",
+                  _re_sub(r"^def _write_failure_diagnosis\(",
+                          "def _write_failure_diag2("))]),
+
+    Rule("兜底产物不得长得像分析报告", rule_fallback_not_disguised,
+         "诊断正文必须含『失败产物』醒目标记，且文件名含『诊断』；"
+         "两者缺一，兜底就会把失败伪装成成功（参考实现 R4 缺陷的教训）",
+         os.path.join("scripts", "fde_run.py"),
+         [_mutant("删掉失败红标文字",
+                  # 正则必须带上 L.append("> ** 这个上下文前缀：
+                  # 若只写 '"[^"]*这是失败产物[^"]*"'，它会先匹配到本行变异定义自身
+                  # （那行里也含"这是失败产物"这几个字），把变异改到自己头上，
+                  # 真实红标纹丝不动 -> 规则照常判过，反向验证形同虚设。
+                  _re_sub(r'L\.append\("> \*\*这是失败产物[^"]*"\)',
+                          'L.append("> **以下为诊断信息。**")')),
+          _mutant("诊断文件名改成报告名",
+                  _re_sub(r'os\.path\.join\(outdir,\s*"运行诊断\.md"\)',
+                          'os.path.join(outdir, "工艺分析报告.md")'))]),
+
+    # ---- 缺陷知识库：索引口径（参考实现第三轮研读结论）----
+
+    Rule("缺陷条目引用不悬空", rule_defect_refs_not_dangling,
+         "knowledge/process_specs.json 中 defect_rootcause 每条的 param_key "
+         "与 likely_params 每一项都必须在 params 里存在，且 mechanism 非空；"
+         "悬空引用不会报错，只表现为『库里有条目、报告却说机理未收录』的静默失效",
+         os.path.join("knowledge", "process_specs.json"),
+         [_mutant("把黑心条目的 param_key 改成不存在的键",
+                  _json_mutate_defect_field("黑心", "param_key",
+                                            "el_black_core_NOT_EXIST")),
+          _mutant("删掉碎片条目的 mechanism",
+                  _json_drop_defect_field("碎片", "mechanism"))]),
+
+    Rule("根因识别必须走别名索引", rule_defect_alias_index_used,
+         "lib/rootcause.py 必须有 _defect_alias_names 的定义，"
+         "且 identify_defects 函数体内真实调用了它（只按条目键名比对会让全部现场叫法失效）",
+         ROOTCAUSE_FILE,
+         [_mutant("别名索引函数改名（消掉定义）",
+                  _re_sub(r"^def _defect_alias_names\(",
+                          "def _defect_alias_names2(")),
+          _mutant("identify_defects 里不再调用别名索引",
+                  _sub("for nn in _defect_alias_names(dk, dv):",
+                       "for nn in [PP._norm_name(dk)]:"))]),
+
+    Rule("响应型缺陷不得继承目标量别名", rule_response_defect_not_inherit,
+         "param_key 指向结果指标（role=response 且非缺陷计量列）的缺陷条目，"
+         "必须标 response_defect，且 _defect_alias_names 必须遵守该标记；"
+         "否则目标列会被识别成缺陷列，共线排除整条失效（实测曾使 E06 用例翻红）",
+         os.path.join("knowledge", "process_specs.json"),
+         [_mutant("去掉功率衰减的 response_defect 标记",
+                  _json_drop_defect_field("功率衰减", "response_defect")),
+          _mutant("别名索引不再检查 response_defect",
+                  _sub('if pk and not dv.get("response_defect"):',
+                       'if pk:'), ROOTCAUSE_FILE)]),
+
+    Rule("未收录缺陷必须给可行动提示", rule_unregistered_hint_actionable,
+         "lib/rootcause.py 的 build_5why 未收录分支必须调用 _unregistered_hint，"
+         "且该函数正文含可直接复制的补录命令（kb_manage.py 与 defect_new）；"
+         "只回『机理未收录』等于把问题原样丢回给工程师",
+         ROOTCAUSE_FILE,
+         [_mutant("未收录分支改回硬编码文案",
+                  _sub('"because": info.get("mechanism") or _unregistered_hint(defect_name),',
+                       '"because": info.get("mechanism") or "机理未收录",')),
+          _mutant("提示里去掉补录命令",
+                  _sub("kb_manage.py scaffold", "知识库 scaffold"))]),
 ]
 
 
@@ -1003,6 +1612,12 @@ def flow_analyze(args):
                 print("")
                 print("  【不得对外发出】D5–D8 未经人工确审（已确审项见报告）。")
                 print("  需现场质量工程师逐项核对原始记录并签字后，方可对外。")
+
+    # 跑完了就要告诉人家东西在哪。失败时更要给一份能打开看的东西。
+    if code == 0:
+        _print_deliverables(result_json, outdir, args.d2_card)
+    else:
+        _write_failure_diagnosis(result_json, outdir, steps)
     return code
 
 

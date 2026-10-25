@@ -94,6 +94,12 @@ WARN_PATTERNS = [
 WARN_TEXT_EXTS = {".md", ".json", ".py", ".txt", ".csv", ".yml", ".yaml"}
 SKIP_FILES = {"prepublish_audit.py"}     # 规则自身包含这些正则的字面量
 
+# 有意公开的联系方式：项目 README 的「联系与商业授权」小节本来就该放邮箱，
+# 把它刷成隐私告警只会让人学会无视告警。这里按「地址 + 文件」双条件放行，
+# 其它文件里出现同一个地址照样报——避免白名单被滥用成漏报通道。
+PUBLIC_CONTACT_EMAILS = {"kinartcn@gmail.com"}
+PUBLIC_CONTACT_FILES = {"README.md"}
+
 # ---- 发布完整性：不是隐私问题，但少了它们仓库就不能算「可协作」 ----
 REQUIRED_FILES = ["LICENSE", "NOTICE", "README.md", "CONTRIBUTING.md", ".gitignore"]
 RECOMMENDED_FILES = ["CLA.md", "SECURITY.md", "CHANGELOG.md"]
@@ -151,6 +157,9 @@ def scan():
                         hit = m.group(0)
                         if re.fullmatch(r"[\d.]+([eE][+-]?\d+)?", hit):
                             continue
+                        if (hit in PUBLIC_CONTACT_EMAILS
+                                and os.path.basename(rel) in PUBLIC_CONTACT_FILES):
+                            continue      # 有意公开，不是泄漏
                         warns.append({
                             "file": rel, "line": i, "rule": why,
                             "hit": hit[:60], "snippet": line.strip()[:140],
