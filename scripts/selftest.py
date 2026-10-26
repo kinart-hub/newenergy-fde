@@ -2545,6 +2545,97 @@ def test_contract_schema():
           (not r1["ok"]) and "不存在" in r1["error"], str(r1))
 
 
+def test_d8_closure_gate():
+    """P1-9 结案门禁：能不能结案必须能由机器判出来。
+
+    改造前 derive_d8({}) 的 blockers 是空的、也没有 can_close —— 零证据喂进去，
+    得到的仍然是一份看起来完整的"结案检查清单"。
+    使用者拿着它去见客户，才发现机器从头到尾没说过"能不能结案"。
+
+    所以这一组断言的核心只有一句：**零证据必须判不可结案**。
+    再往上加三类最容易钻空子的情形：时间倒挂、签字与证据自相矛盾、
+    日期格式不合法（不能因为比不了就放行）。
+    """
+    from lib import eightd as E
+
+    FULL = {
+        "d4_field_result": "现场复现，判定为真因", "d4_verify_method": "对照试验",
+        "signoff_d5": True, "action_list": ["调整涂布速度"], "change_no": "ECN-2026-018",
+        "signoff_d6": True, "verify_date": "2026-11-20",
+        "verify_sample_window": "11/20-11/27", "verify_sample_size": "连续 12 批",
+        "before_after": [{"before": 3.2, "after": 0.4}],
+        "signoff_d7": True, "doc_nos": ["WI-031 rev.C"],
+        "fmea_rev": "FMEA-2026-07 rev.2", "fmea_sod": "S=6 O=3 D=4",
+        "lateral_done": True, "lateral_records": ["产线 B 已排查"],
+        "customer_reply": "客户已接受", "signoff_d8": True,
+        "signoff_by": "质量经理", "signoff_date": "2026-11-28",
+    }
+    WIN = {"clean": {"verify_window": ["2026-10-01", "2026-10-20"]}}
+
+    # ---- 1. 零证据必须判不可结案（改造前的 bug 就在这里）
+    d0 = E.derive_d8({})
+    check("结案门禁：结果必须自带机器可判的 can_close", "can_close" in d0, str(sorted(d0)))
+    check("结案门禁：零证据不得判可结案", d0["can_close"] is False, str(d0.get("can_close")))
+    check("结案门禁：零证据时阻断项不得为空",
+          bool(d0["blockers"]), str(d0["blockers"])[:70])
+    check("结案门禁：零证据时 ready 必须为 0", d0["ready"] == 0, str(d0["ready"]))
+    check("结案门禁：status 要采用统一状态值",
+          d0.get("status") in ("INSUFFICIENT_DATA", "NO_FINDING"), str(d0.get("status")))
+
+    # ---- 2. 证据齐备要判可结案（不能永远 False，否则门禁没人信）
+    full = E.closure_check(WIN, card=dict(FULL))
+    check("结案门禁：证据齐备要判可结案", full["can_close"] is True, str(full["blockers"])[:90])
+    check("结案门禁：齐备时 ready 等于 total",
+          full["ready"] == full["total"], "%s/%s" % (full["ready"], full["total"]))
+
+    # ---- 3. 时间倒挂：拿改善前的历史数据充当"改善后验证"
+    bad = dict(FULL); bad["verify_date"] = "2026-09-01"
+    c = E.closure_check(WIN, card=bad)
+    check("结案门禁：验证日期早于样本窗口必须拦下", c["can_close"] is False)
+    check("结案门禁：要说清是倒挂而不是笼统不过",
+          any("倒挂" in b for b in c["blockers"]), str(c["blockers"])[:80])
+    check("结案门禁：time_check 要能反映倒挂",
+          c["time_check"] == "时间倒挂", str(c["time_check"]))
+
+    # ---- 4. 日期写得不合法：不能因为比不出来就放行
+    junk = dict(FULL); junk["verify_date"] = "去年冬天"
+    cj = E.closure_check(WIN, card=junk)
+    check("结案门禁：无法解析的日期不得放行", cj["can_close"] is False,
+          str(cj["time_check"]))
+    check("结案门禁：解析不了要标无法校验", cj["time_check"] == "无法校验", str(cj["time_check"]))
+    # 这一条专门盯"字符串比较"的老写法：str 比大小永远不抛异常，
+    # 于是非标准写法会被静默判成通过。日期必须真解析。
+    for okv, badv in [("2026-11-20", "2026-10-20")]:
+        d_ok, d_bad = E._parse_date(okv), E._parse_date(badv)
+        check("结案门禁：真解析而非字符串比大小",
+              d_ok is not None and d_bad is not None and d_ok > d_bad,
+              "%s vs %s" % (d_ok, d_bad))
+    for junk_date in ("去年冬天", "", None, "2026-13-45"):
+        check("结案门禁：非法日期必须返回 None（%r）" % (junk_date,),
+              E._parse_date(junk_date) is None, str(E._parse_date(junk_date)))
+    check("结案门禁：常见日期写法要认得出",
+          E._parse_date("2026/11/20") is not None
+          and E._parse_date("2026年11月20日") is not None
+          and E._parse_date("2026.11.20") is not None)
+
+    # ---- 5. 签了 D6 却没有对照数据：自相矛盾必须拦
+    contra = dict(FULL); contra["before_after"] = []; contra["verify_sample_size"] = ""
+    cc = E.closure_check(WIN, card=contra)
+    check("结案门禁：签了 D6 但缺对照数据必须拦", cc["can_close"] is False)
+    d6g = [g for g in cc["gates"] if g["id"] == "d6"][0]
+    check("结案门禁：要点名缺的是哪几项证据",
+          ("验证样本量" in d6g["missing"]) and ("改善前后对照" in d6g["missing"]),
+          str(d6g["missing"]))
+    check("结案门禁：每个 gate 都要声明它靠什么证明",
+          all(g.get("evidence_required") for g in cc["gates"]))
+
+    # ---- 6. 只缺客户回执的内部结案：应当放行（这一项不是必需条件）
+    internal = dict(FULL); internal.pop("customer_reply")
+    ci = E.closure_check(WIN, card=internal)
+    check("结案门禁：内部结案缺客户回执不阻断", ci["can_close"] is True,
+          str(ci["blockers"])[:80])
+
+
 def test_parameter_contracts():
     """入口契约：非法参数必须报错/降级，不得静默产出结论。
 
@@ -2821,6 +2912,7 @@ if __name__ == "__main__":
     test_confound_and_evidence()
     test_doe_safety_boundary()
     test_parameter_contracts()
+    test_d8_closure_gate()
     test_contract_schema()
     test_concurrent_write_integrity()
     test_tenant_path_guard()

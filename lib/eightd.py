@@ -827,7 +827,190 @@ def derive_d7_fmea(res, lead=None, card=None):
 # D8 结案条件
 # ---------------------------------------------------------------------------
 
-def derive_d8(res, lead=None):
+def _parse_date(v):
+    """尽最大努力把各种写法解析成 date；认不出来返回 None。
+
+    关键在返回值语义：**认不出来就是 None，不猜**。
+    结案判定里"不知道"必须等价于"不能放行"，而不是退化成一个默认值。
+    """
+    if v is None:
+        return None
+    import datetime as _dt
+    if isinstance(v, _dt.datetime):
+        return v.date()
+    if isinstance(v, _dt.date):
+        return v
+    s = str(v).strip()
+    if not s:
+        return None
+    s = s.replace("/", "-").replace("年", "-").replace("月", "-").replace("日", "")
+    s = s.split(" ")[0].split("T")[0]
+    for fmt in ("%Y-%m-%d", "%Y-%m-%d", "%d-%m-%Y", "%Y.%m.%d", "%Y%m%d"):
+        try:
+            return _dt.datetime.strptime(s, fmt).date()
+        # scan:keep 逐个格式试解是**正常探测路径**而非降级：前几种格式解不出
+        # 属预期情形，最终解不出时由调用方按 None 判「无法校验」并阻断，
+        # 这条路不会因为这里没记账而丢信息。启用条件：失败必须有兜底判定，
+        # 不能在 continue 之后不了了之。
+        except (ValueError, TypeError):
+            continue
+    # 退回抽数字：至少认得出纯日期数字串，认不出就 None
+    m = re.match(r"^(\d{4})-(\d{1,2})-(\d{1,2})$", s)
+    if m:
+        try:
+            return _dt.date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        except ValueError:
+            return None
+    return None
+
+
+def closure_check(res, card=None):
+    """P1-9 结案证据门禁：能不能结案，由机器判，不由人填。
+
+    改造前的 derive_d8 只有一段文案式的检查清单，零证据输入时 blockers 为空、
+    也不产出 can_close —— 也就是说，机器根本判不了"这份 8D 能不能结案"，
+    只剩下一个"任一 gate 未满足即不得结案"的提示靠人自觉。
+
+    报告点名要校的四件事，这里逐条落实：
+      1. 证据附件/记录是否真的填了（不是"有这一栏"，是"这栏里有东西"）
+      2. 验证日期是否晚于样本窗口末 —— 验证数据早于原始数据就是伪造
+      3. 样本量与窗口有没有登记 —— 签了字却说不清验了几批，等于没验
+      4. 改善前后对照数据是否存在 —— 没有对照就谈不上"措施有效"
+      5. 审批链是否完整且与上述证据匹配（签了 D6 却没有对照数据是自相矛盾）
+    """
+    card = card or {}
+    res = res or {}
+    st = signoff_state(card)
+
+    def _has(v):
+        if v is None:
+            return False
+        if isinstance(v, str):
+            return bool(v.strip())
+        if isinstance(v, (list, tuple, dict)):
+            return len(v) > 0
+        return True
+
+    # 每个 gate 都绑定"它到底要靠什么来证明"，而不是只写一句话。
+    # 只有这样才谈得上"结案能不能由机器判"。
+    spec = [
+        {"id": "d4", "item": "D4 根因已通过现场验证（真因/伪因已判定）",
+         "fields": ["d4_field_result", "d4_verify_method"],
+         "labels": ["现场验证结论", "验证方法"]},
+        {"id": "d5", "item": "D5 措施已实施且参数变更有审批记录",
+         "fields": ["signoff_d5", "action_list", "change_no"],
+         "labels": ["D5 确审", "措施清单", "变更申请单编号"]},
+        {"id": "d6", "item": "D6 验证数据满足判定标准（含连续批次数与 Cpk）",
+         "fields": ["signoff_d6", "verify_date", "verify_sample_window",
+                    "verify_sample_size", "before_after"],
+         "labels": ["D6 确审", "验证日期", "验证样本窗口", "验证样本量", "改善前后对照"]},
+        {"id": "d7", "item": "D7 预防动作已有文件编号并生效",
+         "fields": ["signoff_d7", "doc_nos"],
+         "labels": ["D7 确审", "文件编号清单"]},
+        {"id": "d7f", "item": "D7 的 PFMEA 更新完成且有修订记录（含 8D 编号）",
+         "fields": ["fmea_rev", "fmea_sod"],
+         "labels": ["FMEA 修订记录", "S/O/D 评分依据"]},
+        {"id": "lat", "item": "横向展开范围内已完成同类排查",
+         "fields": ["lateral_done", "lateral_records"],
+         "labels": ["横向展开结论", "排查记录"]},
+        {"id": "cust", "item": "客户已反馈接受（对外 8D）",
+         "fields": ["customer_reply"], "labels": ["客户回执"],
+         "required": False},      # 内部结案不强求客户回执
+    ]
+    # 签署字段要做的是布尔判定，不能拿它当"有值"来凑数
+    bool_ish = {"signoff_d5", "signoff_d6", "signoff_d7", "signoff_d8",
+                "lateral_done"}
+
+    gates, blockers = [], []
+    for s in spec:
+        missing = []
+        for i, f in enumerate(s["fields"]):
+            v = card.get(f)
+            ok = (v is True) if f in bool_ish else _has(v)
+            if not ok:
+                missing.append(s["labels"][i] if i < len(s["labels"]) else f)
+        ready = not missing
+        gate = {"id": s["id"], "item": s["item"],
+                "evidence_required": list(s["labels"]),
+                "missing": missing, "ready": ready,
+                "status": "已具备证据" if ready else "缺证据"}
+        gates.append(gate)
+        if not ready and s.get("required", True):
+            blockers.append("「%s」缺：%s" % (s["item"], "、".join(missing)))
+
+    # ---- 时间自洽：验证日期必须晚于样本窗口末 ----
+    # 这一条抓的是最恶劣的一种情况：拿改善前的历史数据充当"改善后验证"。
+    _vd = card.get("verify_date")
+    _win = None
+    try:
+        _win = ((res.get("clean") or {}).get("verify_window")
+                or (res.get("trace_meta") or {}).get("window"))
+    except Exception:
+        _win = None
+    _end = None
+    if isinstance(_win, (list, tuple)) and _win:
+        _end = _win[-1]
+    elif isinstance(_win, dict):
+        _end = _win.get("end") or _win.get("latest")
+    _time_check = "未执行"
+    _vd_d = _parse_date(_vd)
+    _end_d = _parse_date(_end)
+    if _vd and _end:
+        # 必须真的解析成日期再比。
+        # 早先用 str 比大小，而 Python 的字符串比较对任何输入都成立：
+        # 非法写法不会抛异常，只会按字典序给出假答案，
+        # 于是 except 永远不触发、时间倒挂检查遇到非标准写法就自动放行。
+        # 日期比不出来就必须是阻断，不能默认是好的。
+        if _vd_d is None or _end_d is None:
+            _time_check = "无法校验"
+            blockers.append(
+                "时间自洽无法校验：验证日期 %r 或样本窗口末 %r 不是可识别的日期"
+                "（应为 YYYY-MM-DD），无法确认验证是否发生在改善之后"
+                % (_vd, _end))
+        elif _vd_d < _end_d:
+            _time_check = "时间倒挂"
+            blockers.append(
+                "时间倒挂：验证日期 %s 早于分析样本窗口末 %s —— "
+                "验证数据不可能早于被验证的数据，请核对该日期是否为改善前数据"
+                % (_vd, _end))
+        else:
+            _time_check = "通过"
+    elif not _vd and (gates[2]["ready"]):
+        # D6 其余证据齐了却没日期，照样不许过
+        blockers.append("D6 缺验证日期：无法确认验证发生在改善之后")
+        _time_check = "缺验证日期"
+
+    # ---- 签署完备性 ----
+    if not st["all_signed"]:
+        blockers.append("D5–D8 四项人工确审未齐全，不得结案。")
+
+    conf = (res.get("confidence") or {}).get("level")
+    if conf in ("低", "较低", "low"):
+        blockers.append("结论置信度为「%s」，P0 数据缺口未补齐前不得结案。" % conf)
+    if bool((res.get("negative_verdict") or {}).get("verdict") == "no_actionable_cause"):
+        blockers.append("本次为负例结论（无可行动工艺根因），"
+                        "在补充 STC 归一与测试台标定之前不具备结案条件。")
+
+    ready_n = sum(1 for g in gates if g["ready"])
+    return {
+        "can_close": (not blockers),
+        "gates": gates,
+        "ready": ready_n,
+        "total": len(gates),
+        "blockers": blockers,
+        "time_check": _time_check,
+        "signoff": {"all_signed": st["all_signed"], "by": st.get("by"),
+                    "date": st.get("date")},
+        "note": ("结案判定由证据字段是否齐备与时间是否自洽得出，不靠人工勾选。"
+                 "任一项未具备即不得结案：本节是检查清单，不是结案声明。"
+                 "时限：完整 8D 需在接到客户投诉后 5 个工作日内提交。"),
+    }
+
+
+def derive_d8(res, lead=None, card=None):
+    """D8 结案检查清单。card 为 D2 录入卡——不传就拿不到证据，
+    门禁只能判"不具备结案条件"，那和没有门禁差别不大。
+    """
     conf = (res.get("confidence") or {}).get("level")
     nv = bool((res.get("negative_verdict") or {}).get("verdict") == "no_actionable_cause")
     gates = [
@@ -846,15 +1029,27 @@ def derive_d8(res, lead=None):
         {"item": "客户已反馈接受（对外 8D）", "status": "待确认",
          "evidence": "客户回执"},
     ]
-    blockers = []
-    if nv:
-        blockers.append("本次分析为**负例结论**（无可行动工艺根因），"
-                        "在补充 STC 归一与测试台标定之前不具备结案条件。")
-    if conf in ("低", "较低", "low"):
-        blockers.append("结论置信度为「%s」，P0 数据缺口未补齐前不得结案。" % conf)
-    return {"gates": gates, "blockers": blockers,
-            "note": "任一 gate 未满足即不得结案。本节是检查清单，不是结案声明。"
-                    "**时限：完整 8D 需在接到客户投诉后 5 个工作日内提交。**"}
+    # 真正的结案判定交给 closure_check。
+    # 这里保留兼容：旧调用方拿到的 key 一个不少，但多了一个
+    # 机器可判的 can_close —— 没有它，这份清单只能靠人自觉。
+    cc = closure_check(res, card=(card or res.get("_d2_card") or None))
+    out = dict(cc)
+    out["gates"] = [{"item": g["item"],
+                     "status": g["status"],
+                     "evidence": "、".join(g["evidence_required"])
+                                 + ("（缺：%s）" % "、".join(g["missing"])
+                                    if g["missing"] else "")}
+                    for g in cc["gates"]]
+    try:
+        from . import status as ST
+    except Exception:
+        try:
+            import status as ST
+        except Exception:
+            ST = None
+    out["status"] = (ST.NO_FINDING if cc["can_close"] else ST.INSUFFICIENT_DATA) \
+        if ST else ("可以结案" if cc["can_close"] else "不具备结案条件")
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -1058,11 +1253,18 @@ def render_8d(rep, res, card=None, conflicts=None, parent=None):
 
     # ---- D8 ----
     s = rep.section("D8 结案检查清单", level=3)
-    d8 = derive_d8(res, lead)
+    d8 = derive_d8(res, lead, card=card)
+    # 先给结论再给清单：审核者翻到这一节，第一眼要看到
+    # 「现在到底能不能结案」，而不是自己去数哪几条打勾。
+    rep.kv(s, [("结案判定",
+                "**具备结案条件**（证据 %d/%d 项齐备）" % (d8["ready"], d8["total"])
+                if d8.get("can_close") else
+                "**不具备结案条件**（证据 %d/%d 项齐备，尚有 %d 项阻断）"
+                % (d8["ready"], d8["total"], len(d8.get("blockers") or [])))])
     rep.table(s, ["#", "结案条件", "状态", "证据要求"],
               [[i, g["item"], g["status"], g["evidence"]]
                for i, g in enumerate(d8["gates"], 1)],
-              caption=d8["note"])
+              caption=d8.get("note", ""))
     if d8["blockers"]:
         for b in d8["blockers"]:
             rep.callout(s, b, "warn")

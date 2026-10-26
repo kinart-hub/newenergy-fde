@@ -1642,6 +1642,66 @@ def rule_contract_enforced():
     return _r(True, "", {"compat": True, "result": True, "values": True})
 
 
+def rule_d8_closure_gate():
+    """P1-9：8D 能不能结案必须能由机器判出来。
+
+    改造前 derive_d8({}) 的 blockers 为空、也没有 can_close：
+    零证据喂进去，照样吐出一份完整的"结案检查清单"。
+    使用者拿去见客户才发现，机器从头到尾没说过"能不能结案"。
+
+    判据落在四个具体动作上（不停留在"字样出现过"）：
+      can_close 真的被返回、每个 gate 绑定了证明它所需的证据字段、
+      日期是真解析而非字符串比大小、渲染时真的把录入卡传给了门禁。
+    """
+    t = _read(EIGHTD_FILE) or ""
+    if not t:
+        return _r(False, "读不到 " + EIGHTD_FILE)
+
+    cc = _block(t, "def closure_check(", "\ndef ")
+    if "def closure_check(" not in t:
+        return _r(False, "缺少 closure_check：结案与否无法由机器判定")
+    # 1) 必须产出机器可判的结论，而不是只给一段给人看的清单
+    if not re.search(r'"can_close":\s*\(?not blockers\)?', cc) and \
+       not re.search(r'"can_close":\s*not blockers', cc):
+        return _r(False, "closure_check 未产出 can_close（或它的值与 blockers 脱钩）")
+    # 2) 每个 gate 必须声明"靠什么证明"——否则项和项之间没有区别
+    if '"evidence_required"' not in cc:
+        return _r(False, "gate 未绑定所需证据清单：无法逐项判定")
+    if "missing" not in cc:
+        return _r(False, "gate 未记录缺哪些证据：使用者不知道该补什么")
+    # 3) 日期必须真解析：字符串比大小对任何输入都成立，
+    #    "去年冬天" 会被静默判成合法并通过。这条是本轮实测出来的真坑。
+    if "def _parse_date(" not in t:
+        return _r(False, "缺 _parse_date：日期只能做字符串比较，非标准写法会被静默放行")
+    if not re.search(r"_vd_d is None or _end_d is None", cc):
+        return _r(False, "日期解析不出来时应当阻断，当前实现默认放行")
+    # 判据落在**正确调用的形态**上：比较必须发生在解析之后的日期变量之间。
+    # 不去搜索 "str(_vd) < str(_end)" 这种错误串 —— 我上一版就是这么写的，
+    # 结果自己注释里提到这个写法都被判为违规（自我指涉第三次）。
+    if not re.search(r"^\s+elif _vd_d < _end_d:", cc, re.M):
+        return _r(False, "比较必须基于解析后的日期变量 _vd_d/_end_d，不能直接比原始字符串")
+    if not re.search(r"^\s+_vd_d = _parse_date\(_vd\)", cc, re.M):
+        return _r(False, "验证日期未走 _parse_date 解析")
+    # 解析不出来要记账才好排查
+    if re.search(r"_time_check = \"无法校验\"", cc) is None:
+        return _r(False, "日期无法校验时没有标记为无法校验")
+
+    # 4) 渲染必须把录入卡传进去，否则门禁永远看不到证据。
+    # 这里不用 _block 取块：render_8d 是长函数，_block 的 maxlen 截断会让
+    # 调用行落在截取范围外，规则就变成恒失败——而恒失败看起来跟"抓到了"一样。
+    # 改用行首锚定的全文件正则，既躲开注释，又不依赖片段长度。
+    if not re.search(r"^\s+d8 = derive_d8\(res, lead, card=card\)", t, re.M):
+        return _r(False, "渲染 8D 时没有把录入卡传给 derive_d8：门禁拿不到证据")
+    if not re.search(r'^\s+rep\.kv\(s, \[\("结案判定"', t, re.M):
+        return _r(False, "报告没有给出结案判定结论：审核者要自己去数哪几条打勾")
+    # derive_d8 自身也要能把 card 透下去
+    d8 = _block(t, "def derive_d8(", "\ndef ")
+    if "card=(card or res.get(" not in d8:
+        return _r(False, "derive_d8 未把 card 透传给 closure_check")
+
+    return _r(True, "", {"closure": True, "dates": True, "wired": True})
+
+
 AUDIT_RULES = [
     Rule("LICENSE 为 Elastic 2.0 官方纯文本", rule_license,
          "LICENSE 首行必须是裸文本 'Elastic License 2.0'（前面有 # 或 ## 即判不过）",
@@ -2141,6 +2201,34 @@ AUDIT_RULES = [
                   _re_sub(r"^[ \t]+_ci = CT\.check_input\(work",
                           "        _ci = None  # 变异：契约未接入\n        if _ci is None: _ci = {}",
                           flags=re.M), PIPELINE_FILE)]),
+    Rule("8D 能不能结案必须由证据判出来，且日期要真解析",
+         rule_d8_closure_gate,
+         "P1-9。closure_check 必须产出与 blockers 挂钩的 can_close；"
+         "每个 gate 绑定 evidence_required 并记下缺哪几项；"
+         "日期用 _parse_date 真解析，解析不出来按阻断处理；"
+         "渲染时必须把录入卡传给 derive_d8。"
+         "为什么这四条缺一不可：改造前 derive_d8({}) 的 blockers 是空的、"
+         "也没有 can_close——零证据喂进去照样吐出一份完整清单，"
+         "机器从头到尾没说过能不能结案。"
+         "另外，用 str 比日期是本轮实测出来的坑：Python 的 str 比较对任何输入都成立，"
+         "『去年冬天』不会抛异常，只会按字典序给出假答案从而静默放行。",
+         EIGHTD_FILE,
+         [          _mutant("结案判定与 blockers 脱钩（永远可结案）",
+                  _re_sub(r'"can_close": \(not blockers\),',
+                          '"can_close": True,',
+                          flags=re.M), EIGHTD_FILE),
+          _mutant("日期解析不出来也放行",
+                  _re_sub(r"^[ \t]+if _vd_d is None or _end_d is None:",
+                          "    if False:",
+                          flags=re.M), EIGHTD_FILE),
+          _mutant("退回字符串比日期（非法写法会被静默判通过）",
+                  _re_sub(r"^[ \t]+elif _vd_d < _end_d:",
+                          "    elif str(_vd) < str(_end):",
+                          flags=re.M), EIGHTD_FILE),
+          _mutant("渲染不把录入卡传给门禁（证据永远看不到）",
+                  _re_sub(r"^[ \t]+d8 = derive_d8\(res, lead, card=card\)",
+                          "    d8 = derive_d8(res, lead)",
+                          flags=re.M), EIGHTD_FILE)]),
 ]
 
 
