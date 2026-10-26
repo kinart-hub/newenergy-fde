@@ -35,6 +35,7 @@ try:
     sys.stderr.reconfigure(encoding="utf-8")
 except Exception:
     pass
+    # scan:keep stdout 编码兜底在模块加载期执行，degrade 尚未导入；且非 Windows 环境没有 reconfigure 属正常分支，不是降级。
 
 
 def emit(obj, as_json=False, title=""):
@@ -999,8 +1000,10 @@ def main():
         try:
             from lib import preprocess as PP
             PP._KNOWLEDGE = None
-        except Exception:
-            pass
+        except Exception as e:
+            # 缓存没清掉意味着本条命令会读到上一次的知识库快照——
+            # 在「改完知识库立刻验证」的场景下，这会让人以为改动没生效。
+            print("[提示] 知识库缓存未能清除（%s），本条命令可能读到旧快照。" % e)
     if not getattr(a, "func", None):
         p.print_help()
         sys.exit(0)

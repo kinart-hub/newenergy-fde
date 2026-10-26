@@ -81,6 +81,7 @@ def note(where, exc=None, stage=""):
     except Exception:
         # 台账自身出任何问题都必须静默——诊断通道不许反过来搞崩主流程
         pass
+        # scan:keep 台账自身必须静默：记账再抛异常会递归回这里，诊断通道不许反过来搞崩主流程。退化路径是 print，不是崩溃。
 
 
 def note_current(where, stage=""):

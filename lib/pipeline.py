@@ -31,6 +31,7 @@ except Exception:
     # 非 Windows、或 stdout 已被外部替换时没有 reconfigure，属正常分支。
     # 这里刻意不记降级台账：本行在模块加载期执行，那时 degrade 还没导入，
     # 而且把环境差异记成"降级"会污染每一次分析的台账。
+    # scan:keep 模块加载期执行、degrade 尚未导入，且非 Windows 无 reconfigure 属正常分支，不是降级。
     pass
 import io
 import json
@@ -88,7 +89,7 @@ if EV is not None and EV.__name__ != "lib.events":
 KB = PP.load_knowledge()
 _fmt = RPT._fmt
 
-ANALYZER_VERSION = "2.2.0"
+ANALYZER_VERSION = "2.3.0"
 
 
 # 空数据排查清单。

@@ -94,6 +94,9 @@ class Finding(object):
                 "hint": self.hint}
 
 
+_KEPT = []        # 被 scan:keep 豁免的条目，与 findings 分开报
+
+
 # 豁免标记：源码里写 `# scan:keep <理由>` 表示"这条我确认过，保留"。
 # 用途是把「已知但暂不处理」与「不知道它存在」分开——
 # 前者是决策，后者是盲区。豁免必须带理由，无理由的豁免不予承认。
@@ -104,6 +107,23 @@ def _keep_reason(text, def_lineno):
     """取定义处附近的 scan:keep 理由（定义行本身或紧邻的前 3 行内）。"""
     lines = text.splitlines()
     for i in range(def_lineno - 1, max(-1, def_lineno - 5), -1):
+        m = KEEP_RE.search(lines[i])
+        if m:
+            return m.group(1).strip()
+    return ""
+
+
+def _keep_reason_range(lines, lo_1based, hi_1based, pad=2):
+    """按行区间取 scan:keep 理由（1 起行号，两端再外扩 pad 行）。
+
+    用 handler 的真实起止行而不是「except 行 ±3」：多行 handler
+    （except + 若干行说明 + pass）按固定行数算会整个落在窗口外，
+    豁免就静默失效——而豁免失效的后果是它又被报一遍，
+    逼着人要么重复标注要么放弃使用豁免机制。
+    """
+    lo = max(0, lo_1based - 1 - pad)
+    hi = min(len(lines), hi_1based + pad)
+    for i in range(lo, hi):
         m = KEEP_RE.search(lines[i])
         if m:
             return m.group(1).strip()
@@ -157,6 +177,15 @@ def scan_silent_except():
                 if "pass" not in src_lines[ln - 1] and ln < len(src_lines):
                     if "pass" in src_lines[ln]:
                         ln = ln + 1
+            # 豁免：源码里写明「这条确认过、保留」的，不再报。
+            # 注释可能写在 except 之前（解释为什么吞）或之后（解释为什么保留），
+            # 所以按 handler 的真实起止行取窗口，再两端各外扩 2 行。
+            kr = _keep_reason_range(src_lines, node.lineno,
+                                    getattr(node, "end_lineno", None)
+                                    or node.lineno)
+            if kr:
+                _KEPT.append({"id": "S1", "file": rel, "line": ln, "reason": kr})
+                continue
             out.append(Finding(
                 "S1", "MED" if has_finally else "HIGH", rel, ln,
                 "except 分支静默吞掉异常（只有 pass）",
@@ -234,6 +263,8 @@ def scan_dead_code():
             text = _read(rel)
             reason = _keep_reason(text, ln)
             if reason:
+                _KEPT.append({"id": "S2", "file": rel, "line": ln,
+                              "reason": reason})
                 continue      # 已确认保留并写明理由，不再报
             out.append(Finding(
                 "S2", "MED", rel, ln,
@@ -639,6 +670,12 @@ def main(argv=None):
     print("汇总：HIGH %d / MED %d / LOW %d —— 共 %d 条" % (
         n_high, n_med,
         sum(1 for f in findings if f.sev == "LOW"), len(findings)))
+    # 豁免数单独报：它衡量的是「有多少盲区被主动确认过」。
+    # 不报的话，把静默异常标注成豁免就成了另一种「让它消失」。
+    if _KEPT:
+        print("已豁免 %d 条（源码里写明 scan:keep 理由，属决策不是盲区）" % len(_KEPT))
+        for k in _KEPT[:20]:
+            print("    · %s:%s  %s" % (k["file"], k["line"], k["reason"][:60]))
 
     if args.json:
         try:
@@ -647,8 +684,10 @@ def main(argv=None):
                 os.makedirs(d, exist_ok=True)
             with io.open(args.json, "w", encoding="utf-8") as f:
                 json.dump({"summary": {"high": n_high, "med": n_med,
-                                       "total": len(findings)},
-                           "findings": [x.as_dict() for x in findings]},
+                                       "total": len(findings),
+                                       "kept": len(_KEPT)},
+                           "findings": [x.as_dict() for x in findings],
+                           "kept": _KEPT},
                           f, ensure_ascii=False, indent=2)
             print("落盘：" + args.json)
         except Exception as e:

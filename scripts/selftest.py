@@ -25,6 +25,7 @@ try:
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 except Exception:
     pass
+    # scan:keep stdout 编码兜底在模块加载期执行，degrade 尚未导入；且非 Windows 环境没有 reconfigure 属正常分支，不是降级。
 import io
 import math
 import glob
@@ -50,6 +51,16 @@ def check(name, cond, detail=""):
 
 def approx(a, b, tol=1e-6):
     return a is not None and b is not None and abs(a - b) <= tol
+
+
+def reset_fail(what, e):
+    """测试环境复位失败时出声，但不计入 FAIL。
+
+    不计入 FAIL 是因为复位的锅不该由被测功能背；
+    必须出声是因为复位失败会让**后续**用例跑在脏状态上——
+    那时看到的 [OK] 是假的，而看报告的人无从分辨。
+    """
+    print("  [清理警告] %s 未能复位：%s（后续用例可能受脏状态影响）" % (what, e))
 
 
 # ---------------------------------------------------------------- A 表格
@@ -951,8 +962,8 @@ def test_isolation():
     finally:
         try:
             KBS.set_root(None); TN.set_tenant(None); TN.set_root(orig_root); PP._KNOWLEDGE = None
-        except Exception:
-            pass
+        except Exception as _rst_e:
+            reset_fail("知识库根目录/租户/缓存", _rst_e)
         if tmp:
             shutil.rmtree(tmp, ignore_errors=True)
 
@@ -1179,8 +1190,8 @@ def test_industry():
                 SC.clear()
                 PP._KNOWLEDGE = None
                 PP._KNOWLEDGE_SCOPE = "__unset__"
-            except Exception:
-                pass
+            except Exception as _rst_e:
+                reset_fail("TN.set_root(orig_root)", _rst_e)
             shutil.rmtree(tmp2, ignore_errors=True)
     except Exception as e:
         import traceback
@@ -1192,8 +1203,8 @@ def test_industry():
             PP._KNOWLEDGE = None
             PP._KNOWLEDGE_SCOPE = "__unset__"
             DEV.invalidate_cache()
-        except Exception:
-            pass
+        except Exception as _rst_e:
+            reset_fail("scope 状态", _rst_e)
 
 
 def test_device_memory():
@@ -1220,8 +1231,8 @@ def test_device_memory():
         try:
             from lib import scope as SC
             SC.set_root(tmp)
-        except Exception:
-            pass
+        except Exception as _rst_e:
+            reset_fail("scope 根目录切到临时目录", _rst_e)
         base_dev = os.path.join(tmp, "knowledge", "device_profiles.json")
         h0 = hashlib.md5(io.open(base_dev, "rb").read()).hexdigest()
 
@@ -1354,19 +1365,19 @@ def test_device_memory():
     finally:
         try:
             TN.set_root(orig_root)
-        except Exception:
-            pass
+        except Exception as _rst_e:
+            reset_fail("TN.set_root(orig_root)", _rst_e)
         try:
             from lib import devices as DEV2
             DEV2.invalidate_cache()
-        except Exception:
-            pass
+        except Exception as _rst_e:
+            reset_fail("设备档案缓存", _rst_e)
         try:
             from lib import preprocess as PP2
             PP2._KNOWLEDGE = None
             PP2._KNOWLEDGE_TENANT = "__unset__"
-        except Exception:
-            pass
+        except Exception as _rst_e:
+            reset_fail("工艺知识库缓存", _rst_e)
         if tmp:
             shutil.rmtree(tmp, ignore_errors=True)
 
@@ -1395,17 +1406,35 @@ def test_hotswap():
 
         # 1) Windows 并发读下原子写不得失败
         stop = {"v": False}
-        stat = {"ok": 0, "fail": 0}
+        # 读侧与写侧分开统计。此前读侧的异常被 pass 吞掉、一个数都没进 stat，
+        # 于是「并发读不撕裂」这条断言实际只覆盖了写侧——读侧撕裂根本发现不了。
+        # 现在读侧拆成三种结果，只有「解析失败」才是这条测试要抓的目标。
+        stat = {"ok": 0, "fail": 0, "read_ok": 0, "read_torn": 0,
+                "read_locked": 0}
 
         def _holder():
             while not stop["v"]:
                 try:
-                    # 用 hotswap 的容错读：另一线程做 replace 的瞬间 Windows 会拒绝
-                    # 读打开（Errno 13）。这是 replace 的排斥窗口不是数据损坏，
-                    # 实测 4005 次读里 7 次，抓到的失败快照全部是完整 JSON——零撕裂。
-                    _json.loads(HS.read_text_retry(spec))
+                    # 两级失败必须分开看：
+                    #   read_text_retry 抛错 = 另一线程 replace 的瞬间 Windows 拒绝
+                    #     读打开（Errno 13），这是排斥窗口不是数据损坏，可接受；
+                    #   json.loads 抛错 = 读到了写了一半的内容，这就是撕裂。
+                    # 混在一起 pass 掉，撕裂就会被排斥窗口的合理性一起挡掉。
+                    try:
+                        raw = HS.read_text_retry(spec)
+                    except Exception:
+                        stat["read_locked"] += 1
+                        time.sleep(0.001)
+                        continue
+                    try:
+                        _json.loads(raw)
+                    except Exception:
+                        stat["read_torn"] += 1
+                    else:
+                        stat["read_ok"] += 1
                 except Exception:
-                    pass
+                    # 兜底：任何没预想到的读侧异常都按撕裂算，宁可误报不可漏报
+                    stat["read_torn"] += 1
                 # 让出 1ms。真实读者读完还要解析、算指标、写报告，不存在
                 # 100% 忙等的读进程；而 2 核 CI runner 上忙等会把 writer 线程
                 # 直接饿死——那样测出来的是调度器，不是原子写的健壮性。
@@ -1435,6 +1464,12 @@ def test_hotswap():
         t2.join()
         check("并发读期间原子写不失败", stat["fail"] == 0 and stat["ok"] > 0,
               "成功%d 失败%d" % (stat["ok"], stat["fail"]))
+        # 读侧单独成条：写成功 ≠ 读到的东西是完整的，
+        # 这两件事此前共用一个断言，等于只验了前者。
+        check("并发读全程零撕裂",
+              stat["read_torn"] == 0 and stat["read_ok"] > 0,
+              "完整解析%d 撕裂%d 撞排斥窗口%d" % (
+                  stat["read_ok"], stat["read_torn"], stat["read_locked"]))
         check("原子写不留临时文件",
               not [f for f in os.listdir(os.path.join(tmp, "knowledge")) if ".tmp-" in f])
         check("并发写后基线仍可解析",
@@ -1496,8 +1531,8 @@ def test_hotswap():
             PP._KNOWLEDGE_TENANT = "__unset__"
             PP._KNOWLEDGE_SCOPE = "__unset__"
             HS.forget()
-        except Exception:
-            pass
+        except Exception as _rst_e:
+            reset_fail("知识库/租户/scope/热更新指纹", _rst_e)
         if tmp:
             shutil.rmtree(tmp, ignore_errors=True)
 

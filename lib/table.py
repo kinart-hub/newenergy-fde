@@ -128,6 +128,9 @@ def to_number(value):
         return float(s)
     except Exception:
         pass
+        # scan:keep 探测型容错：to_number 每秒被调用上千次，记账会把台账
+        # 刷爆；解析不出数字是本函数的正常返回路径（走下面的带单位提取），
+        # 不是降级。同类探测型容错都不记账。
     m = _NUM_HEAD_RE.match(s)
     if m is None:
         return None

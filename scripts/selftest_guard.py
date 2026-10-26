@@ -13,6 +13,7 @@ try:
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 except Exception:
     pass
+    # scan:keep stdout 编码兜底在模块加载期执行，degrade 尚未导入；且非 Windows 环境没有 reconfigure 属正常分支，不是降级。
 import re
 import json
 import shutil
@@ -36,6 +37,16 @@ RESULTS = []
 def check(name, cond, detail=""):
     RESULTS.append((name, bool(cond), detail))
     print("  [%s] %s %s" % ("OK" if cond else "FAIL", name, detail))
+
+
+def reset_fail(what, e):
+    """测试环境复位失败时出声，但不计入 FAIL。
+
+    不计入 FAIL 是因为复位的锅不该由被测功能背；
+    必须出声是因为复位失败会让**后续**用例跑在脏状态上——
+    那时看到的 [OK] 是假的，而看报告的人无从分辨。
+    """
+    print("  [清理警告] %s 未能复位：%s（后续用例可能受脏状态影响）" % (what, e))
 
 
 print("A. 别名子串护栏")
@@ -247,8 +258,8 @@ check("CLI 模式下 8D 引擎同样生效且不静默降级",
       "eightd=%s" % (list((_cli_res.get("eightd") or {}).keys())[:6]))
 try:
     shutil.rmtree(_tmpd)
-except Exception:
-    pass
+except Exception as _rst_e:
+    reset_fail("临时目录", _rst_e)
 
 print("N. 性能护栏：不能出现「同一份数据被反复解析」")
 # 教训：企业端一条涂布线一个班次的导出就是几万行。此前 Table.numeric_columns() /

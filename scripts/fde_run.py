@@ -45,6 +45,7 @@ try:
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 except Exception:
     pass
+    # scan:keep stdout 编码兜底在模块加载期执行，degrade 尚未导入；且非 Windows 环境没有 reconfigure 属正常分支，不是降级。
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -235,8 +236,11 @@ def _print_deliverables(result_json, outdir, d2_card=None):
                         ap = os.path.abspath(p)
                         if ap not in files:
                             files.append(ap)
-    except Exception:
-        pass
+    except Exception as e:
+        # 权威清单读不出来，下面只靠 glob 兜底——能兜住目录里的文件，
+        # 兜不住写在 outputs 里的绝对路径产物。必须让人知道清单可能不全。
+        print("[提示] result.json 的 outputs 清单读不出来（%s），"
+              "产物清单改为按目录扫描，可能漏掉写在清单里的路径。" % e)
 
     # 2) 补 outputs 没覆盖到的产物（如 8D 录入卡）
     for p in sorted(glob.glob(os.path.join(outdir, "*"))):
@@ -448,8 +452,10 @@ def check_stale_locks():
                 for f in os.listdir(p):
                     try:
                         os.remove(os.path.join(p, f))
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        # 删不掉就如实说，别让它看起来是清干净了
+                        print("[提示] 锁目录残留文件删不掉：%s（%s）"
+                              % (os.path.join(p, f), e))
                 os.rmdir(p)
                 removed.append(d)
             except Exception:
@@ -1636,8 +1642,12 @@ def rule_selftest_steps():
         try:
             subprocess.run(["git", "init", "-q"], cwd=tmp, capture_output=True,
                            timeout=60)
-        except Exception:
-            pass
+        except Exception as e:
+            # 不静默：git 起不来时依赖仓库状态的规则会记 SKIP，
+            # 而 SKIP 比 FAIL 危险——FAIL 至少告诉你有事，
+            # SKIP 让你以为门禁是好的。这里必须让跑的人看见。
+            print("[提示] 规则自检副本里 git init 失败（%s）："
+                  "依赖仓库状态的规则会记为 SKIP，不是通过。" % e)
         for i, rule in enumerate(AUDIT_RULES, 1):
             steps.append(_selftest_one(i, rule, tmp))
     finally:
@@ -1781,11 +1791,18 @@ def flow_analyze(args):
             return False, "结果里没有 8D 段（eightd 未装载）", {}
         mds = sorted(glob.glob(os.path.join(outdir, "*.md")))
         text = ""
+        unreadable = []
         for m in mds:
             try:
                 text += io.open(m, encoding="utf-8", errors="replace").read()
-            except Exception:
-                pass
+            except Exception as e:
+                # 读不出来的文件不能当成「内容为空」混进 text：那样下面会报
+                # 「报告缺小节」，使用者就去找报告的问题，而真实原因是文件
+                # 被 Excel/编辑器占用或没权限。报错必须指向真实原因。
+                unreadable.append("%s（%s）" % (os.path.basename(m), e))
+        if unreadable:
+            return False, ("报告文件读不出来，无法判定小节完整性：%s"
+                           % "；".join(unreadable)), {}
         missing = [d for d in ("D1", "D2", "D3", "D4", "D5", "D6", "D7", "D8")
                    if d not in text]
         st = e8.get("signoff") or {}
