@@ -107,11 +107,23 @@ def main(argv=None):
         print("若路径不同，用 --dest 指定。")
         return 1
 
-    rels = tracked_files() if args.all else changed_files()
+    # ⚠️ 这里原先有个假阴性，改这段前先看清楚为什么：
+    # 旧实现默认用 changed_files()（git status --porcelain）取"本次改动"。
+    # 一旦 commit，改动就不在 status 里了 → rels 变空 →
+    # 直接打印「没有需要同步的文件」并返回 0。
+    # 实测后果：v2.4.0 提交后安装目录的 CHANGELOG.md 仍是旧版，
+    # --check 却报「两处一致」。**报一致比报不一致危险得多**——
+    # 它让人以为核对过了，而安装目录是真正被运行时加载的那一份。
+    # 安装目录落后多少，跟"这次改了几个文件"根本没关系，
+    # 所以核对与同步一律按全量受版本控制的文件走。
+    rels = list(tracked_files())
+    for r in changed_files():          # 还没 git add 的新文件也要带上
+        if r not in rels:
+            rels.append(r)
     rels = [r for r in rels if not _skip(r)]
     if not rels:
-        print("没有需要同步的文件。")
-        return 0
+        print("仓库里没有受版本控制的文件，无法核对。")
+        return 1
 
     same, diff, missing, copied = 0, [], [], 0
     for rel in sorted(set(rels)):
