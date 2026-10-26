@@ -171,6 +171,13 @@ def finish(flow, steps, report_path, extra=None, started=None):
         mark = {"PASS": "OK  ", "FAIL": "FAIL", "SKIP": "SKIP"}[s["status"]]
         print("  [%s] %-26s %6.1fs %s" % (mark, s["name"], s["seconds"],
                                           s.get("reason") or ""))
+        # 失败原因必须当场可见。只有退出码时，使用者分不清「真有缺陷」和
+        # 「被另一个实例的锁挤掉」，而这两种的处置完全不同：
+        # 前者要改代码，后者只要串行重跑。让人去翻 JSON 才能分辨，
+        # 等于把门禁的结论权交给记得去翻的人。
+        if s["status"] in ("FAIL", "SKIP") and s.get("tail"):
+            for line in s["tail"][-3:]:
+                print("         ↳ %s" % line.strip()[:120])
     print("-" * 68)
     print("  通过 %d / 失败 %d / 跳过 %d   总耗时 %.1fs"
           % (n["PASS"], n["FAIL"], n["SKIP"], total))
@@ -619,6 +626,12 @@ AUDIT_FILES = [
     os.path.join("lib", "correlation.py"),
     os.path.join("lib", "direction.py"),
     os.path.join("lib", "stats.py"),
+    # v2.6 新增模块的规则要在这些文件里注入缺陷；缺了它们会静默 SKIP（不是 FAIL），
+    # 表现为"规则全绿"，实际一条都没验过判别力。教训已经写在 max_delay 那条上。
+    os.path.join("lib", "status.py"),
+    os.path.join("lib", "provenance.py"),
+    os.path.join("lib", "confound.py"),
+    os.path.join("lib", "doe.py"),
     os.path.join("knowledge", "process_specs.json"),
 ]
 
@@ -1006,6 +1019,11 @@ def rule_defect_refs_not_dangling():
 ROOTCAUSE_FILE = os.path.join("lib", "rootcause.py")
 CORRELATION_FILE = os.path.join("lib", "correlation.py")
 DIRECTION_FILE = os.path.join("lib", "direction.py")
+STATUS_FILE = os.path.join("lib", "status.py")
+PROVENANCE_FILE = os.path.join("lib", "provenance.py")
+CONFOUND_FILE = os.path.join("lib", "confound.py")
+DOE_FILE = os.path.join("lib", "doe.py")
+TENANCY_FILE = os.path.join("lib", "tenancy.py")
 EIGHTD_FILE = os.path.join("lib", "eightd.py")
 PIPELINE_FILE = os.path.join("lib", "pipeline.py")
 VIEWS_FILE = os.path.join("lib", "views.py")
@@ -1349,6 +1367,115 @@ def rule_direction_symmetric():
         return _r(False, "target_is_best 未按与目标值的偏差判定")
     if not re.search(r"abs\(m - center\)", t, re.M):
         return _r(False, "two_sided_spec 未按与规格中心的偏差判定")
+    return _r(True, "", {"ok": True})
+
+
+# -------------------------------------------- v2.6 外部审计报告改进行 / 规则
+
+def rule_status_no_fake_clean():
+    """P0-3：失败不得被读成没问题。
+
+    判据落在 may_claim_no_finding 的逐个取否，而不是"有没有 status.py"。
+    逐条验是为了让任何一个状态被悄悄放宽时都能被点名。
+    """
+    t = _read(STATUS_FILE) or ""
+    if not t:
+        return _r(False, "读不到 " + STATUS_FILE)
+    for st in ("SUCCESS", "NO_FINDING", "PARTIAL_SUCCESS", "INSUFFICIENT_DATA",
+               "NOT_APPLICABLE", "SKIPPED", "FAILED"):
+        if not re.search(r"^%s = \"" % st, t, re.M):
+            return _r(False, "统一状态缺少常量 %s" % st)
+    m = re.search(r"_NO_FINDING_CLAIMABLE = frozenset\(\[([^\]]*)\]\)", t)
+    if not m:
+        return _r(False, "找不到唯一允许宣称『无异常』的集合定义")
+    allowed = [x.strip() for x in m.group(1).split(",") if x.strip()]
+    if allowed != ["NO_FINDING"]:
+        return _r(False, "允许宣称无异常的状态被放宽为 %s，"
+                        "失败/跳过也会被读成没问题" % allowed)
+    if "def normalize(raw, default=FAILED)" not in t:
+        return _r(False, "认不出来的状态必须保守处理成 FAILED，"
+                        "改成 SUCCESS 会让不明状态的模块蒙混过关")
+    return _r(True, "", {"ok": True})
+
+
+def rule_lineage_replayable():
+    """P1-10：run_id 可复盘 + 指纹可重现 + 哈希能抓等长篡改。"""
+    t = _read(PROVENANCE_FILE) or ""
+    if not t:
+        return _r(False, "读不到 " + PROVENANCE_FILE)
+    if not re.search(r'"sha256":\s*sha256_file\(p\)', t):
+        return _r(False, "输入摘要不再记录 sha256，等长篡改将无从发现")
+    if "time.time_ns()" not in t:
+        return _r(False, "run_id 未带纳秒段，同一秒内的两轮会互盖证据")
+    if not re.search(r'"fingerprint":\s*fp', t):
+        return _r(False, "血缘记录未带内容寻址指纹，答不出『两次是否同一份数据』")
+    if 'if sha256_file(path) != it.get("sha256")' not in t:
+        return _r(False, "复现自检只比字节数不比哈希：等长改内容会被判为没变")
+    if 'base = str(rec["run_id"]).split("-")[0]' not in t:
+        return _r(False, "run_id 分段解析必须用 split 取首段；写成 rsplit "
+                        "会把时间戳留进去，导致每条记录都被误判为被篡改")
+    return _r(True, "", {"ok": True})
+
+
+def rule_confound_not_causal():
+    """P1-6：混杂要判出来，假设不能混进结论。"""
+    tc = _read(CONFOUND_FILE) or ""
+    tr = _read(ROOTCAUSE_FILE) or ""
+    if not tc:
+        return _r(False, "读不到 " + CONFOUND_FILE)
+    if not re.search(r'item\["vanishes_within_layers"\] = \(', tc):
+        return _r(False, "缺少层内关系消失的判定：整体强相关由分组造成时判不出来")
+    # 判据必须精确到"赋值后面紧跟阈值表达式"这一**调用形态**。
+    # 只验两处字样是否分别存在是不够的：注入 `(False and ...)` 的短路写法后
+    # 两个字样都还在，规则却照样判过 —— 这正是"判据停在字样层"的典型症状。
+    if not re.search(r'item\["vanishes_within_layers"\] = \(\s*'
+                     r'max\(abs\(r\) for r in rs\) < 0\.20\)', tc):
+        return _r(False, "『层内关系消失』的判定被改写或加了短路，"
+                        "实际不再生效（字样还在但结论恒假）")
+    if not tc.count("高度怀疑混杂") >= 1:
+        return _r(False, "verdict 必须显式判为『高度怀疑混杂』")
+    m = re.search(r'if strong:\n(?:.+\n){0,4}?\s*c\["conclusion_status"\] = ', tr)
+    if not m:
+        return _r(False, "检出强混杂后未把候选结论降级为『混杂未排除』")
+    if 'c["is_hypothesis"] = (not data_backed)' not in tr:
+        return _r(False, "候选缺少假设标记：无数据支撑的条目会与有数据的长得一样")
+    return _r(True, "", {"ok": True})
+
+
+def rule_doe_boundary_gate():
+    """P1-8：来源不足不能算受控；单位跨量纲必须拒；异常情形必须阻断。"""
+    t = _read(DOE_FILE) or ""
+    if not t:
+        return _r(False, "读不到 " + DOE_FILE)
+    if '"受控" if not missing else "推断"' not in t:
+        return _r(False, "缺少出处三要素（file/version/approval）的核验，"
+                        "任何数值都会被当成受控边界")
+    if 'return None, ("%s 与 %s 之间存在温度换算' not in t:
+        return _r(False, "仿射单位（温度）未被拒绝换算：套做比例因子必错")
+    if "不属于同一量纲（或不在通用换算表内），不能混用" not in t:
+        return _r(False, "跨量纲单位必须被拒绝，而不是按 1.0 放行")
+    if 'return {"ok": not blockers,' not in t:
+        return _r(False, "boundary_gate 必须按有无 blocker 决定 ok；"
+                        "写成恒 True 就等于没有门禁")
+    return _r(True, "", {"ok": True})
+
+
+def rule_tenant_write_guard():
+    """P2-1：路径不得逃逸，写入必须过闸门，清空前必须复核。"""
+    t = _read(TENANCY_FILE) or ""
+    if not t:
+        return _r(False, "读不到 " + TENANCY_FILE)
+    if "cand = os.path.abspath(os.path.join(base, _safe_id(tid)))" not in t:
+        return _r(False, "tenant_root 未按 _safe_id 归一后再拼路径")
+    if "if not is_inside(cand, base):" not in t:
+        return _r(False, "归一后的路径必须再用 is_inside 复核一次；"
+                        "只靠 _safe_id 一层，将来被改宽就会直接逃出 tenants/")
+    if "if root and not is_inside(p, root):" not in t:
+        return _r(False, "guard_write_path 缺少越界拒绝：租户身份下可写到库外")
+    if "if not is_inside(r, base):" not in t:
+        return _r(False, "reset_tenant 在 rmtree 前未复核路径（不可逆操作无保护）")
+    if "os.path.realpath" not in t:
+        return _r(False, "必须用 realpath 比对，符号链接指向库外的情况抓不到")
     return _r(True, "", {"ok": True})
 
 
@@ -1822,6 +1949,113 @@ AUDIT_RULES = [
                   _re_sub(r"^[ \t]+return abs\(m - float\(target\)\)",
                           "        return m",
                           flags=re.M), DIRECTION_FILE)]),
+
+    # ---- v2.6：外部深度审计报告剩余项（status/血缘/混杂/DOE边界/租户隔离）----
+
+    Rule("分析状态必须走统一枚举，失败不得被读成没问题", rule_status_no_fake_clean,
+         "P0-3。lib/status.py 必须定义七态枚举，且唯一允许宣称『未发现异常』的"
+         "只有 NO_FINDING；其余六态在 may_claim_no_finding 上一律返回 False。"
+         "为什么必须这样：此前各模块自己写状态字符串，"
+         "spc/doe/views/quality_guard 干脆不返回状态，于是『执行失败』和"
+         "『检查过、没有问题』在汇总层长得一模一样 —— 这是报告点名的"
+         "『危险的假阴性』。另外 normalize 认不出来的状态必须保守判 FAILED："
+         "判成 SUCCESS 等于给不明状态的模块发放行条。",
+         STATUS_FILE,
+         [_mutant("允许 FAILED 也宣称无异常",
+                  _re_sub(r"^_NO_FINDING_CLAIMABLE = frozenset\(\[NO_FINDING\]\)",
+                          "_NO_FINDING_CLAIMABLE = frozenset([NO_FINDING, FAILED])",
+                          flags=re.M), STATUS_FILE),
+          _mutant("认不出来的状态按成功处理（最危险的放宽）",
+                  _re_sub(r"^def normalize\(raw, default=FAILED\):",
+                          "def normalize(raw, default=SUCCESS):",
+                          flags=re.M), STATUS_FILE)]),
+
+    Rule("每轮分析必须留下可按 run_id 复盘的血缘记录", rule_lineage_replayable,
+         "P1-10。lib/provenance.py 必须同时产出 run_id（每次唯一，带纳秒段）"
+         "与 fingerprint（输入哈希+配置+版本的内容寻址指纹）；"
+         "replay_check 必须比 sha256 而不只是比字节数。"
+         "为什么必须这样：只有 run_id 没有指纹，答不出『这次和上次是不是同一份数据』；"
+         "只比字节数，等长篡改过的输入会被判成没变过 —— "
+         "而改一个数字恰好不改长度，正是最容易发生的那种手滑。",
+         PROVENANCE_FILE,
+         [_mutant("run_id 去掉纳秒段（同秒两次运行互盖证据）",
+                  _re_sub(r'    run_id = "%s-%s-%s" % \(fp\[:12\], '
+                          r'time\.strftime\("%Y%m%d%H%M%S"\),\n'
+                          r"                           str\(time\.time_ns\(\)\)\[-6:\]\)",
+                          '    run_id = "%s-%s" % (fp[:12], '
+                          'time.strftime("%Y%m%d%H%M%S"))',
+                          flags=re.M), PROVENANCE_FILE),
+          _mutant("不再算输入哈希（等长篡改查不出来）",
+                  _re_sub(r"^[ \t]+\"sha256\": sha256_file\(p\),",
+                          '        "sha256": None,',
+                          flags=re.M), PROVENANCE_FILE)]),
+
+    Rule("根因候选必须做混杂检查并区分假设与结论", rule_confound_not_causal,
+         "P1-6。lib/confound.py 必须在『目标于分组列上显著相关、"
+         "而层内 X→Y 关系均不明显』时把 verdict 判为以『高度怀疑混杂』开头；"
+         "lib/rootcause.py 的候选必须带 is_hypothesis，"
+         "且检出强混杂后必须把结论状态降级为『混杂未排除』。"
+         "为什么必须这样：实测构造的纯混杂样本里整体相关高达 0.997，"
+         "层内却只有 0.124 —— 照这个相关去调机，产线纹丝不动。"
+         "没有数据支撑的知识库条目只能标『机理支持/现场待确认』，"
+         "不能与数据支撑的结论并排出现却不作区分。",
+         CONFOUND_FILE,
+         [_mutant("层内关系消失也不再判为混杂",
+                  _re_sub(r"^[ \t]+item\[\"vanishes_within_layers\"\] = \(\n"
+                          r"[ \t]+max\(abs\(r\) for r in rs\) < 0\.20\)",
+                          '        item["vanishes_within_layers"] = (False and\n'
+                          '            max(abs(r) for r in rs) < 0.20)',
+                          flags=re.M), CONFOUND_FILE),
+          _mutant("所有候选一律按有数据支撑处理",
+                  _re_sub(r"^[ \t]+c\[\"is_hypothesis\"\] = \(not data_backed\)",
+                          '        c["is_hypothesis"] = False',
+                          flags=re.M), ROOTCAUSE_FILE)]),
+
+    Rule("DOE 边界必须有受控出处，异常情形必须阻断而非放行", rule_doe_boundary_gate,
+         "P1-8。controlled_boundaries 必须在出处缺 file/version/approval 任一要素时"
+         "判为『推断』（controlled=False）；unit_factor 对跨量纲与仿射单位"
+         "（温度）必须返回 None；boundary_gate 的 ok 必须随 blocker 变化。"
+         "为什么必须这样：报告明确指出『依赖参数名匹配的通用安全边界不足以保证安全，"
+         "参数名相同不代表物理意义、单位或设备限制相同』。"
+         "把单位冲突降级成警告等于没设门禁 —— 警告会被顺手关掉，"
+         "而 kWh/tiers 的那种量纲错位，放过去就是设备层面的事故。",
+         DOE_FILE,
+         [_mutant("没有出处的边界也算受控",
+                  _re_sub(r"^[ \t]+return _src_record\(\n"
+                          r"[ \t]+kind, \"受控\" if not missing else \"推断\",",
+                          '        return _src_record(\n            kind, "受控",',
+                          flags=re.M), DOE_FILE),
+          _mutant("跨量纲单位放行（不再阻断）",
+                  _re_sub(r"^    return None, \"「%s」与「%s」不属于同一量纲"
+                          r"（或不在通用换算表内），不能混用\" % \(src, dst\)",
+                          "    return 1.0, \"同量纲换算\"",
+                          flags=re.M), DOE_FILE),
+          _mutant("门禁失灵：任何情况都放行",
+                  _re_sub(r"^    return \{\"ok\": not blockers, \"blockers\": blockers,",
+                          "    return {\"ok\": True, \"blockers\": [],",
+                          flags=re.M), DOE_FILE)]),
+
+    Rule("租户写入必须过路径闸门，路径不得逃出 tenants/", rule_tenant_write_guard,
+         "P2-1。tenant_root 必须先按 _safe_id 归一、再用 is_inside 复核；"
+         "guard_write_path 在租户启用时必须拒绝落点在租户目录外的写入；"
+         "reset_tenant 必须在 rmtree 前复核路径；比对一律走 realpath。"
+         "为什么必须这样：实测 tenant_root('C:/Windows/System32') 曾原样返回系统目录，"
+         "而 reset_tenant 会照着这个值执行 rmtree —— "
+         "一列 payload 足以把『清空某个租户』变成『清空某个别的目录』。"
+         "两层防护缺一不可：单靠 _safe_id，将来有人放宽它就全线失守。",
+         TENANCY_FILE,
+         [_mutant("不再复核归一后的路径是否还在 tenants 内",
+                  _re_sub(r"^[ \t]+if not is_inside\(cand, base\):",
+                          "    if False:",
+                          flags=re.M), TENANCY_FILE),
+          _mutant("写入闸门一律放行",
+                  _re_sub(r"^[ \t]+if root and not is_inside\(p, root\):",
+                          "    if False and root:",
+                          flags=re.M), TENANCY_FILE),
+          _mutant("清空前不再校验路径（不可逆操作失去保护）",
+                  _re_sub(r"^[ \t]+if not is_inside\(r, base\):",
+                          "    if False:",
+                          flags=re.M), TENANCY_FILE)]),
 ]
 
 
@@ -2502,8 +2736,12 @@ def main(argv=None):
                     help="audit：反向验证，把每条规则人为破坏一遍看它是否报警")
     ap.add_argument("--show-criteria", action="store_true",
                     help="audit：打印每条规则的判据与变异清单")
-    ap.add_argument("--report", default=os.path.join("output", "_fde_run_report.json"),
-                    help="证据报告落盘路径")
+    # 默认落盘路径按 flow 分开。原先五个流程共用 _fde_run_report.json，
+    # 后跑的会把先跑的证据整份覆盖掉——实测追一次 verify 失败时，
+    # 打开报告看到的是上一次 analyze 的步骤，失败原因无从查起。
+    # 证据文件的默认名必须能回答"这是哪一轮"，显式 --report 仍以使用者为准。
+    ap.add_argument("--report", default=None,
+                    help="证据报告落盘路径（默认 output/_fde_run_<流程>_report.json）")
     ap.add_argument("--verbose", action="store_true",
                     help="逐阶段打印「这份数据被理解成了什么」（失败时先看这个）")
     ap.add_argument("--timeout", type=int, default=900, help="单步超时（秒）")
@@ -2529,6 +2767,9 @@ def main(argv=None):
         else:
             ap.add_argument(_name, help="analyze：透传给 lib/pipeline.py")
     args = ap.parse_args(argv)
+    if not args.report:
+        args.report = os.path.join("output",
+                                   "_fde_run_%s_report.json" % (args.flow or "run"))
 
     if args.flow == "analyze" and not args.input:
         ap.error("analyze 必须给 --input")

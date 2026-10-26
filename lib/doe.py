@@ -579,3 +579,204 @@ def optimize_rsm(model, goal="maximize", target=None, grid=21, bounds=(-1, 1)):
             best_x, best_y = list(x), yv
     return {"coded_optimum": best_x, "predicted_response": best_y,
             "goal": goal, "target": target}
+
+
+# ------------------------------------------------------------------ P1-8 受控边界
+
+# 通用量纲换算表。只收物理量纲的量纲级关系，**不含任何产品的经验阈值**——
+# 产品的具体上下限属于企业受控数据，由调用方经 --spec 传入，本模块不替它编。
+#
+# 温度刻意不给换算：℃↔℉ 是仿射变换（带 32/1.8 偏移），套比例因子必错。
+# 与其算错一个 mils 不如明说"请统一写法"——拦下来的代价远小于放过去的代价。
+_LINEAR_SCALES = [
+    ("长度", {"mm": 1.0, "um": 1e-3, "μm": 1e-3, "nm": 1e-6, "cm": 10.0,
+             "m": 1000.0, "mil": 0.0254, "inch": 25.4}),
+    ("时间", {"s": 1.0, "min": 60.0, "h": 3600.0, "ms": 1e-3, "minute": 60.0,
+             "sec": 1.0, "second": 1.0}),
+    ("电压", {"v": 1.0, "mv": 1e-3, "kv": 1e3}),
+    ("电流", {"a": 1.0, "ma": 1e-3, "ua": 1e-6}),
+    ("质量", {"g": 1.0, "mg": 1e-3, "kg": 1000.0, "ug": 1e-6}),
+    ("功率", {"w": 1.0, "mw": 1e-3, "kw": 1e3}),
+    ("压力", {"pa": 1.0, "kpa": 1e3, "mpa": 1e6, "bar": 1e5, "mpa·s": None}),
+]
+_TEMP_UNITS = {"℃", "°c", "c", "摄氏", "℉", "°f", "f", "华氏", "k", "开尔文"}
+
+
+def unit_factor(src, dst):
+    """单位一致性换算。返回 (factor, note)。
+
+    factor 说明如何把"以 src 为单位的值"转成 dst；换算不通返回 (None, 原因)。
+    DOE 边界做**单位不明就阻断**的依据就在这里：
+    企业给的 [-40, 150] 到底是 ℃ 还是 ℉，决定了 150 是烘烤温度还是安全事故。
+    """
+    if not src or not dst:
+        return None, "单位缺失，无法确认量纲是否一致"
+    su, du = str(src).strip().lower(), str(dst).strip().lower()
+    if su == du:
+        return 1.0, "单位一致"
+    if su in _TEMP_UNITS or du in _TEMP_UNITS:
+        return None, ("%s 与 %s 之间存在温度换算（含零点偏移），"
+                      "DOE 边界换算不处理仿射单位，请统一写法后重来" % (src, dst))
+    for _, tbl in _LINEAR_SCALES:
+        if su in tbl and du in tbl:
+            a, b = tbl[su], tbl[du]
+            if a is None or b is None:
+                return None, "单位 %s/%s 缺换算基准" % (src, dst)
+            return (a / b), "同量纲换算 %s→%s" % (src, dst)
+    return None, "「%s」与「%s」不属于同一量纲（或不在通用换算表内），不能混用" % (src, dst)
+
+
+def _src_record(kind, confidence, file=None, version=None, approval=None,
+                effective=None, scope=None, note=None):
+    """边界来源的一条档案记录。
+
+    报告 P1-8 点名要"记录来源文件、版本、审批状态、生效日期和适用产品/设备"，
+    所以这里五项都是一等字段，不是附注。少哪一项，这一条就只能算"推断"，
+    不能算"受控"——这个区分是整个门禁的意义所在。
+    """
+    return {"kind": kind, "confidence": confidence, "file": file,
+            "version": version, "approval": approval, "effective": effective,
+            "scope": scope, "note": note}
+
+
+def controlled_boundaries(factor_specs, spec_overrides=None, kb_control=None):
+    """把每个因子的上下限收成"带出处的受控边界"。
+
+    与 build_constraints 的分工：
+      build_constraints 负责算出最终 min/max（工程用途）
+      这里负责回答"这对 min/max 凭什么"——少一件证据就不能算受控。
+    返回 {name: {"min","max","forbid","unit","blockers","warnings","sources"}}
+    """
+    out = {}
+    overrides = spec_overrides or {}
+    meta = overrides.get("_meta") if isinstance(overrides, dict) else None
+    if not isinstance(meta, dict):
+        meta = None
+
+    def _meta_src(kind):
+        if not meta:
+            return _src_record(kind, "推断",
+                               note="未提供 --spec 的来源元信息(_meta)，"
+                                    "无法证明该边界来自受控文件")
+        missing = [k for k in ("file", "version", "approval")
+                   if not meta.get(k)]
+        return _src_record(
+            kind, "受控" if not missing else "推断",
+            file=meta.get("file"), version=meta.get("version"),
+            approval=meta.get("approval"), effective=meta.get("effective"),
+            scope=meta.get("scope"),
+            note=("缺非空检查项：%s" % "、".join(missing)) if missing else None)
+
+    for spec in factor_specs or []:
+        name = spec.get("name")
+        if not name:
+            continue
+        rec = {"min": None, "max": None, "forbid": [], "unit": spec.get("unit"),
+               "blockers": [], "warnings": [], "sources": [], "unit_conflicts": []}
+
+        low, high = spec.get("low"), spec.get("high")
+        if low is not None and high is not None:
+            try:
+                rec["min"], rec["max"] = float(low), float(high)
+                rec["sources"].append(_src_record(
+                    "试验水平区间", "推断",
+                    note="取自本轮数据的分布/设备归档区间，属试验范围不是量产规格"))
+            except (TypeError, ValueError):
+                rec["blockers"].append("试验水平区间不是数值（low=%r high=%r）" % (low, high))
+
+        # 企业受控规格
+        ov = overrides.get(name)
+        if isinstance(ov, dict):
+            for key, side in (("lsl", "min"), ("min", "min"),
+                              ("usl", "max"), ("max", "max")):
+                v = ov.get(key)
+                if v is None:
+                    continue
+                try:
+                    v = float(v)
+                except (TypeError, ValueError):
+                    rec["blockers"].append("企业规格 %s=%r 不是数值" % (key, v))
+                    continue
+                if ov.get("unit") and rec["unit"] and ov.get("unit") != rec["unit"]:
+                    f, note = unit_factor(ov.get("unit"), rec["unit"])
+                    if f is None:
+                        rec["unit_conflicts"].append(note)
+                        continue
+                    v = v * f
+                if side == "min":
+                    rec["min"] = v if rec["min"] is None else max(rec["min"], v)
+                else:
+                    rec["max"] = v if rec["max"] is None else min(rec["max"], v)
+            if any(ov.get(k) is not None for k in ("lsl", "usl", "min", "max")):
+                rec["sources"].append(_meta_src("企业受控规格"))
+            for fb in (ov.get("forbid") or []):
+                if isinstance(fb, (list, tuple)) and len(fb) == 2:
+                    rec["forbid"].append([float(fb[0]), float(fb[1])])
+
+        # 设备/知识库控制限
+        ctl = (kb_control or {}).get(name)
+        if isinstance(ctl, dict):
+            for key, side in (("lsl", "min"), ("min", "min"),
+                              ("usl", "max"), ("max", "max")):
+                v = ctl.get(key)
+                if v is None:
+                    continue
+                try:
+                    v = float(v)
+                except (TypeError, ValueError):
+                    continue
+                if side == "min":
+                    rec["min"] = v if rec["min"] is None else max(rec["min"], v)
+                else:
+                    rec["max"] = v if rec["max"] is None else min(rec["max"], v)
+            if any(ctl.get(k) is not None for k in ("lsl", "usl", "min", "max")):
+                rec["sources"].append(_src_record("知识库控制限", "推断",
+                                                  note="知识库条目当前没有登记出处与审批信息"))
+
+        # 内置安全包络：靠参数名匹配，天然只是兜底，必须标"推断"
+        sf = safety_envelope(name)
+        if sf:
+            rec["sources"].append(_src_record(
+                "内置安全包络", "推断", note=sf.get("note"),
+                file="lib/doe.py::_SAFETY_RULES"))
+            if sf["limit"] == "max":
+                rec["max"] = sf["value"] if rec["max"] is None else min(rec["max"], sf["value"])
+            else:
+                rec["min"] = sf["value"] if rec["min"] is None else max(rec["min"], sf["value"])
+
+        for c in rec["unit_conflicts"]:
+            rec["blockers"].append("单位冲突：%s" % c)
+        if rec["min"] is not None and rec["max"] is not None and rec["min"] > rec["max"]:
+            rec["blockers"].append("边界冲突：下限 %.6g 大于上限 %.6g" % (rec["min"], rec["max"]))
+        conf = [s["confidence"] for s in rec["sources"]]
+        rec["controlled"] = "受控" in conf
+        rec["confidence"] = "受控" if rec["controlled"] else ("推断" if conf else "无来源")
+        if not conf:
+            rec["blockers"].append("该因子没有任何边界来源（企业规格/设备限制/安全包络均无），"
+                                   "不能凭 guess 生成试验水平")
+        out[name] = rec
+    return out
+
+
+def boundary_gate(bounds, plan_name="DOE 方案"):
+    """P1-8 门禁：缺少有效边界、边界冲突、单位不明，一律阻断方案生成。
+
+    报告原话：「缺少有效边界、边界冲突或单位不明时应阻断方案生成，不能默认放行。」
+    所以这里必须是 blocker 而不是 warning——warning 会被人顺手关掉，
+    blocker 才会逼出那份受控规格文件。
+    """
+    blockers, warns = [], []
+    for name, rec in (bounds or {}).items():
+        for b in rec.get("blockers", []):
+            blockers.append("因子「%s」：%s" % (name, b))
+        if rec["min"] is None or rec["max"] is None:
+            side = "下限" if rec["min"] is None else "上限"
+            blockers.append("因子「%s」缺%s，无法确证试验水平落在受控窗口内"
+                            % (name, side))
+        if not rec.get("controlled"):
+            warns.append("因子「%s」的边界没有受控来源（现为「%s」），"
+                         "仅按 %s 推断，须由工艺工程师书面确认后方可试跑"
+                         % (name, rec.get("confidence"),
+                            "、".join(s["kind"] for s in rec.get("sources", [])) or "无来源"))
+    return {"ok": not blockers, "blockers": blockers, "warnings": warns,
+            "n_factors": len(bounds or {})}

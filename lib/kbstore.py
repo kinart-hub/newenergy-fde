@@ -154,6 +154,17 @@ def _read_json(path, default):
 def _write_json(path, data):
     # 租户模式下写入一律重定向到租户层；基线保持只读
     target = TN.map_to_tenant(path) if TN.enabled() else path
+    # 重定向之后必须再核一次落点。重定向是"想去租户层"，
+    # 这道检查是"真的到了租户层"——万一租户目录里有人放了指向库外的
+    # 符号链接，重定向的结果仍然会写到外面去。两件事不能互相替代。
+    ok, why, real = TN.guard_write_path(target)
+    if not ok:
+        try:
+            from . import degrade as DG
+            DG.note("kbstore._write_json", why)
+        except Exception:
+            pass                      # scan:keep 台账不可用时不得反向阻断写入 path
+        raise IOError(why)
     try:
         from . import hotswap as HS
     except Exception:

@@ -62,7 +62,58 @@ def enabled():
 
 def tenant_root(tid=None):
     tid = tid or _TENANT
-    return os.path.join(SKILL_ROOT, "tenants", tid) if tid else None
+    if not tid:
+        return None
+    base = os.path.join(SKILL_ROOT, "tenants")
+    # 两层防护都必要，不能只留一层：
+    #   _safe_id 把分隔符换成下划线，是第一层；
+    #   这里再核一次归一化的绝对路径是否仍在 tenants/ 内，是第二层。
+    # 只靠第一层时实测过：tenant_root('C:/Windows/System32') 会原样返回系统目录，
+    # 而 reset_tenant 会照着这个返回值 rmtree —— 一层失守就是删库级别的后果。
+    cand = os.path.abspath(os.path.join(base, _safe_id(tid)))
+    if not is_inside(cand, base):
+        try:
+            from . import degrade as DG
+            DG.note("tenancy.tenant_root",
+                    "租户 id %r 解析后越出 tenants/，已回落到 default" % tid)
+        except Exception:
+            pass                      # scan:keep 台账不可用时不能反向挡住安全回落
+        cand = os.path.abspath(os.path.join(base, "default"))
+    return cand
+
+
+def is_inside(path, root):
+    """path 是否确实位于 root 之内（按 realpath 比，符号链接也算越界）。
+
+    先看 realpath 再看包含关系，是为了让"租户层里某个目录被换成指向库外的
+    符号链接"这件事在这里被拦住——按字符串比前缀是抓不到符号链接的。
+    """
+    if not path or not root:
+        return False
+    try:
+        rp = os.path.realpath(os.path.abspath(path))
+        rr = os.path.realpath(os.path.abspath(root))
+        return os.path.commonpath([rp, rr]) == rr
+    except ValueError:
+        # Windows 跨盘符时 commonpath 会抛 ValueError，那种情况必然是越界
+        return False
+
+
+def guard_write_path(path):
+    """开启租户隔离时，写路径必须落在本租户目录内，否则拒绝。
+
+    这是统一的写入闸门：kbstore / hotswap 各自的写之前都过这里。
+    放在各自模块里各写一遍，迟早有一处忘——集中在一处才能被静态检查证明"全覆盖"不了。
+    返回 (ok, reason, realpath)。
+    """
+    p = os.path.abspath(str(path or ""))
+    if not enabled():
+        return True, "", os.path.realpath(p)
+    root = tenant_root()
+    if root and not is_inside(p, root):
+        return False, ("拒绝写入：目标 %s 不在本租户目录 %s 内"
+                       % (p, root)), None
+    return True, "", os.path.realpath(p)
 
 
 def tenant_kb(tid=None):
@@ -470,6 +521,18 @@ def reset_tenant(tid=None):
     import shutil
     r = tenant_root(tid)
     if not r or not os.path.isdir(r):
+        return False
+    # rmtree 之前必须确认目标确实落在 tenants/ 内：
+    # 这个函数是"一键清空"，走错目录没有第二次机会。
+    # 租户根的归一已经挡过一轮，这里再核一次是因为此处的后果不可逆——
+    # 不可逆操作值得多一道校验。
+    base = os.path.join(SKILL_ROOT, "tenants")
+    if not is_inside(r, base):
+        try:
+            from . import degrade as DG
+            DG.note("tenancy.reset_tenant", "拒绝清空越界路径：%s" % r)
+        except Exception:
+            pass                      # scan:keep 同上，台账故障不得让安全检查失效
         return False
     shutil.rmtree(r, ignore_errors=True)
     return not os.path.exists(r)

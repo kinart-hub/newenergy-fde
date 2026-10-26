@@ -45,7 +45,7 @@ if __package__ in (None, ""):
     from lib import table as T, stats as S, preprocess as PP, spc as SPC, \
         correlation as CORR, doe as DOE, rootcause as RC, charts as CH, report as RPT, \
         kbstore as KBS, devices as DEV, crossprocess as XP, actions as AC, \
-        adapt as AD, quality_guard as QG
+        adapt as AD, quality_guard as QG, status as ST, provenance as PROV
     try:                    # v1.11 新增模块，导入失败不能拖垮整条流水线
         from lib import events as EV
         _HAS_EVENTS = True
@@ -62,7 +62,7 @@ else:
     from . import table as T, stats as S, preprocess as PP, spc as SPC, \
         correlation as CORR, doe as DOE, rootcause as RC, charts as CH, report as RPT, \
         kbstore as KBS, devices as DEV, crossprocess as XP, actions as AC, \
-        adapt as AD, quality_guard as QG
+        adapt as AD, quality_guard as QG, status as ST, provenance as PROV
     try:
         from . import events as EV
         _HAS_EVENTS = True
@@ -89,7 +89,7 @@ if EV is not None and EV.__name__ != "lib.events":
 KB = PP.load_knowledge()
 _fmt = RPT._fmt
 
-ANALYZER_VERSION = "2.5.0"
+ANALYZER_VERSION = "2.6.0"
 
 
 # 空数据排查清单。
@@ -399,21 +399,36 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
               # 所以挂在 result 上传过去（改签名会牵动所有调用点，不值）
               "outdir": outdir, "d2_card_path": d2_card, "emit_d2_card": emit_d2_card}
 
-    # v1.11：运行清单。版本号只说明"用的哪份代码"，审计还要知道"读的哪份文件"、
-    # "自动替工程师做了哪些决定"——没有这两项，结论无法被第三方复现。
+    # 数据血缘（P1-10）。此前这里只有 inputs+decisions 两样，
+    # 够回答"读了哪个文件"，回答不了"喂的是什么内容、当时用的哪套规则"。
+    # 现在把同一份 decisions 直接挂进血缘记录（同一个 list 对象，不是拷贝），
+    # 保证"做了哪些自动决定"在报告和血缘里是同一个事实源——两边各记一份，
+    # 迟早会出现报告写了、血缘没写的分裂。
     result["decisions"] = []
+    _plist = paths if isinstance(paths, (list, tuple)) else [paths]
     try:
-        import hashlib as _hl
+        _inputs = PROV.input_fingerprints(_plist)
+    except Exception as _pv_e:
+        degrade.note("pipeline.analyze@provenance_inputs", _pv_e)
         _inputs = []
-        for _p in (paths if isinstance(paths, (list, tuple)) else [paths]):
-            if not _p or not os.path.exists(_p):
-                continue
-            _b = open(_p, "rb").read()
-            _inputs.append({"file": os.path.basename(_p), "size": len(_b),
-                            "sha256": _hl.sha256(_b).hexdigest()})
-        result["run_manifest"] = {"inputs": _inputs, "decisions": result["decisions"]}
-    except Exception:
-        result["run_manifest"] = {"inputs": [], "decisions": result["decisions"]}
+    _spec_src = None
+    if isinstance(spec_overrides, dict):
+        _spec_src = {"keys": sorted(spec_overrides.keys())[:40],
+                     "n_keys": len(spec_overrides)}
+    elif spec_overrides:
+        _spec_src = {"path": str(spec_overrides)}
+    _prov = PROV.new_run(
+        inputs=_inputs,
+        config={"target": target, "process": process, "defect": defect,
+                "sheet": sheet, "do_doe": do_doe, "rules": rules or None,
+                "auto_adapt": auto_adapt, "views": list(views or []),
+                "industry": industry, "spec": _spec_src},
+        versions={"analyzer": ANALYZER_VERSION, "knowledge": _kb_stamp(),
+                  "python": sys.version.split()[0], "platform": sys.platform},
+        tenant=tenant, process=process, target=target)
+    _prov["decisions"] = result["decisions"]
+    result["provenance"] = _prov
+    result["run_manifest"] = {"inputs": _inputs, "decisions": result["decisions"]}
     try:
         from . import tenancy as _TN
     except Exception:
@@ -936,7 +951,7 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
         # 把真正的原因盖掉 —— 与 'gaps' 那个 UnboundLocalError 是同一类问题。
         if corr is None:
             result.setdefault("degraded_sections", []).append(
-                {"section": "相关性", "status": "FAILED",
+                {"section": "相关性", "status": ST.FAILED,
                  "error": "corr_matrix 未产出相关矩阵",
                  "impact": "本节结论缺失，不代表『没有问题』"})
         else:
@@ -951,8 +966,8 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
             a = CORR.association_with_target(work, y_col)
             if isinstance(a, list):
                 assoc = a
-            elif isinstance(a, dict) and a.get("status") in ("FAILED",
-                                                             "INSUFFICIENT_DATA"):
+            elif isinstance(a, dict) and a.get("status") in (ST.FAILED,
+                                                             ST.INSUFFICIENT_DATA):
                 # 目标列不可用时必须把它带的状态一起留下来，
                 # `isinstance(a, list)` 会把带状态的 dict 静默丢成空列表，
                 # 报告上就写成"未发现相关因素"了。
@@ -1070,8 +1085,8 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
                         "score": round(min(1.0, w["effect"] / 2.0), 4),
                         "evidence_score": round(w["effect"], 3),
                         "prior_score": 0.0, "temporal_score": 0.0,
-                        "data_status": "已测",
-                        "detail": {"status": "已测", "column": hs["dim"],
+                        "data_status": ST.SUCCESS,
+                        "detail": {"status": ST.SUCCESS, "column": hs["dim"],
                                    "level": w["level"], "n": w["n"],
                                    "mean": w["mean"], "others_mean": w["others_mean"],
                                    "p_raw": w["p_raw"], "p_adj": w["p_adj"],
@@ -1109,8 +1124,8 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
                     "unit": "", "role": "position", "source": "位置聚集检验",
                     "score": _ev_score, "evidence_score": _ev_score,
                     "prior_score": 0.0, "temporal_score": 0.0,
-                    "data_status": "已测",
-                    "detail": {"status": "已测", "column": _cl["factor"],
+                    "data_status": ST.SUCCESS,
+                    "detail": {"status": ST.SUCCESS, "column": _cl["factor"],
                                "level": _cl["hot_level"],
                                "note": "%s；%d 个水平同时检验，p 值已做 BH 校正"
                                        % (_cl.get("test") or "", _cl.get("n_levels") or 0)},
@@ -1158,7 +1173,7 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
         conf = None
         result.setdefault("degraded_sections", []).append(
             {"section": "根因", "error": str(_guard_e),
-             "status": "FAILED",
+             "status": ST.FAILED,
              "impact": "本节结论缺失：根因候选、证据缺口与置信等级均未产出，"
                        "不代表『没有问题』"})
     try:  # 护栏：Pareto 环节失败只降级本节，不中断整轮
@@ -1246,7 +1261,7 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
                     excluded.append((nm, "是本次分析的响应变量（Y）"))
                     continue
                 # 当前数据里没有的参数不能定水平（只能退回知识库典型量程，易超出该厂安全窗口）
-                if d.get("data_status") != "已测":
+                if d.get("data_status") != ST.SUCCESS:
                     excluded.append((nm, "数据中无实测值，无法定水平"))
                     continue
                 # 结果指标（测量值）不能当 DOE 因子：它不可独立设定，是其它因子的函数。
@@ -1334,7 +1349,32 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
             factors = [f for f in factors if not f.get("blocked")]
             result["doe_constraints"] = _cons
             result["doe_clamped"] = _clamped
-            if len(factors) >= 2:
+
+            # P1-8 受控边界门禁：报告的验收第 7 项要求
+            # 「缺少有效边界、边界冲突或单位不明时应阻断方案生成，不能默认放行」。
+            # 出证据样例：只是一对 min/max 不够，还要回答它凭什么。
+            try:
+                _bounds = DOE.controlled_boundaries(
+                    factors, spec_overrides=spec_overrides, kb_control=_kb_ctl)
+                _gate = DOE.boundary_gate(_bounds)
+            except Exception as _bg_e:
+                degrade.note("pipeline.analyze@boundary_gate", _bg_e)
+                _bounds, _gate = {}, {"ok": False,
+                                      "blockers": ["边界门禁自身未跑成（%s），按阻断处理" % _bg_e],
+                                      "warnings": [], "n_factors": len(factors)}
+            result["doe_boundaries"] = _bounds
+            result["doe_boundary_gate"] = _gate
+
+            if not _gate.get("ok"):
+                doe_plan = {"factors": [], "blocked": True,
+                            "blockers": _gate.get("blockers") or [],
+                            "boundaries": _bounds,
+                            "skipped_reason": "边界门禁阻断：%s"
+                            % "；".join((_gate.get("blockers") or [])[:3])}
+                result.setdefault("warnings", []).append(
+                    "DOE 方案已阻止生成（受控边界不满足）：%s"
+                    % "；".join((_gate.get("blockers") or [])[:2]))
+            elif len(factors) >= 2:
                 opts = DOE.recommend_design(len(factors), levels=2, budget=32)
                 chosen = opts[0]
                 matrix = DOE.build_design(chosen["kind"], len(factors), 2, chosen.get("param"))
@@ -1342,10 +1382,17 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
                 doe_plan = {"factors": factors, "options": opts, "excluded": excluded,
                             "chosen": chosen, "matrix": matrix, "run_plan": plan,
                             "constraints": _cons, "clamped": _clamped}
+                doe_plan["boundaries"] = _bounds
+                doe_plan["boundary_gate"] = _gate
+                _src_note = ""
+                for _w in (_gate.get("warnings") or []):
+                    _src_note += "⚠ %s；" % _w
                 doe_plan["safety_note"] = (
                     "以上水平均已限制在工艺窗口与安全包络内（安全边界只可收紧、不可放宽）。"
+                    + _src_note +
                     "本方案为**待验证实验方案**，不是调机指令：需经工艺工程师确认、"
-                    "小批试跑并复核安全条件后方可执行。")
+                    "小批试跑并复核安全条件后方可执行。设计矩阵的取值未经试验验证，"
+                    "不得据此宣称已得到最优参数。")
             else:
                 # 因子凑不齐时，必须说清为什么没有方案，而不是悄悄不给
                 doe_plan = {"factors": [], "excluded": excluded}
@@ -1397,7 +1444,7 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
     if degraded:
         result["incomplete"] = True
         result["module_summary"] = [
-            {"section": d.get("section"), "status": d.get("status") or "FAILED",
+            {"section": d.get("section"), "status": d.get("status") or ST.FAILED,
              "error": d.get("error")}
             for d in degraded]
         result.setdefault("warnings", []).append(
@@ -1406,7 +1453,7 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
             % (len(degraded), "、".join(str(d.get("section")) for d in degraded)))
         for d in degraded:
             if not d.get("status"):
-                d["status"] = "FAILED"
+                d["status"] = ST.FAILED
                 d.setdefault(
                     "impact", "本节结论缺失，不代表『没有问题』")
 
@@ -1457,6 +1504,33 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
         degrade.note("pipeline.analyze@L1319", _dg_e)
     result["outputs"] = files
     result["summary"] = build_summary(result)
+
+    # 血缘收口：先把状态定下来再落盘。
+    # 有环节没产出结论时记 PARTIAL_SUCCESS 而不是 SUCCESS——这两者的区别正是
+    # P0-3 要求守住的地方：写成 SUCCESS，半年后就没人知道那几个章节是空的。
+    try:
+        _files_digest = []
+        for _k, _v in sorted((files or {}).items()):
+            try:
+                _st = os.stat(_v)
+                _files_digest.append({"name": _k, "file": os.path.basename(_v),
+                                      "bytes": _st.st_size})
+            except Exception:
+                _files_digest.append({"name": _k, "file": os.path.basename(str(_v))})
+        PROV.finish(
+            _prov,
+            status=ST.PARTIAL_SUCCESS if result.get("incomplete") else ST.SUCCESS,
+            output_digest={"outputs": _files_digest,
+                           "n_outputs": len(files or {}),
+                           "incomplete": bool(result.get("incomplete")),
+                           "module_summary": result.get("module_summary") or [],
+                           "n_warnings": len(result.get("warnings") or [])},
+            outdir=outdir,
+            warnings=list(result.get("warnings") or [])[:30])
+    except Exception as _pv_e:
+        # 血缘写不出来要出声，但不能因此把整轮分析的结果带走
+        result.setdefault("warnings", []).append("血缘记录落盘失败：%s" % _pv_e)
+        degrade.note("pipeline.analyze@provenance_finish", _pv_e)
     return result
 
 
@@ -1601,8 +1675,8 @@ def data_driven_rootcause(assoc, spc_res, col_map, process_key, y_col, recog=Non
             "score": round(ev * (1 - i * 0.08), 4),
             "evidence_score": round(ev, 3),
             "prior_score": 0.0, "temporal_score": 0.0,
-            "data_status": "已测",
-            "detail": {"status": "已测", "param": key or nm, "column": nm,
+            "data_status": ST.SUCCESS,
+            "detail": {"status": ST.SUCCESS, "param": key or nm, "column": nm,
                        "r": a.get("r"), "p": a.get("p"), "n": a.get("n"),
                        "via": via, "indirect": round(indirect, 3) if via else None,
                        "note": chain_note or (
@@ -2302,7 +2376,10 @@ def _render_disclaimer(rep, res):
     _man = res.get("run_manifest") or {}
     if _man.get("inputs"):
         rep.table(s17, ["输入文件", "字节数", "SHA-256（前 16 位）"],
-                  [[i["file"], i["size"], (i["sha256"] or "—")[:16]]
+                  # 字节数统一取 "bytes"：输入摘要由 provenance.input_fingerprints
+                  # 一处产出，报告这里跟着读它。此前这里写的是 "size"，
+                  # 与生产端不一致——改了生产端的键名，报告就 KeyError 崩在这一行。
+                  [[i["file"], i.get("bytes", i.get("size")), (i["sha256"] or "—")[:16]]
                    for i in _man["inputs"]],
                   caption="输入文件指纹。同名文件被替换后指纹会变，可用于核对结论出自哪一份数据")
     if _man.get("decisions"):

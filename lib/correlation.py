@@ -16,6 +16,7 @@ except Exception:                      # 脚本模式无包上下文
 import math
 from . import table as T
 from . import stats as S
+from . import status as ST
 
 
 def corr_matrix(table, columns=None, method="pearson"):
@@ -59,11 +60,11 @@ def association_with_target(table, target_col, exclude=None, method="pearson",
     except Exception as exc:
         # 目标列取不出来必须显性失败：调用方 `isinstance(a, list)` 会把 error
         # 静默丢成空列表，报告上就变成"未发现相关因素"。
-        return {"status": "FAILED", "target": target_col,
+        return {"status": ST.FAILED, "target": target_col,
                 "error": "目标列「%s」读取失败：%s" % (target_col, exc)}
     n_valid_y = sum(1 for v in y_raw if S.is_num(v))
     if n_valid_y < min_n:
-        return {"status": "INSUFFICIENT_DATA", "target": target_col,
+        return {"status": ST.INSUFFICIENT_DATA, "target": target_col,
                 "error": "目标列有效样本不足（需要 >=%d，实际 %d）"
                          % (min_n, n_valid_y),
                 "n_valid": n_valid_y, "min_n": min_n}

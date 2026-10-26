@@ -23,6 +23,8 @@ from . import stats as S
 from . import preprocess as PP
 from . import correlation as CORR
 from . import spc as SPC
+from . import status as ST
+from . import confound as CF
 
 _KB_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                         "knowledge", "process_specs.json")
@@ -322,11 +324,11 @@ def _data_evidence(table, param_key, target_col, defect_proc):
         if col:
             break
     if col is None:
-        return 0.0, {"status": "数据缺失", "param": param_key,
+        return 0.0, {"status": ST.INSUFFICIENT_DATA, "param": param_key,
                      "need": spec.get("name", param_key)}
     vals = table.numeric_column(col)
     y = table.numeric_column(target_col) if target_col else None
-    detail = {"status": "已测", "param": param_key, "column": col}
+    detail = {"status": ST.SUCCESS, "param": param_key, "column": col}
     score = 0.0
     if y:
         r, p, n = S.pearson(vals, y)
@@ -389,7 +391,7 @@ def _evidence_gate(score, det):
     likely_params 里排第一（先验 1.0）就被列为首要根因。现场照着去调这个参数，
     真因一点没动。所以凡是"有数据却查不到关联"的候选，一律降级。
     """
-    if det.get("status") != "已测":
+    if det.get("status") != ST.SUCCESS:
         return score * 0.60, "数据缺失，按知识库先验推断（需补测才能确认）"
     r = det.get("r")
     p = det.get("p")
@@ -508,7 +510,7 @@ def rank_root_causes(defect_name, table, target_col=None, top=5,
             if allowed and pproc and pproc not in allowed:
                 continue                       # 挡掉跨工序串味的参数
             ev, det = _data_evidence(table, pk, target_col, proc or pproc or "")
-            if det.get("status") != "已测":
+            if det.get("status") != ST.SUCCESS:
                 continue
             r = det.get("r")
             p = det.get("p")
@@ -551,6 +553,7 @@ def rank_root_causes(defect_name, table, target_col=None, top=5,
     if not cands:
         return None
     cands.sort(key=lambda d: -d["score"])
+    _annotate_evidence(cands, table, target_col, info or {})
     return {
         "defect": defect_name,
         "process": proc,
@@ -562,6 +565,113 @@ def rank_root_causes(defect_name, table, target_col=None, top=5,
         "all_candidates": cands,
         "history_cases": [hist[k] for k in hist],
     }
+
+
+def _annotate_evidence(cands, table, target_col, info, confound_top=3):
+    """给候选补上"这条结论凭什么、差什么、怎么验"（审计报告 P1-5 / P1-6）。
+
+    为什么不放在构造候选时就带上：混杂检查要重扫全表，给几十个候选都跑一遍
+    会把排序阶段拖成分钟级。现场真正会被送去验证的只有前几条，
+    所以混杂只做前 confound_top 条，**并如实标注其余未检查**。
+    ——"没检查"必须写出来，不写出来就会被读成"检查过、没问题"。
+
+    结论状态只有四种取值：数据证实 / 机理支持 / 现场待确认 / 未知。
+    这条口径来自报告要求，不许为了好看改成五级六级。
+    """
+    for i, c in enumerate(cands):
+        d = c.get("detail") or {}
+        missing, counter = [], []
+        st = d.get("status")
+
+        if st == ST.INSUFFICIENT_DATA:
+            missing.append("本轮数据里没有「%s」的有效数据列，"
+                           "这一条目前**没有数据证据**（不是证据为负，是没有证据）"
+                           % c.get("param_name"))
+            data_backed = False
+        elif st == ST.SUCCESS and d.get("r") is not None:
+            r, p = d.get("r"), d.get("p")
+            if abs(r) >= 0.15 and (p is None or p <= 0.05):
+                data_backed = True
+            else:
+                data_backed = False
+                counter.append("统计上未见关联（r=%.3f，p=%s），"
+                               "这条不是被数据否定的因果关系，"
+                               "而是「本轮数据看不出这条線索」"
+                               % (r, ("%.4g" % p) if p is not None else "—"))
+        else:
+            missing.append("该参数未取到可分析的数据列")
+            data_backed = False
+
+        beforeafter = (c.get("temporal") or {})
+        if beforeafter.get("verdict") in ("不符", "不支持"):
+            counter.append("时序上不支持：%s" % beforeafter.get("note", ""))
+
+        c["missing_evidence"] = missing
+        c["counter_evidence"] = counter
+        c["is_hypothesis"] = (not data_backed)
+        c["supported_by_data"] = data_backed
+
+        if data_backed:
+            c["conclusion_status"] = "数据支持"
+        elif c.get("source") == "知识库先验" or c.get("history_case"):
+            c["conclusion_status"] = "机理支持"
+        elif (c.get("quick_checks") or info.get("quick_checks")):
+            c["conclusion_status"] = "现场待确认"
+        else:
+            c["conclusion_status"] = "未知"
+
+        # 验证步骤：知识库里写过的现场动作直接用；没写过的只给流程骨架，
+        # **不替任何工艺编具体做法**（跨工序照抄做法是会被现场笑话的那种错）。
+        steps = list(info.get("quick_checks") or [])
+        gen = []
+        if data_backed and target_col:
+            gen.append("复算：用同一份数据按班次/设备/批次分层重算该项相关关系，"
+                       "确认不是由某一批数据单独撑起来的")
+        if st == ST.INSUFFICIENT_DATA:
+            gen.append("补数据：补齐「%s」的测量列后重跑，缺列情况下无法验证"
+                       % c.get("param_name"))
+        gen.append("现场核对：确认该参数的量纲、采样位置与报告假定一致后再下结论")
+        seen = set()
+        all_steps = []
+        for s in steps + gen:
+            if s and s not in seen:
+                seen.add(s)
+                all_steps.append(s)
+        c["verification_steps"] = all_steps
+
+        # 验证成本只按"数据要不要重采"分级，不猜现场工时：
+        # 猜出来的数字一旦被当成承诺，就是给使用者挖坑。
+        if st == ST.INSUFFICIENT_DATA:
+            c["verification_cost"] = "需补数据（成本由 sampling 方案决定，此处不估计）"
+        elif data_backed:
+            c["verification_cost"] = "低：现有数据即可复核"
+        else:
+            c["verification_cost"] = "中：需现场取数确认"
+
+        if i < confound_top and c.get("param") and target_col:
+            try:
+                cf = CF.check(table, c["param"], target_col)
+                c["confounders"] = cf.get("confounders") or []
+                c["confound_lines"] = CF.summary_lines(cf)
+                c["confound_limitation"] = (
+                    "；".join(cf.get("limitations") or []))
+                c["confound_technique"] = cf.get("technique") or []
+                strong = [x for x in (cf.get("confounders") or [])
+                          if x.get("verdict", "").startswith(("高度怀疑", "强警告"))]
+                if strong:
+                    c["conclusion_status"] = "数据支持（混杂未排除）"
+                    c.setdefault("warnings", []).append(
+                        "混杂嫌疑：%s —— 结论需按该列分层复核，"
+                        "在未排除前不得按此条下调整机指令" % strong[0]["column"])
+            except Exception as _cf_e:
+                degrade.note("rootcause.confound@%s" % c.get("param_key"), _cf_e)
+                c["confounders"] = []
+                c["confound_unavailable"] = "混杂检查未跑成（%s）：**未检查，不等于没有混杂**" % _cf_e
+        else:
+            c["confounders"] = None
+            c["confound_note"] = ("本条未做混杂检查（只对评分前 %d 条做，"
+                                  "为的是不把排序拖成分钟级）；**未检查 ≠ 没有混杂**"
+                                  % confound_top)
 
 
 # ------------------------------------------------------------------ 5Why
@@ -626,14 +736,14 @@ def build_5why(defect_name, top_causes, table=None, target_col=None):
             ev.append("超规格 %.1f%%（%d 点）" % (d["oos_pct"], d.get("out_of_spec", 0)))
         if d.get("cv_pct") is not None:
             ev.append("CV=%.2f%%" % d["cv_pct"])
-        if d.get("status") == "数据缺失":
+        if d.get("status") == ST.INSUFFICIENT_DATA:
             ev.append("该参数在当前数据中不存在，需补充：%s" % d.get("need"))
         chain.append({
             "level": 3,
             "why": "为什么指向「%s」？" % lead.get("param_name"),
             "because": "；".join(ev) if ev else "证据不足，需补充数据",
             "evidence": "数据证据（得分 %.2f）" % lead.get("score", 0),
-            "supported": bool(ev) and d.get("status") != "数据缺失",
+            "supported": bool(ev) and d.get("status") != ST.INSUFFICIENT_DATA,
         })
         chain.append({
             "level": 4,

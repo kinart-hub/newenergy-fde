@@ -86,6 +86,20 @@ def atomic_write_text(path, text, retries=20, base_delay=0.01, max_delay=0.05):
        **同步重试、反复对撞**（惊群），加了抖动才能错开。
     """
     import random
+    # 写之前先过一遍租户写入闸门：这里是最底层的一次真正的落盘，
+    # 上面任何一层忘了检查，都会在这里被拦住。
+    # 之所以放在循环中之外：这是越界与否的判断，跟并发冲突无关，只核一次即可。
+    try:
+        import tenancy as _TN
+    except Exception:
+        try:
+            from . import tenancy as _TN
+        except Exception:
+            _TN = None
+    if _TN is not None and _TN.enabled():
+        _ok, _why, _real = _TN.guard_write_path(path)
+        if not _ok:
+            raise IOError(_why)
     d = os.path.dirname(path)
     if d:
         os.makedirs(d, exist_ok=True)

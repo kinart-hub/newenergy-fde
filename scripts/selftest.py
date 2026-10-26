@@ -1494,7 +1494,13 @@ def test_hotswap():
         d = _json.load(io.open(spec, encoding="utf-8"))
         d["params"]["_baseline_new"] = {"name": "基线新增", "process": "battery_coating",
                                         "unit": "mm"}
+        # 更新基线必须脱开租户上下文再做。带上"某企业"的身份去写共享基线，
+        # 本身就是越权动作——写入闸门现在会把这类直接写拦下来。
+        # 真实运维升级基线也确实是"不在任何企业上下文里"进行的，
+        # 所以这里显式切出去再切回来，而不是去放宽闸门。
+        TN.set_tenant(None)
         HS.atomic_write_json(spec, d)
+        TN.set_tenant("A")
         time.sleep(1.1)
         kb_a = PP.load_knowledge()
         check("基线新增参数自动流入租户", "_baseline_new" in kb_a["params"],
@@ -2162,6 +2168,360 @@ def test_v19_delivery():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_status_and_lineage():
+    """P0-3 统一状态语义 + P1-10 数据血缘（外部审计报告验收第 3、8 项）。
+
+    这两条此前都是"文档上答应了、代码里没有"：
+      - 状态：全库没有一个统一定义，spc/doe/views/quality_guard 干脆不返回状态，
+        于是"这一节空着"和"这一节查过没问题"在报告里长得一模一样。
+      - 血缘：只有输入文件名+哈希的一半体格，没有 run_id、没有版本、
+        没有"等会儿还能不能复现"的答案。
+
+    断言的写法一律按"把式子反过来也成立"来挑：只看 ≫0 的数量不够，
+    必须精确到"是哪一个状态被放过/拦下"。否则放宽一处，测试照样是绿的。
+    """
+    import os as _os, tempfile as _tf, io as _io
+    from lib import status as ST
+    from lib import provenance as PROV
+
+    # ---------- 状态 ----------
+    check("状态：七个常量互不重复",
+          len(set(ST.ANALYSIS_STATES)) == 7, str(sorted(ST.ANALYSIS_STATES)))
+
+    allowed = [s for s in ST.ANALYSIS_STATES if ST.may_claim_no_finding(s)]
+    check("状态：只有 NO_FINDING 允许宣称『未发现异常』",
+          allowed == [ST.NO_FINDING], str(allowed))
+    for bad in (ST.FAILED, ST.INSUFFICIENT_DATA, ST.SKIPPED,
+                ST.NOT_APPLICABLE, ST.PARTIAL_SUCCESS, ST.SUCCESS):
+        check("状态：%s 不许宣称无异常" % bad, not ST.may_claim_no_finding(bad))
+    check("状态：必须显式披露的五个都点名了",
+          all(ST.must_disclose(s) for s in (ST.FAILED, ST.INSUFFICIENT_DATA,
+                                            ST.SKIPPED, ST.NOT_APPLICABLE,
+                                            ST.PARTIAL_SUCCESS)))
+
+    check("状态：历史写法『已测』收成 SUCCESS",
+          ST.normalize("已测") == ST.SUCCESS, ST.normalize("已测"))
+    check("状态：历史写法『数据缺失』收成 INSUFFICIENT_DATA",
+          ST.normalize("数据缺失") == ST.INSUFFICIENT_DATA)
+    check("状态：历史写法『insufficient』收成 INSUFFICIENT_DATA",
+          ST.normalize("insufficient") == ST.INSUFFICIENT_DATA)
+    check("状态：认不出来的保守处理成 FAILED（不是 SUCCESS）",
+          ST.normalize("这算啥状态") == ST.FAILED, ST.normalize("这算啥状态"))
+    check("状态：8D 的动作状态不混进分析状态",
+          ST.normalize("待验证") == ST.FAILED,
+          "『待验证』是核查动作状态，落入分析状态时应保守判 FAILED")
+
+    fr = ST.frame(ST.INSUFFICIENT_DATA, method="pearson", n_effective=3,
+                  params={"min_n": 8})
+    need = ("status", "status_text", "may_claim_no_finding", "method",
+            "params", "n_effective", "warnings", "errors", "input_digest")
+    missing_k = [k for k in need if k not in fr]
+    check("状态：统一骨架含 P0-3 要求的全部字段", not missing_k, str(missing_k))
+
+    sm = ST.summarize([{"section": "相关性", "status": ST.FAILED,
+                        "errors": ["目标列读取失败"]},
+                       {"section": "SPC", "status": ST.NO_FINDING}])
+    check("状态：汇总点名未产出结论的环节", sm["n_disclosed"] == 1 and
+          "相关性" in sm["bad_lines"][0], str(sm["bad_lines"]))
+    check("状态：有环节失败时不得判『全部清白』", not sm["all_clean"])
+    sm2 = ST.summarize([{"section": "a", "status": ST.NO_FINDING},
+                        {"section": "b", "status": ST.NO_FINDING}])
+    check("状态：全为 NO_FINDING 才判全部清白", sm2["all_clean"] is True)
+    sm3 = ST.summarize([{"section": "a", "status": None}])
+    check("状态：缺状态按失败计（不是清白）", sm3["n_disclosed"] == 1)
+
+    # ---------- 血缘 ----------
+    try:
+        tmp = _tf.mkdtemp(prefix="fde_lineage_")
+        csv = _os.path.join(tmp, "in.csv")
+        _io.open(csv, "w", encoding="utf-8", newline="").write(
+            "批次号,涂布面密度\nA,10.1\nA,10.4\nA,10.2\nB,9.8\nB,9.9\nB,10.0\n")
+
+        ins1 = PROV.input_fingerprints([csv])
+        cfg = {"target": "涂布面密度", "process": "battery_coating"}
+        ver = {"analyzer": "9.9.9", "knowledge": "kb-x"}
+        check("血缘：输入摘要字节数与物理文件一致",
+              ins1 and ins1[0]["bytes"] == _os.path.getsize(csv),
+              str(ins1[0].get("bytes")) if ins1 else "空")
+
+        r1 = PROV.new_run(inputs=ins1, config=cfg, versions=ver, target="涂布面密度")
+        r2 = PROV.new_run(inputs=ins1, config=cfg, versions=ver, target="涂布面密度")
+        check("血缘：同输入同配置指纹一致（可据此判重现）",
+              r1["fingerprint"] == r2["fingerprint"],
+              r1["fingerprint"][:12])
+        check("血缘：run_id 每次不同（可定位这一轮）",
+              r1["run_id"] != r2["run_id"])
+
+        r3 = PROV.new_run(inputs=PROV.input_fingerprints([csv]),
+                          config=dict(cfg, target="含水量"), versions=ver)
+        check("血缘：配置变了指纹就变", r3["fingerprint"] != r1["fingerprint"])
+        r4 = PROV.new_run(inputs=PROV.input_fingerprints([csv]),
+                          config=cfg, versions=dict(ver, knowledge="kb-y"))
+        check("血缘：版本变了指纹就变", r4["fingerprint"] != r1["fingerprint"])
+
+        PROV.note_step(r1, "预处理", ST.SUCCESS, seconds=0.01,
+                       detail={"rows_in": 6, "rows_out": 6})
+        PROV.note_nondeterminism(r1, seed=None, reason="本轮无随机步骤")
+        rec = PROV.finish(r1, ST.SUCCESS,
+                          output_digest={"n_outputs": 2}, outdir=tmp)
+        check("血缘：落盘成功且给了路径",
+              bool(rec.get("lineage_file")) and _os.path.exists(rec["lineage_file"]),
+              str(rec.get("lineage_file")))
+        check("血缘：步骤与随机种子都记下来了",
+              rec["steps"][0]["step"] == "预处理" and "notes" in rec,
+              str(rec["steps"][0]))
+
+        back = PROV.load(rec["run_id"], tmp)
+        check("血缘：按 run_id 能读回整条记录",
+              back is not None and back["fingerprint"] == rec["fingerprint"])
+        ok, why = PROV.replay_check(back)
+        check("血缘：未改动的输入能通过复现自检", ok, str(why))
+
+        # 反向一：等长改内容 —— 只有哈希能发现，字节数一模一样。
+        #   这段必须有：只追加行的话走的是"字节数"分支，哈希比对从头到尾没被验过，
+        #   而哈希才是"喂的是不是同一份数据"的唯一判据。
+        raw0 = _io.open(csv, encoding="utf-8").read()
+        _io.open(csv, "w", encoding="utf-8", newline="").write(raw0.replace("10.1", "19.9"))
+        ok2, why2 = PROV.replay_check(back)
+        check("血缘：等长篡改输入必须被哈希抓到",
+              (not ok2) and any("内容已变" in str(w) for w in why2), str(why2)[:90])
+        check("血缘：等长篡改后字节数不变（证明不是靠体积发现的）",
+              _os.path.getsize(csv) == back["inputs"][0]["bytes"],
+              "%d vs %d" % (_os.path.getsize(csv), back["inputs"][0]["bytes"]))
+
+        # 反向二：追加行 -> 走字节数分支
+        _io.open(csv, "a", encoding="utf-8").write("C,11.5\n")
+        ok2b, why2b = PROV.replay_check(back)
+        check("血缘：追加内容也必须报错", not ok2b, str(why2b)[:90])
+
+        # 反向：run_id 被手改时必须认出来
+        bad_rec = dict(back, run_id="deadbeefdead-20260101000000")
+        ok3, why3 = PROV.replay_check(bad_rec)
+        check("血缘：run_id 与内容对不上要报错", not ok3 and
+              any("run_id" in str(w) for w in why3), str(why3)[:80])
+    finally:
+        import shutil as _sh
+        _sh.rmtree(tmp, ignore_errors=True)
+
+
+def test_confound_and_evidence():
+    """P1-6 混杂因素 + P1-5 根因证据结构（外部审计报告验收第 4、5 项）。
+
+    守的是一件现场最容易吃亏的事：
+        X 与 Y 整体强相关，但这个相关完全由"批次"造成——
+        批次 A 恰好 X 低 Y 也低，批次 B 恰好 X 高 Y 也高。
+        照 X 去调机，产线纹丝不动。
+    这份数据是专门这么造出来的：层内 X 单调变化而 Y 几乎不动，
+    所以"层内关系消失"必须被判出来，这是本测试的核心断言。
+    """
+    from lib import table as T, rootcause as RC, confound as CF, stats as S
+
+    rows, cols = [], ["批次号", "X参数", "目标Y"]
+    for i in range(14):
+        rows.append(["A", 10 + 0.1 * i, 5.0 + (0.02 if i % 2 else -0.02)])
+    for i in range(14):
+        rows.append(["B", 20 + 0.1 * i, 8.0 + (0.02 if i % 2 else -0.02)])
+    tb = T.Table(cols, rows)
+
+    r_all = S.pearson(tb.numeric_column("X参数"), tb.numeric_column("目标Y"))[0]
+    check("混杂用例本身成立：整体相关看着很强", r_all > 0.9, "r=%.3f" % r_all)
+
+    res = CF.check(tb, "X参数", "目标Y")
+    it = (res.get("confounders") or [{}])[0]
+    check("混杂：识别出批次是分组列", it.get("column") == "批次号", str(it.get("column")))
+    check("混杂：目标在批次间差异显著", it.get("target_diff") == "显著",
+          str(it.get("target_diff")))
+    check("混杂：层内关系消失被判出来", it.get("vanishes_within_layers") is True,
+          "层内 r=%s" % [round(l["r"], 3) for l in it.get("stratified", [])])
+    check("混杂：结论明确写怀疑混杂",
+          str(it.get("verdict", "")).startswith("高度怀疑混杂"), str(it.get("verdict"))[:60])
+    check("混杂：方法限制必须交代（未采集因素查不了）",
+          any("不能确立因果" in x for x in res.get("limitations", [])),
+          str(res.get("limitations"))[:60])
+
+    # 反向：真的有层内关系的数据，不能被冤枉成混杂
+    rows2, cols2 = [], ["批次号", "X参数", "目标Y"]
+    for i in range(14):
+        rows2.append(["A", 10 + 0.1 * i, 5.0 + 0.2 * i])
+    for i in range(14):
+        rows2.append(["B", 20 + 0.1 * i, 8.0 + 0.2 * i])
+    tb2 = T.Table(cols2, rows2)
+    it2 = (CF.check(tb2, "X参数", "目标Y").get("confounders") or [{}])[0]
+    check("混杂：真实层内关系不得被误判为消失",
+          it2.get("vanishes_within_layers") is False,
+          "层内 r=%s" % [round(l["r"], 3) for l in it2.get("stratified", [])])
+
+    # 根因侧：候选必须带上"凭什么/差什么/怎么验"
+    r = RC.rank_root_causes("面密度超差", tb2, "目标Y",
+                            process="battery_coating", top=3)
+    cands = (r or {}).get("candidates") or []
+    check("证据：根因能产出候选", len(cands) > 0, "%d 条" % len(cands))
+    keys_need = ("conclusion_status", "missing_evidence", "counter_evidence",
+                 "verification_cost", "verification_steps", "is_hypothesis",
+                 "supported_by_data")
+    lack = [k for k in keys_need if k not in cands[0]]
+    check("证据：候选含 P1-5 要求的全部结构字段", not lack, str(lack))
+    check("证据：结论状态取值为四选一",
+          cands[0].get("conclusion_status") in
+          ("数据支持", "机理支持", "现场待确认", "未知",
+           "数据支持（混杂未排除）"), str(cands[0].get("conclusion_status")))
+    # 缺数据的候选必须标成"假设"，不能和数据支撑的候选长得一样
+    hyp = [c for c in cands if c.get("is_hypothesis")]
+    check("证据：无数据支撑的候选标记为假设而非结论",
+          all(c.get("conclusion_status") in ("机理支持", "现场待确认", "未知")
+              for c in hyp), "%d/%d 条假设" % (len(hyp), len(cands)))
+
+
+def test_doe_safety_boundary():
+    """P1-8 受控安全边界门禁（外部审计报告验收第 7 项）。
+
+    报告点名批评了原来的做法：「通用硬编码安全边界或依赖参数名匹配的规则
+    不足以保障设备和工艺安全，参数名称相同不代表物理意义、单位或设备限制相同」。
+
+    这里守三件事，件件都是"放过去就会出事"而不是"不美观"：
+      1. 单位不明/跨量纲 —— 企业的 [-40,150] 到底是 ℃ 还是 ℉，
+         直接决定了 150 是工艺烘烤还是安全事故，必须拦下而不是换算着猜。
+      2. 边界来源是否受控 —— 光有一对数值不算受控，必须交代清楚
+         是出自哪份文件哪一版、谁批的、什么时候生效；
+         file / version / approval 缺一项，这一条就只能算推断。
+      3. 冲突的上/下限 —— min>max 说明某处单位或口径已经串了。
+    """
+    from lib import doe as D
+
+    f, _ = D.unit_factor("mm", "um")
+    check("边界：同量纲可换算且方向正确", f == 1000.0, "mm→um=%s" % f)
+    f2, _ = D.unit_factor("um", "mm")
+    check("边界：反向换算取倒数", abs(f2 - 1e-3) < 1e-12, "um→mm=%s" % f2)
+    f3, n3 = D.unit_factor("V", "A")
+    check("边界：跨量纲拒绝换算", f3 is None and "不属于同一量纲" in n3, str(n3)[:50])
+    f4, n4 = D.unit_factor("℃", "℉")
+    check("边界：温度这类仿射单位不做换算（宁拦不算错）",
+          f4 is None and "零点偏移" in n4, str(n4)[:50])
+    f5, n5 = D.unit_factor(None, "mm")
+    check("边界：单位缺失时拒绝（不是当作一致）", f5 is None, str(n5)[:40])
+
+    specs = [{"name": "烘箱一区温度", "unit": "℃", "low": 60, "high": 140}]
+    b1 = D.controlled_boundaries(specs)
+    rec1 = b1["烘箱一区温度"]
+    check("边界：无来源时判为「推断」而非「受控」",
+          rec1["confidence"] == "推断" and rec1["controlled"] is False,
+          rec1["confidence"])
+    g1 = D.boundary_gate(b1)
+    check("边界：来源不受控必须给警告（要求书面确认）",
+          any("书面确认" in w for w in g1["warnings"]),
+          str(g1["warnings"])[:80])
+
+    b2 = D.controlled_boundaries(specs, spec_overrides={
+        "_meta": {"file": "spec-B3.pdf", "version": "B/3", "approval": "工艺工程师（张三）",
+                  "effective": "2026-05-10", "scope": "L1 涂布线"},
+        "烘箱一区温度": {"lsl": 50, "usl": 120, "unit": "℃"}})
+    rec2 = b2["烘箱一区温度"]
+    check("边界：补齐来源六要素后判为受控", rec2["confidence"] == "受控",
+          str([s["confidence"] for s in rec2["sources"]]))
+    check("边界：受控边界记录了出处/版本/审批/生效日期",
+          any(s["file"] == "spec-B3.pdf" and s["version"] == "B/3"
+              and s["approval"] == "工艺工程师（张三）" and s["effective"] == "2026-05-10"
+              for s in rec2["sources"]), str(rec2["sources"])[:90])
+    check("边界：安全包络只能收紧不能放宽",
+          rec2["max"] <= 150.0 and rec2["min"] >= 50.0,
+          "[%s, %s]" % (rec2["min"], rec2["max"]))
+
+    b3 = D.controlled_boundaries(
+        [{"name": "涂布速度", "unit": "m/min", "low": 30, "high": 50}],
+        spec_overrides={"涂布速度": {"lsl": 20, "usl": 40, "unit": "mm/s"}})
+    g3 = D.boundary_gate(b3)
+    check("边界：单位跨量纲时阻断（不是警告）", g3["ok"] is False and
+          len(g3["blockers"]) > 0, str(g3["blockers"])[:80])
+
+    b4 = D.controlled_boundaries(
+        [{"name": "涂布速度", "unit": "m/min", "low": 30, "high": 50}],
+        spec_overrides={"涂布速度": {"lsl": 80, "usl": 90, "unit": "m/min"}})
+    g4 = D.boundary_gate(b4)
+    check("边界：上下限冲突时阻断", g4["ok"] is False and
+          any("边界冲突" in x or "缺" in x for x in g4["blockers"]),
+          str(g4["blockers"])[:80])
+
+    b5 = D.controlled_boundaries([{"name": "某因子", "unit": None}])
+    g5 = D.boundary_gate(b5)
+    check("边界：完全没有边界的因子必须被拦下", g5["ok"] is False,
+          str(g5["blockers"])[:80])
+
+
+def test_tenant_path_guard():
+    """P2-1 租户路径越界防护（外部审计报告第八节点名的风险项）。
+
+    修之前的事实：`tenant_root("C:/Windows/System32")` 原样返回系统目录，
+    而 `reset_tenant` 会对这个返回值执行 rmtree。也就是说一列 payload
+    足以让"清空某个租户"变成"清空某个别的目录"。
+    这类缺陷在单人单机使用时看不出来——只有把它当成多维 entry 跑才会撞上。
+    """
+    import os as _os, tempfile as _tf, shutil as _sh
+    from lib import tenancy as TN, kbstore as KBS
+
+    orig_root = TN.SKILL_ROOT
+    tmp = _tf.mkdtemp(prefix="fde_guard_")
+    try:
+        _sh.copytree(_os.path.join("knowledge"), _os.path.join(tmp, "knowledge"))
+        TN.set_root(tmp)
+        base = _os.path.join(tmp, "tenants")
+
+        for bad in ("../evil", "..\\..\\..\\Windows", "/etc/passwd",
+                    "C:/Windows/System32", "\\\\server\\share\\x", "a/../../b"):
+            r = TN.tenant_root(bad)
+            check("租户路径：%+r 不得逃出 tenants/" % bad,
+                  bool(r) and TN.is_inside(r, base), str(r))
+
+        TN.set_tenant("A")
+        root_a = TN.tenant_root()
+        check("租户路径：正常租户落在 tenants/<id> 下",
+              TN.is_inside(root_a, base), str(root_a))
+
+        outside = _os.path.join(tmp, "knowledge", "process_specs.json")
+        ok, why, _real = TN.guard_write_path(outside)
+        check("写入闸门：拒绝把内容写到租户目录之外", not ok, str(why)[:70])
+        inside = _os.path.join(root_a, "knowledge", "ok.json")
+        ok2, _why2, _real2 = TN.guard_write_path(inside)
+        check("写入闸门：租户目录内的正常写入放行", ok2)
+
+        # kbstore 是真正的写入入口。这里验的是两件事而不是"有没有抛异常"：
+        # 写一条基线路径上的记录，必须①落到租户层②基线文件一字未改。
+        # 只读��筌有没有异常是不够的——抛异常解决不了"私有知识混进共享库"。
+        try:
+            before = io.open(outside, encoding="utf-8").read()
+            KBS._write_json(outside, {"x": 1, "_probe_": True})
+            after = io.open(outside, encoding="utf-8").read()
+        except Exception as _e:
+            before, after = "ERR", "ERR2:%s" % _e
+        check("写入闸门：经 kbstore 写基线路径时基线一字未改",
+              before == after, "基线变动=%s" % (before != after))
+        redirected = _os.path.join(root_a, "knowledge", "process_specs.json")
+        check("写入闸门：该写入被重定向进租户层",
+              _os.path.exists(redirected), str(redirected))
+
+        check("清空保护：越界租户 id 不会被 rmtree 掉",
+              TN.reset_tenant("C:/Windows/System32") is False)
+
+        # 符号链接：能造就测，造不了就明说没测（Windows 无 SeCreateSymbolicLink
+        # 权限时很常见），绝不把"没测"记成"通过"。
+        link = _os.path.join(tmp, "escape_link")
+        try:
+            _os.symlink(_os.path.join(tmp, "knowledge"), link, target_is_directory=True)
+        except (OSError, NotImplementedError, AttributeError) as _e:
+            print("  [跳过] 符号链接越界用例：本机无法创建符号链接（%s）"
+                  % getattr(_e, "winerror", _e))
+        else:
+            check("符号链接：指向库外的链接被判越界",
+                  TN.is_inside(link, base) is False, link)
+            ok3, _w3, _r3 = TN.guard_write_path(_os.path.join(link, "x.json"))
+            check("符号链接：经链接写入租户目录外被拒", not ok3)
+    finally:
+        try:
+            TN.set_root(orig_root)
+        except Exception as _e:
+            print("  [提示] 测试后复位根目录失败：%s" % _e)
+        _sh.rmtree(tmp, ignore_errors=True)
+
+
 if __name__ == "__main__":
     print("newenergy-fde 自检开始")
     test_table()
@@ -2185,6 +2545,10 @@ if __name__ == "__main__":
     test_p0_align_and_direction()
     test_p1_stdlib_oracle()
     test_p03_failure_not_disguised()
+    test_status_and_lineage()
+    test_confound_and_evidence()
+    test_doe_safety_boundary()
+    test_tenant_path_guard()
     print("\n" + "=" * 56)
     print("通过 %d 项，失败 %d 项" % (len(PASS), len(FAIL)))
     if FAIL:
