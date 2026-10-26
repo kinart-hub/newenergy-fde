@@ -666,6 +666,18 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
     except Exception as e:
         result["adaptation"] = {"error": str(e), "degraded": True}
     result["col_map"] = {k: v for k, v in col_map.items() if v}
+    # P1-3：把结构化映射与低置信列一并交出去；低置信映射触发告警（默认 auto 不阻塞，
+    # 需要更严时可改用 apply_map_policy(detailed, "block") 直接按未匹配处理）。
+    _cmap_detailed = PP.map_columns_detailed(main, chosen_proc)
+    _cmap_block_keys, _low_conf = PP.apply_map_policy(_cmap_detailed, "auto")
+    result["col_map_detail"] = {c: {k: v for k, v in r.items() if k != "candidates"}
+                               for c, r in _cmap_detailed.items()}
+    result["low_confidence_mappings"] = _low_conf
+    if _low_conf:
+        result.setdefault("warnings", []).append(
+            "字段映射存在 %d 个低置信项（来源=%s），建议人工确认或升级为 block 政策"
+            % (len(_low_conf),
+               ", ".join(sorted({x["source"] for x in _low_conf})) or "未知"))
     result["process_detected"] = proc_scores[:3]
     result["process"] = chosen_proc
     result["process_name"] = KB["processes"].get(chosen_proc, {}).get("name", "未知工序")
@@ -676,11 +688,13 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
     # 3. 清洗。log 记下每一条被剔除的行（文件+原始行号+原因），
     #    既能在报告里交代"删了什么"，也给了复核和撤销的依据。
     cleaning_log = []
-    clean_tb, clean_rep = PP.clean(main, missing="keep", outlier="mad", log=cleaning_log)
+    clean_tb, clean_rep = PP.clean(main, missing="keep", outlier="mad", log=cleaning_log,
+                                   prefer_process=chosen_proc)
     result["clean"] = {k: v for k, v in clean_rep.items() if k != "col_map"}
     if len(clean_tb) < 3:
         cleaning_log = []
-        clean_tb, clean_rep = PP.clean(main, missing="keep", outlier="none", log=cleaning_log)
+        clean_tb, clean_rep = PP.clean(main, missing="keep", outlier="none", log=cleaning_log,
+                                       prefer_process=chosen_proc)
         result["clean"] = {k: v for k, v in clean_rep.items() if k != "col_map"}
     result["cleaning_log"] = cleaning_log
     result["trace_meta"] = {

@@ -616,6 +616,7 @@ AUDIT_FILES = [
     os.path.join("scripts", "package.py"),
     os.path.join("scripts", "fde_run.py"),
     os.path.join("lib", "pipeline.py"),
+    os.path.join("lib", "preprocess.py"),
     os.path.join("lib", "hotswap.py"),
     os.path.join("lib", "kbstore.py"),
     os.path.join("lib", "tenancy.py"),
@@ -1028,6 +1029,7 @@ DOE_FILE = os.path.join("lib", "doe.py")
 TENANCY_FILE = os.path.join("lib", "tenancy.py")
 EIGHTD_FILE = os.path.join("lib", "eightd.py")
 PIPELINE_FILE = os.path.join("lib", "pipeline.py")
+PREPROCESS_FILE = os.path.join("lib", "preprocess.py")
 CONTRACT_FILE = os.path.join("lib", "contract.py")
 VIEWS_FILE = os.path.join("lib", "views.py")
 RUN_FILE = os.path.join("scripts", "fde_run.py")
@@ -1730,6 +1732,42 @@ def rule_p1_verifiability_weighted():
     return _r(True, "", {"verifiability_weighted": True})
 
 
+def rule_p1_field_mapping_confidence():
+    """P1-3：字段映射必须结构化（来源/候选/置信度/量纲风险），低置信度可阻断。
+
+    改造前 map_columns 返回裸 {列: key}，没有来源/置信度，低置信只能"猜了就用"，
+    单位换算靠白名单碰巧挡住跨量纲。现在必须：① map_columns_detailed 返回带
+    source/confidence/candidates 的记录；② apply_map_policy 支持 block 把低置信判未匹配；
+    ③ 量纲风险（unit_risk）被显式检测而非靠白名单运气；④ 清洗报告交出映射明细。
+    """
+    t = _read(PREPROCESS_FILE) or ""
+    if not t:
+        return _r(False, "读不到 " + PREPROCESS_FILE)
+    if "def map_columns_detailed(" not in t:
+        return _r(False, "缺少 map_columns_detailed：映射仍是裸 {列: key}")
+    if "def _match_one(" not in t:
+        return _r(False, "缺少 _match_one：无法产出结构化匹配记录")
+    if '"confidence"' not in t:
+        return _r(False, "匹配记录未带 confidence：下游无法按置信度决策")
+    if '"candidates"' not in t:
+        return _r(False, "匹配记录未保留候选集：无法追溯『为什么配这个』")
+    if "def apply_map_policy(" not in t:
+        return _r(False, "缺少 apply_map_policy：低置信度无法被阻断/确认")
+    if 'policy == "block"' not in t:
+        return _r(False, "apply_map_policy 不支持 block：低置信列无法判未匹配")
+    if "def _unit_mismatch(" not in t:
+        return _r(False, "缺少 _unit_mismatch：跨量纲误映射只能靠白名单碰巧挡住")
+    if '"unit_risk"' not in t:
+        return _r(False, "匹配记录未带 unit_risk：量纲不一致不可见")
+    if "col_hints & decl_hints" not in t:
+        return _r(False, "unit_risk 未用量纲 token 集合求交：归一串接会假阴性")
+    if '"mapping_detail"' not in t:
+        return _r(False, "clean 报告未输出 mapping_detail：结构化映射不落地")
+    if '"low_confidence_mappings"' not in t:
+        return _r(False, "clean 报告未输出 low_confidence_mappings：低置信不可见")
+    return _r(True, "", {"field_mapping_confidence": True})
+
+
 AUDIT_RULES = [
     Rule("LICENSE 为 Elastic 2.0 官方纯文本", rule_license,
          "LICENSE 首行必须是裸文本 'Elastic License 2.0'（前面有 # 或 ## 即判不过）",
@@ -2275,6 +2313,22 @@ AUDIT_RULES = [
           _mutant("候选不再输出可验证性分项",
                   _re_sub(r'c\["verifiability_score"\] = round\(_vf, 3\)',
                           "pass  # 不再输出分项", flags=re.M), ROOTCAUSE_FILE)]),
+
+    Rule("字段映射必须结构化且低置信可阻断", rule_p1_field_mapping_confidence,
+         "P1-3。map_columns 必须升级为 map_columns_detailed：每条记录带 source/confidence/"
+         "candidates；apply_map_policy 必须支持 block 把低置信列判未匹配；"
+         "unit_risk 必须显式检测跨量纲误映射；clean 报告必须交出 mapping_detail 与 "
+         "low_confidence_mappings。裸 {列: key} 让『这一列配得有多准』彻底不可见。",
+         PREPROCESS_FILE,
+         [_mutant("结构化映射入口改名（消掉定义）",
+                  _re_sub(r"^def map_columns_detailed\(",
+                          "def map_columns_detailed2(", flags=re.M), PREPROCESS_FILE),
+          _mutant("量纲风险检测被关掉（跨量纲误映射不再可见）",
+                  _re_sub(r'return not \(col_hints & decl_hints\)',
+                          'return False', flags=re.M), PREPROCESS_FILE),
+          _mutant("去掉 block 政策分支（低置信无法阻断）",
+                  _re_sub(r'if policy == "block" and conf == "low":',
+                          'if False and conf == "low":', flags=re.M), PREPROCESS_FILE)]),
 ]
 
 

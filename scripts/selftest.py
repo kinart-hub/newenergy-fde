@@ -2924,6 +2924,65 @@ def test_tenant_path_guard():
         _sh.rmtree(tmp, ignore_errors=True)
 
 
+def test_p1_field_mapping_confidence():
+    """P1-3：字段映射必须有来源/候选/置信度/量纲风险，低置信度可阻断。
+
+    审计原话：映射只有裸 {列: key}，无来源/候选/置信度/人工确认；
+    低置信度无法阻断；单位换算靠白名单"恰好"挡住跨量纲。
+    """
+    from lib import table as T
+    # 构造一张含"精确匹配列"的表
+    cols = ["设备号", "浆料固含(wt%)", "某未知温度参数"]
+    rows = [["A1", 55.0, 25.0], ["A2", 56.0, 26.0],
+            ["A3", 54.0, 24.0], ["A4", 55.5, 25.5]]
+    tb = T.Table(cols, rows)
+    det = PP.map_columns_detailed(tb, prefer_process="battery_coating")
+
+    # ① 结构化：每条记录带来源/置信度/候选，且向后兼容的 map_columns 仍给 key
+    keys = PP.map_columns(tb, prefer_process="battery_coating")
+    check("P1-3：map_columns 向后兼容仍返回 {列: key}",
+          set(keys.get(c) for c in cols) ==
+          set(det.get(c, {}).get("key") for c in cols), "")
+    miss = [c for c in cols if "confidence" not in det.get(c, {})
+            or "source" not in det.get(c, {})]
+    check("P1-3：每条映射记录含 source 与 confidence", not miss, str(miss))
+    # 精确归一匹配（浆料固含）应是 high
+    sc = det.get("浆料固含(wt%)", {})
+    check("P1-3：精确别名匹配置信度为 high",
+          sc.get("confidence") == "high", str(sc.get("source")))
+    check("P1-3：映射记录保留候选集（candidates）",
+          isinstance(sc.get("candidates"), list) and len(sc["candidates"]) >= 1, "")
+    check("P1-3：clean 报告交出 mapping_detail 与 low_confidence_mappings",
+          "mapping_detail" in PP.clean(tb, prefer_process="battery_coating")[1]
+          and "low_confidence_mappings" in PP.clean(tb, prefer_process="battery_coating")[1], "")
+
+    # ② 低置信度可阻断：直接对 apply_map_policy 做单元验证（不依赖具体知识库）
+    synth = {
+        "colA": {"key": "p1", "source": "substring", "confidence": "low", "unit_risk": False},
+        "colB": {"key": "p2", "source": "exact", "confidence": "high", "unit_risk": False},
+    }
+    auto_keys, auto_low = PP.apply_map_policy(synth, "auto")
+    block_keys, block_low = PP.apply_map_policy(synth, "block")
+    check("P1-3：auto 下低置信列仍保留猜测 key", auto_keys["colA"] == "p1", str(auto_keys))
+    check("P1-3：block 政策把低置信列判为未匹配（key=None）",
+          block_keys["colA"] is None, str(block_keys))
+    check("P1-3：高置信列不受 block 影响",
+          block_keys["colB"] == "p2", str(block_keys))
+    check("P1-3：auto 下汇总低置信清单",
+          len(auto_low) == 1 and auto_low[0]["col"] == "colA", str(auto_low))
+
+    # ③ 量纲风险：列名暗示单位与参数声明 unit 不一致应被标记
+    #    （直接单元验证 _unit_hint / _unit_mismatch，不依赖具体知识库匹配）
+    check("P1-3：_unit_hint 从列名抽取量纲 token",
+          PP._unit_hint("涂布速度(mm)") == "mm", str(PP._unit_hint("涂布速度(mm)")))
+    params_mm = {"coating_speed": {"unit": "m/min"}}
+    rec_mm = {"key": "coating_speed"}
+    check("P1-3：列名暗示量纲与声明量纲冲突→unit_risk",
+          PP._unit_mismatch(rec_mm, "涂布速度(mm)", params_mm) is True, "")
+    check("P1-3：列名量纲与声明一致→不误报",
+          PP._unit_mismatch(rec_mm, "涂布速度(m/min)", params_mm) is False, "")
+
+
 if __name__ == "__main__":
     print("newenergy-fde 自检开始")
     test_table()
@@ -2955,6 +3014,7 @@ if __name__ == "__main__":
     test_contract_schema()
     test_concurrent_write_integrity()
     test_tenant_path_guard()
+    test_p1_field_mapping_confidence()
     print("\n" + "=" * 56)
     print("通过 %d 项，失败 %d 项" % (len(PASS), len(FAIL)))
     if FAIL:

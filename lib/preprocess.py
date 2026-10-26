@@ -169,48 +169,162 @@ def _substring_ok(a, t):
     return True
 
 
+def _unit_tokens(s):
+    """从文本抽取常见量纲 token（℃/mm/kPa/% 等），返回小写列表。"""
+    return [m.group(1).lower() for m in
+            re.finditer(r"(℃|°c|mm|cm|μm|um|nm|kpa|mpa|pa|%|pct|rpm|a|v|w|min|h|s)\b",
+                        s, re.I)]
+
+
+def _unit_hint(col_name):
+    """从列名抽取首个量纲 token，供记录展示（冲突判定见 _unit_mismatch）。"""
+    toks = _unit_tokens(col_name)
+    return toks[0] if toks else None
+
+
+def _unit_mismatch(rec, col_name, params):
+    """声明量纲与列名暗示量纲不一致 → 跨量纲风险。
+
+    P1-3 ③：原来靠白名单"恰好"挡住跨量纲，属碰巧而非设计保障。
+    现在用**量纲 token 集合求交**比对——避免把 "m/min" 归一成 "mmin" 后
+    误把列名里的 "mm" 当成已声明量纲（归一串接造成的假阳性）。
+    """
+    col_hints = set(_unit_tokens(col_name))
+    if not col_hints or not rec.get("key"):
+        return False
+    decl = (params.get(rec["key"], {}) or {}).get("unit", "") or ""
+    decl_hints = set(_unit_tokens(decl))
+    if not decl_hints:
+        return False
+    return not (col_hints & decl_hints)
+
+
+def _confidence(rec):
+    """映射置信度：精确归一命中最高，子串相似度越低越不可信。"""
+    if not rec.get("key"):
+        return "unmatched"
+    if rec.get("source") == "exact":
+        return "high"
+    sc = rec.get("score", 0.0)
+    if sc >= 0.85:
+        return "high"
+    if sc >= 0.70:
+        return "medium"
+    return "low"
+
+
 def _search_param(target, params):
-    """在给定参数子集中做别名匹配"""
-    best, best_score = None, 0
+    """在给定参数子集中做别名匹配，返回 (key, 命中别名, 相似度, 来源)。"""
+    best, best_score, best_via, best_src = None, 0, None, None
     for key, spec in params.items():
         for alias in spec.get("aliases", []) + [spec.get("name", ""), key]:
             a = _norm_name(alias)
             if not a:
                 continue
             if a == target:
-                return key
+                return key, alias, 1.0, "exact"
             # 护栏：子串匹配要求较短一方至少 4 个字符。否则「Visc」会误配「isc」、
             # 「电池列」会误配泛化别名「电池」，导致工序与参数同时判错（v1.10 修复）。
             if (a in target or target in a) and _substring_ok(a, target):
                 score = min(len(a), len(target)) / max(len(a), len(target))
                 if score > best_score:
-                    best, best_score = key, score
-    return best if best_score >= 0.6 else None
+                    best, best_score, best_via, best_src = key, score, alias, "substring"
+    if best_score >= 0.6:
+        return best, best_via, best_score, best_src
+    return None, None, 0.0, "unmatched"
 
 
-def match_param(col_name, prefer_process=None):
-    """列名 -> 标准参数 key。
+def _match_one(col_name, prefer_process=None):
+    """列名 -> 标准参数 key 的**结构化**匹配结果（P1-3 核心）。
 
-    匹配优先级（关键：防止跨行业误匹配，例如把涂布的"不良率"错认成光伏 EL 不良率）：
-      1. 指定工序下的参数
-      2. 通用参数（process 为 null，如不良率/良率）
-      3. 全局兜底
+    返回带来源/候选/置信度/量纲风险/人工确认的记录，
+    裸 {列: key} 无法表达"这一列到底配得有多准"——这正是审计指出的缺口。
     """
     kb = load_knowledge()
     target = _norm_name(col_name)
     if not target:
-        return None
+        return {"key": None, "source": "unmatched", "matched_via": None,
+                "score": 0.0, "confidence": "unmatched", "candidates": [],
+                "unit_hint": _unit_hint(col_name), "unit_risk": False,
+                "confirmed": False, "policy_action": "accept"}
     params = kb["params"]
+    scopes = []
     if prefer_process:
-        r = _search_param(target, {k: v for k, v in params.items()
-                                   if v.get("process") == prefer_process})
-        if r:
-            return r
-    r = _search_param(target, {k: v for k, v in params.items()
-                               if v.get("process") is None})
-    if r:
-        return r
-    return _search_param(target, params)
+        scopes.append(("process_scoped",
+                       {k: v for k, v in params.items()
+                        if v.get("process") == prefer_process}))
+    scopes.append(("generic",
+                   {k: v for k, v in params.items()
+                    if v.get("process") is None}))
+    scopes.append(("global", params))
+
+    rec = None
+    cands = []
+    for scope_name, subset in scopes:
+        k, via, sc, src = _search_param(target, subset)
+        if k:
+            cands.append({"key": k, "score": round(sc, 3),
+                          "source": "exact" if src == "exact" else scope_name})
+            if rec is None:
+                rec = {"key": k, "source": "exact" if src == "exact" else scope_name,
+                       "matched_via": via, "score": sc, "candidates": None}
+    if rec is None:
+        rec = {"key": None, "source": "unmatched", "matched_via": None,
+               "score": 0.0, "candidates": None}
+    rec["candidates"] = sorted(cands, key=lambda x: -x["score"])[:3]
+    rec["unit_hint"] = _unit_hint(col_name)
+    rec["unit_risk"] = _unit_mismatch(rec, col_name, params)
+    rec["confidence"] = _confidence(rec)
+    # 量纲风险一律把置信度下调一级（high->medium, medium->low）
+    if rec["unit_risk"]:
+        rec["confidence"] = {"high": "medium", "medium": "low"}.get(
+            rec["confidence"], rec["confidence"])
+    rec["confirmed"] = False
+    rec["policy_action"] = "accept"
+    return rec
+
+
+def match_param(col_name, prefer_process=None):
+    """列名 -> 标准参数 key（向后兼容入口，只返回 key）。
+
+    完整结构化信息见 map_columns_detailed / _match_one。
+    """
+    return _match_one(col_name, prefer_process).get("key")
+
+
+# 低置信度映射的处理政策（P1-3 ②：低置信度必须可阻断，不能只能"猜了就用"）
+#   auto  ：保留所有最佳猜测，低置信列进 low_confidence（默认，不破坏现有可用性）
+#   review：同 auto，但低置信列标记 require_confirmation=True
+#   block ：低置信（confidence=low）直接判未匹配（key=None），强制人工补映射
+MAP_POLICY = "auto"
+
+
+def apply_map_policy(detailed, policy=MAP_POLICY):
+    """把结构化映射收敛成 {列: key}，并标记低置信列。
+
+    返回 (col_to_key, low_confidence_list)。policy 决定低置信列是
+    仅标注（auto/review）还是直接按未匹配处理（block）。
+    """
+    out, low = {}, []
+    for col, rec in detailed.items():
+        key = rec.get("key")
+        conf = rec.get("confidence")
+        action = "accept"
+        if policy == "block" and conf == "low":
+            key = None
+            action = "block"
+        elif conf == "low":
+            action = "review" if policy == "review" else "accept"
+            low.append({"col": col, "key": key, "confidence": conf,
+                        "source": rec.get("source"), "unit_risk": rec.get("unit_risk")})
+        out[col] = key
+        rec["policy_action"] = action
+    return out, low
+
+
+def map_columns_detailed(table, prefer_process=None):
+    """返回 {原列名: 结构化匹配记录}（P1-3 核心入口）。"""
+    return {c: _match_one(c, prefer_process) for c in table.columns}
 
 
 def detect_process(table, col_map=None):
@@ -244,17 +358,15 @@ def detect_process(table, col_map=None):
 
 
 def map_columns(table, prefer_process=None):
-    """返回 {原列名: 标准参数key or None}"""
-    out = {}
-    for c in table.columns:
-        out[c] = match_param(c, prefer_process)
-    return out
+    """返回 {原列名: 标准参数key or None}（向后兼容）。"""
+    return {c: r.get("key") for c, r in map_columns_detailed(table, prefer_process).items()}
 
 
 # ------------------------------------------------------------------ 清洗
 
 def clean(table, missing="drop_rows", outlier="mad", outlier_k=4.5,
-          use_physical=True, drop_dup=True, spec_override=None, log=None):
+          use_physical=True, drop_dup=True, spec_override=None, log=None,
+          prefer_process=None):
     """
     返回 (clean_table, report_dict)
     missing: drop_rows | keep | fill_mean | fill_median | fill_prev
@@ -263,8 +375,16 @@ def clean(table, missing="drop_rows", outlier="mad", outlier_k=4.5,
          清洗最大的风险是把真实异常当噪声删掉，所以删了什么必须能一条条查回来。
     """
     kb = load_knowledge()
+    # P1-3：映射不再是裸 {列: key}。这里把结构化映射（来源/候选/置信度/量纲风险）
+    # 一并交出去，并标出低置信列——下游据此决定是否阻断或要求人工确认。
+    _cmap_detailed = map_columns_detailed(table, prefer_process)
+    _cmap_keys, _low_conf = apply_map_policy(_cmap_detailed, "auto")
     rep = {"rows_in": len(table), "actions": [], "outliers": {},
-           "missing": {}, "physical_violations": {}, "col_map": map_columns(table)}
+           "missing": {}, "physical_violations": {},
+           "col_map": _cmap_keys,
+           "mapping_detail": {c: {k: v for k, v in r.items() if k != "candidates"}
+                             for c, r in _cmap_detailed.items()},
+           "low_confidence_mappings": _low_conf}
     tb = T.Table(table.columns, table.rows, table.name, table.source_path,
                  src_rows=getattr(table, "src_rows", None))
     if log is None:
