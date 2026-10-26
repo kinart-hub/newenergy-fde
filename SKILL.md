@@ -44,6 +44,8 @@ python scripts/fde_run.py audit --selftest            # 反向验证：故意破
 python scripts/fde_run.py verify                      # 质量闸门全套（含反向验证）
 python scripts/fde_run.py analyze -i <数据> -o <输出>   # 交付主流程（含 8D）
 python scripts/fde_run.py release                     # 闸门 + 分发包指纹
+python scripts/static_scan.py                         # 全库静态扫描（8 类检查一次扫穿）
+python scripts/sync_install.py --check                # 核对仓库与安装目录是否一致
 ```
 
 编排器用代码保证三件事，不靠自觉：
@@ -545,3 +547,36 @@ python lib/pipeline.py --input data.csv --spec spec.json
 ```
 `spec.json` 格式：`{"列名": {"lsl": 100, "usl": 110, "target": 105}}`
 有企业规格时优先用它，知识库典型值仅作兜底。
+
+## 维护者须知：改完代码之后的固定动作
+
+本 skill 有两处物理位置——**源仓库**（有 `.git`）与**安装目录**
+（`~/.workbuddy/skills/newenergy-fde`，运行时真正加载的地方）。
+只改一处会造成引用断链：文档说的入口在运行时根本不存在。
+
+```bash
+cd <源仓库>
+python scripts/sync_install.py --check      # 核对两处是否一致（不一致返回 2）
+python scripts/sync_install.py              # 同步（只做仓库→安装目录单向补齐）
+```
+
+**不要手工列清单 cp**——实测漏过 2 个文件，靠"安装目录扫描读数与仓库
+不一致"才发现，等于靠运气抓到的。改了哪些文件 git 已经知道，
+人不该再记一遍。
+
+全库排查（改任何 `lib/` 下的判定逻辑后必跑）：
+
+```bash
+python scripts/static_scan.py               # 8 类检查一次扫穿：静默吞异常 / 死代码 /
+                                            # 知识库悬空 / 参数透传 / 文档承诺 / 不可达分支 /
+                                            # 硬编码副本 / 跨模块调用签名
+python scripts/static_scan.py --only S1     # 只看某一类
+```
+
+报告里的「已豁免 N 条」是**决策**不是盲区：每条都在源码里写了
+`# scan:keep <理由>`。发现新的静默异常时，先判断它属哪一类：
+
+- **会让结论失真**（统计没覆盖异常路径、报错指向错误原因）→ 必须修
+- **刻意保留**（模块加载期、探测型容错、防递归）→ 加 `scan:keep` 写明理由
+
+豁免不是"让它消失"：豁免数会在扫描报告里单独列出，无理由的豁免扫描器不认。
