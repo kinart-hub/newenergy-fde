@@ -19,8 +19,27 @@ from . import stats as S
 from . import status as ST
 
 
+# 允许的关联度量方法。之所以要白名单而不是让 unknown 兜底成 pearson：
+# 实测 method="no_such" 时结果与 pearson 逐位相同、且无任何提示，
+# 使用者以为算了 spearman，拿到的是另一个统计量——这种错不会抛异常，
+# 只会在结论里安静地错下去。
+_SUPPORTED_METHODS = ("pearson", "spearman")
+_UNKNOWN_METHOD_MSG = ("不支持的关联度量方法「%s」，当前仅支持 %s"
+                       "（若写错，宁肯报错也不能静默换成另一种算法）")
+
+
+def _checked_method(method):
+    """校验 method 并返回规范写法；不支持的一律 ValueError，绝不静默兜底。"""
+    m = (method or "").strip().lower()
+    if m not in _SUPPORTED_METHODS:
+        raise ValueError(_UNKNOWN_METHOD_MSG % (method,
+                                                "、".join(_SUPPORTED_METHODS)))
+    return m
+
+
 def corr_matrix(table, columns=None, method="pearson"):
     """返回 {"columns":[...], "matrix":[[r]], "pvalues":[[p]]}"""
+    method = _checked_method(method)
     cols = columns or table.numeric_columns()
     cols = [c for c in cols if len([v for v in table.numeric_column(c) if v is not None]) >= 3]
     n = len(cols)
@@ -31,10 +50,14 @@ def corr_matrix(table, columns=None, method="pearson"):
         matrix[i][i] = 1.0
         pvals[i][i] = 0.0
         for j in range(i + 1, n):
+            # 分支显式穷举，不留 else 兜底：将来新增第三种算法时，
+            # 这里会因 r 未定义当场炸掉，而不是静默按 pearson 算完还标着新方法名。
             if method == "spearman":
                 r, p, _ = S.spearman(data[cols[i]], data[cols[j]])
-            else:
+            elif method == "pearson":
                 r, p, _ = S.pearson(data[cols[i]], data[cols[j]])
+            else:
+                raise ValueError(_UNKNOWN_METHOD_MSG % method)
             matrix[i][j] = matrix[j][i] = r
             pvals[i][j] = pvals[j][i] = p
     return {"columns": cols, "matrix": matrix, "pvalues": pvals, "method": method}
@@ -55,6 +78,32 @@ def association_with_target(table, target_col, exclude=None, method="pearson",
     """
     spec_limits = spec_limits or {}
     exclude = set(exclude or [])
+    # 参数一起校验完再开跑。实测这三档非法值此前全部静默通过：
+    #   method="no_such" -> 按 pearson 算完还标着新方法名
+    #   min_n=-5         -> 负数把"样本够不够"这道闸变成永真
+    #   alpha=-1 / 1e9   -> 显著性比较失去意义，结论照出
+    # 三者共同点：不报错、不改状态、只悄悄把结论弄错，所以必须在入口堵住。
+    try:
+        method = _checked_method(method)
+    except ValueError as exc:
+        return {"status": ST.FAILED, "target": target_col, "error": str(exc)}
+    if not isinstance(min_n, int) or isinstance(min_n, bool):
+        return {"status": ST.FAILED, "target": target_col,
+                "error": "min_n 必须为整数（当前 %r）；它是最小样本门槛，"
+                         "给非整数会让门槛失去意义" % (min_n,)}
+    if min_n < 2:
+        return {"status": ST.FAILED, "target": target_col,
+                "error": "min_n 必须 >= 2（当前 %r）；少于 2 个样本无法估计相关系数"
+                         % (min_n,)}
+    try:
+        alpha = float(alpha)
+    except (TypeError, ValueError):
+        return {"status": ST.FAILED, "target": target_col,
+                "error": "alpha 必须为数值（当前 %r）" % (alpha,)}
+    if not (0.0 < alpha < 1.0):
+        return {"status": ST.FAILED, "target": target_col,
+                "error": "alpha 必须落在 (0, 1) 开区间（当前 %r），"
+                         "越界的显著性水平会让 p 值比较失去意义" % (alpha,)}
     try:
         y_raw = table.numeric_column(target_col) or []
     except Exception as exc:
@@ -94,8 +143,10 @@ def association_with_target(table, target_col, exclude=None, method="pearson",
         if T.looks_numeric([p[0] for p in pairs]):
             if method == "spearman":
                 r, p, n = S.spearman([p[0] for p in pairs], [p[1] for p in pairs])
-            else:
+            elif method == "pearson":
                 r, p, n = S.pearson([p[0] for p in pairs], [p[1] for p in pairs])
+            else:
+                raise ValueError(_UNKNOWN_METHOD_MSG % method)
             if r is None:
                 continue
             strength = abs(r)

@@ -42,7 +42,6 @@
 
 import sys
 import threading
-import traceback
 
 _LOCK = threading.Lock()
 _LOG = []          # [{"where","kind","msg","stage","n","first_msg"}]

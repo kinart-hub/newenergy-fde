@@ -18,6 +18,10 @@ doe.py —— 试验设计（DOE）与参数寻优
 import math
 import itertools
 import re
+try:
+    from . import degrade          # 包模式
+except Exception:                  # 脚本模式无包上下文
+    import degrade                 # noqa
 from . import stats as S
 
 
@@ -723,7 +727,11 @@ def controlled_boundaries(factor_specs, spec_overrides=None, kb_control=None):
                     continue
                 try:
                     v = float(v)
-                except (TypeError, ValueError):
+                except (TypeError, ValueError) as _dg_e:
+                    # 控制限数值没法转成浮点 -> 这条边界被丢掉，而 rec["sources"]
+                    # 仍会写"知识库控制限"。下游会把边界当成已受控，实际是没受住。
+                    # DOE 边界错一项就可能把工艺推到设备允许范围之外，必须留痕。
+                    degrade.note("doe.controlled_boundaries@L728", _dg_e)
                     continue
                 if side == "min":
                     rec["min"] = v if rec["min"] is None else max(rec["min"], v)
@@ -765,12 +773,32 @@ def boundary_gate(bounds, plan_name="DOE 方案"):
     所以这里必须是 blocker 而不是 warning——warning 会被人顺手关掉，
     blocker 才会逼出那份受控规格文件。
     """
+    if bounds is None:
+        return {"ok": False, "plan_name": plan_name, "n_factors": 0,
+                "blockers": ["没有收到任何因子的边界数据（bounds=None）。"
+                             "零边界不等于「无约束」，等于「约束未知」，不能放行"],
+                "warnings": []}
+    if not isinstance(bounds, dict):
+        raise TypeError("bounds 必须是 {因子名: 边界记录} 字典，当前为 %s"
+                        % type(bounds).__name__)
+    if not bounds:
+        # 零因子判 ok=True 是这个门禁最容易被骗过去的地方：
+        # 上游只要返回空 dict（因子全被过滤、解析失败、传错参数），
+        # 这里就会为一份空方案盖上"边界受控"的章。约束未知 ≠ 无约束。
+        return {"ok": False, "plan_name": plan_name, "n_factors": 0,
+                "blockers": ["方案里没有任何因子（0 个受控边界）。"
+                             "可能是上游未产出因子，不能按无约束放行"],
+                "warnings": []}
     blockers, warns = [], []
-    for name, rec in (bounds or {}).items():
+    for name, rec in bounds.items():
+        if not isinstance(rec, dict):
+            blockers.append("因子「%s」的边界记录不是字典（%s），无法核验"
+                            % (name, type(rec).__name__))
+            continue
         for b in rec.get("blockers", []):
             blockers.append("因子「%s」：%s" % (name, b))
-        if rec["min"] is None or rec["max"] is None:
-            side = "下限" if rec["min"] is None else "上限"
+        if rec.get("min") is None or rec.get("max") is None:
+            side = "下限" if rec.get("min") is None else "上限"
             blockers.append("因子「%s」缺%s，无法确证试验水平落在受控窗口内"
                             % (name, side))
         if not rec.get("controlled"):
@@ -779,4 +807,4 @@ def boundary_gate(bounds, plan_name="DOE 方案"):
                          % (name, rec.get("confidence"),
                             "、".join(s["kind"] for s in rec.get("sources", [])) or "无来源"))
     return {"ok": not blockers, "blockers": blockers, "warnings": warns,
-            "n_factors": len(bounds or {})}
+            "plan_name": plan_name, "n_factors": len(bounds)}

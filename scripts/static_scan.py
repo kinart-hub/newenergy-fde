@@ -103,6 +103,12 @@ _KEPT = []        # 被 scan:keep 豁免的条目，与 findings 分开报
 # 前者是决策，后者是盲区。豁免必须带理由，无理由的豁免不予承认。
 KEEP_RE = re.compile(r"#\s*scan:keep\s+(\S.*)$")
 
+# 向上寻找 scan:keep 时最多回溯多少行。12 行足以覆盖一段完整的理由注释
+# （实测最长的一段是 4 行），又不至于把上一段代码的注释误认进来——
+# 中间一旦遇到真实代码行就会停。这里写死上限而不是无限回溯，
+# 是为了让"注释块偶然紧贴着上一行代码"时不会一路吃到文件头。
+_KEEP_LOOKUP = 12
+
 
 def _keep_reason(text, def_lineno):
     """取定义处附近的 scan:keep 理由（定义行本身或紧邻的前 3 行内）。"""
@@ -117,14 +123,37 @@ def _keep_reason(text, def_lineno):
 def _keep_reason_range(lines, lo_1based, hi_1based, pad=2):
     """按行区间取 scan:keep 理由（1 起行号，两端再外扩 pad 行）。
 
-    用 handler 的真实起止行而不是「except 行 ±3」：多行 handler
+    按 handler 的真实起止行而不是「except 行 ±3」：多行 handler
     （except + 若干行说明 + pass）按固定行数算会整个落在窗口外，
     豁免就静默失效——而豁免失效的后果是它又被报一遍，
     逼着人要么重复标注要么放弃使用豁免机制。
+
+    但光有真实行号还不够，这个坑**同一个文件踩过第三次**：
+    实测 lib/devices.py 里 `# scan:keep ……` 那一段注释写了 4 行，
+    handler 落在第 139 行，窗口按 pad=2 只覆盖到 137，
+    恰好把首行（唯一带 scan:keep 的那行）隔在外面 → 豁免失效。
+    根因是"注释有几行"不固定，用固定 pad 去猜注定要对错 blessed。
+    所以这里改成**向上吞掉整段连续注释**：只要上一行是注释或空行就继续上溯，
+    上限 _KEEP_LOOKUP 行防止极端情况失控。
     """
-    lo = max(0, lo_1based - 1 - pad)
-    hi = min(len(lines), hi_1based + pad)
-    for i in range(lo, hi):
+    # 向上：吞掉整段连续注释。注释行数不定，按行数是猜不准的，
+    # 所以一路吃到"非注释且非空行"为止。
+    up = lo_1based - 1          # 先取 handler 首行
+    i = up - 1
+    for _ in range(_KEEP_LOOKUP):
+        if i < 0:
+            break
+        raw = lines[i].strip()
+        if not raw or raw.startswith("#"):
+            up = i
+            i -= 1
+            continue
+        break                             # 撞到真正的代码行，停
+    # 主搜索：handler 的**整个行区间** + 下方 pad。
+    # 上一版只从 end_lineno 往下找 2 行，漏掉了"理由写在 handler 体内、
+    # 且在 pass 之前"的写法（lib/direction.py、lib/pipeline.py 都是这种），
+    # 于是明明写了理由照样被报。这里一次性覆盖整段，不再靠 pad 猜。
+    for i in range(up, min(len(lines), hi_1based + pad)):
         m = KEEP_RE.search(lines[i])
         if m:
             return m.group(1).strip()
@@ -139,18 +168,34 @@ def scan_silent_except():
       - 只有 pass / continue                    -> HIGH（彻底无声）
       - 有 pass 但同一 try 里有 else/finally 做补偿 -> 降级
       - 只有一句 print/日志                      -> MED（有痕但可能不足以定位）
+
+    !!! 这里踩过一个足以让整条规则失效的坑（2026-10-27 外部核查对拍发现）!!!
+    旧判据是 `if not isinstance(b, ast.Pass)`——只把 pass 当成"没做事"，
+    于是 `except Exception: continue` 的 handler body 里剩下一个 Continue 节点，
+    body 非空 → 直接跳过 → **这条规则看不见 continue 型的静默吞异常**。
+    实测：外部核查用独立脚本扫出 16 条无台账静默，本扫描器报 0 条，
+    两边差异几乎全落在这个盲区里。
+    更糟的是它不报错、"全库扫描未发现问题"照常打印——
+    **扫描器对自己的盲区保持安静，比没这个扫描器更危险。**
     """
     out = []
     for rel in _py_files():
         text = _read(rel)
         try:
             tree = ast.parse(text)
-        except SyntaxError:
+        except SyntaxError as _e:
+            # 这个文件解析不了 -> S1 对它一行都没检查。不写出来的话，
+            # "S1 未发现问题"会被读成"全库都没有静默吞异常"，实际漏了一整份文件。
+            # 审查工具不能对自己的漏检保持安静，所以这里必须显式留痕。
+            sys.stderr.write("[S1] 跳过无法解析的文件 %s：%r\n" % (rel, _e))
             continue
         for node in ast.walk(tree):
             if not isinstance(node, ast.ExceptHandler):
                 continue
-            body = [b for b in node.body if not isinstance(b, ast.Pass)]
+            # Pass 与 Continue 都代表"什么都不留下"，两者必须同等对待。
+            # 漏掉 Continue，循环里的静默吞异常就永远扫不出来。
+            body = [b for b in node.body
+                    if not isinstance(b, (ast.Pass, ast.Continue))]
             if body:
                 # 不是空 except：再看是不是只 print 了一句（有痕但弱）
                 continue
@@ -207,7 +252,10 @@ def _collect_defs():
         text = _read(rel)
         try:
             tree = ast.parse(text)
-        except SyntaxError:
+        except SyntaxError as _e:
+            # 解析不了的文件不会被收进 defs，它的函数名会被 S2 判成"定义了没调用"
+            # ——报的是这份文件根本没被看懂，不是真的没人调用，必须留痕区分。
+            sys.stderr.write("[S2] 跳过无法解析的文件 %s：%r\n" % (rel, _e))
             continue
         for node in ast.walk(tree):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -324,7 +372,10 @@ def scan_dangling_knowledge():
             continue
         try:
             data = json.loads(_read(os.path.join("knowledge", fn)) or "{}")
-        except Exception:
+        except Exception as _e:
+            # 知识库文件坏掉时 S3 直接跳过它：悬空/抢别名的检查对这份文件一行都没做，
+            # 输出却是"S3 无发现"。这类文件本身是运行时必崩的，越早露面越好。
+            sys.stderr.write("[S3] 跳过无法解析的知识库文件 %s：%r\n" % (fn, _e))
             continue
         dr = data.get("defect_rootcause") or {}
         if not dr:
@@ -547,7 +598,10 @@ def scan_unreachable():
         text = _read(rel)
         try:
             tree = ast.parse(text)
-        except SyntaxError:
+        except SyntaxError as _e:
+            # 解析不了 -> S6 对这份文件完全没跑，"没有不可达分支"的结论里
+            # 不含它。结论覆盖范围缺一角却看不出来，所以这里必须显式留痕。
+            sys.stderr.write("[S6] 跳过无法解析的文件 %s：%r\n" % (rel, _e))
             continue
         for node in ast.walk(tree):
             if isinstance(node, ast.If):
@@ -598,7 +652,10 @@ def scan_hardcoded_duplicate():
         text = _read(rel)
         try:
             tree = ast.parse(text)
-        except SyntaxError:
+        except SyntaxError as _e:
+            # 解析不了 -> S7 从没看过这份文件里的清单常量，"没有硬编码副本"
+            # 实际上没把它算进去。S7 以前就踩过两副本的坑，漏检不能静默。
+            sys.stderr.write("[S7] 跳过无法解析的文件 %s：%r\n" % (rel, _e))
             continue
         for node in tree.body:
             if not isinstance(node, ast.Assign):
@@ -657,7 +714,10 @@ def scan_call_signature():
         text = _read(rel)
         try:
             tree = ast.parse(text)
-        except SyntaxError:
+        except SyntaxError as _e:
+            # S8 靠各自文件的 AST 比对调用签名：某文件解析不了时，它既没有被检查，
+            # 也不会出现在对面文件的调用统计里，签名不匹配会被整体漏掉。必须留痕。
+            sys.stderr.write("[S8] 跳过无法解析的文件 %s：%r\n" % (rel, _e))
             continue
         for node in ast.walk(tree):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -673,7 +733,10 @@ def scan_call_signature():
         text = _read(rel)
         try:
             tree = ast.parse(text)
-        except SyntaxError:
+        except SyntaxError as _e:
+            # 别名表缺这一份文件 -> 该文件里的 <别名>.func(...) 调用不再被核对，
+            # S8 会报"签名匹配"，实际是这块从没比过。必须留痕。
+            sys.stderr.write("[S8] 跳过无法解析的文件 %s：%r\n" % (rel, _e))
             continue
         alias_map[rel] = {}
         for node in ast.walk(tree):

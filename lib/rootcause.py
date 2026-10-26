@@ -16,12 +16,9 @@ except Exception:                  # 脚本模式（python lib/pipeline.py）无
     import degrade                 # noqa
 import os
 import json
-import math
-from . import table as T
 from . import quality_guard as QG
 from . import stats as S
 from . import preprocess as PP
-from . import correlation as CORR
 from . import spc as SPC
 from . import status as ST
 from . import confound as CF
@@ -435,8 +432,29 @@ def rank_root_causes(defect_name, table, target_col=None, top=5,
       B. 数据驱动：实际数据里与目标显著相关、且角色为可调控因子的参数
     只留 A 会漏掉知识库没预设的真因（例如烘箱二区温度漂移）；
     只留 B 又会掉进"相关不等于因果"。所以两条都进候选，再按同一把尺子排序。
+
+    返回 dict 里**一定有 status**：此项 microstructure 不是装饰。
+    实测踩过的坑：喂一张空表进来，本函数照样吐出 3 条「机理支持」的候选、
+    score 排得整整齐齐，和喂真数据时长得一模一样——
+    使用者拿到的是一份看起来很专业的根因报告，而它背后一行数据都没有。
+    所以本函数必须自己说清"这次排序站在什么数据基础上"。
     """
     kb = _kb()
+    # 入参契约：缺缺陷名/缺表是**调用方的 bug**，不是"数据不足"。
+    # 若把它混成 INSUFFICIENT_DATA 返回，使用者会以为再喂点数据就能出来，
+    # 于是反复重试一条永远走不通的路。type 不同、处理动作不同，必须分开。
+    if not defect_name or not str(defect_name).strip():
+        raise ValueError("rank_root_causes 必须给出缺陷名称（defect_name）")
+    if table is None:
+        raise ValueError("rank_root_causes 必须给出数据表（table）")
+    if target_col is not None and (not isinstance(target_col, str)
+                                   or not target_col.strip()):
+        raise ValueError("target_col 必须是非空列名字符串或 None")
+    if not isinstance(top, int) or isinstance(top, bool):
+        raise TypeError("top 必须是整数")
+    if top <= 0:
+        raise ValueError("top 必须为正整数（当前 %r）；想要全部候选请传足够大的值" % top)
+
     info = kb["defect_rootcause"].get(defect_name)
     proc = process or (info or {}).get("process")
     if not info and not col_map:
@@ -554,6 +572,11 @@ def rank_root_causes(defect_name, table, target_col=None, top=5,
         return None
     cands.sort(key=lambda d: -d["score"])
     _annotate_evidence(cands, table, target_col, info or {})
+
+    # 数据充分性：**排序这件事本身**能不能站得住，和每条候选的证据，是两回事。
+    # 一条候选可以诚实地标着"机理支持"，但如果整张表只有两行，
+    # 那这份排序整体就不能被当成"本轮数据的结论"来读。
+    suf = _data_sufficiency(table, target_col, cands)
     return {
         "defect": defect_name,
         "process": proc,
@@ -564,7 +587,78 @@ def rank_root_causes(defect_name, table, target_col=None, top=5,
         "candidates": cands[:top],
         "all_candidates": cands,
         "history_cases": [hist[k] for k in hist],
+        "status": suf["status"],
+        "data_sufficiency": suf,
     }
+
+
+# 排序这件事本身所需的最低有效样本量。
+# 依据：n 小于此值时相关系数本身极不稳定（几个点就能摆出任意斜率），
+# 所谓"排序"实际是知识库先验的复读机，与数据无关。
+# 它不是统计学推出的精确门限，是「低于它就必须明着说站不住」的工程约定，
+# 所以写成具名常量，不允许在各处散落成字面量再各改各的。
+MIN_N_FOR_RANKING = 8
+
+
+def _data_sufficiency(table, target_col, cands):
+    """评估"本次排序"整体能否声称由本轮数据得出。
+
+    返回 {status, n_rows, n_effective, target_present, n_data_backed, reason}。
+    status 取值用 lib.status 统一枚举，不允许在这里自造第四种写法。
+    """
+    rows = 0
+    try:
+        rows = len(getattr(table, "rows", None) or [])
+    except Exception as exc:
+        degrade.note("rootcause.sufficiency@rows", exc)
+
+    target_present = False
+    if target_col:
+        try:
+            vals = table.numeric_column(target_col) or []
+            target_present = any(v is not None for v in vals)
+        except Exception as exc:
+            degrade.note("rootcause.sufficiency@target", exc)
+
+    n_effective = rows
+    if target_col and target_present:
+        try:
+            from . import stats as S
+            # 走 finite_list 而不是手写 `is not None`：
+            # NaN/inf 既不是 None 也不是有效观测值，行数会把它们算进去，
+            # 于是"180 行数据"里真正能用的可能只有 12 个。
+            n_effective = len(S.finite_list(table.numeric_column(target_col) or []))
+        except Exception as exc:
+            degrade.note("rootcause.sufficiency@finite", exc)
+
+    n_data_backed = sum(1 for c in (cands or []) if c.get("supported_by_data"))
+
+    if rows == 0:
+        return {"status": ST.INSUFFICIENT_DATA, "n_rows": 0, "n_effective": 0,
+                "target_present": False, "n_data_backed": 0,
+                "reason": "数据表为空（0 行），本次结果全部来自知识库先验，"
+                          "**不能当作这批数据的分析结论**"}
+    if not target_present:
+        return {"status": ST.INSUFFICIENT_DATA, "n_rows": rows, "n_effective": 0,
+                "target_present": False, "n_data_backed": n_data_backed,
+                "reason": "目标列「%s」在本轮数据里没有可用数值，"
+                          "所有候选均无法用数据验证" % (target_col or "未指定")}
+    if n_effective < MIN_N_FOR_RANKING:
+        return {"status": ST.INSUFFICIENT_DATA, "n_rows": rows,
+                "n_effective": n_effective, "target_present": True,
+                "n_data_backed": n_data_backed,
+                "reason": "有效样本仅 %d 个（低于 %d），相关系数不稳定，"
+                          "本次排序顺序不可靠，只能作线索清单用"
+                          % (n_effective, MIN_N_FOR_RANKING)}
+    if n_data_backed == 0:
+        return {"status": ST.NO_FINDING, "n_rows": rows, "n_effective": n_effective,
+                "target_present": True, "n_data_backed": 0,
+                "reason": "数据已够（%d 个有效样本），但没有任何候选拿到数据支持——"
+                          "真因可能不在知识库收录范围内，"
+                          "而不是「检查过、都不是原因」" % n_effective}
+    return {"status": ST.SUCCESS, "n_rows": rows, "n_effective": n_effective,
+            "target_present": True, "n_data_backed": n_data_backed,
+            "reason": ""}
 
 
 def _annotate_evidence(cands, table, target_col, info, confound_top=3):

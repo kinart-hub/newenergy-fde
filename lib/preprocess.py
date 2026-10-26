@@ -14,7 +14,6 @@ preprocess.py —— 工艺数据预处理
 import os
 import re
 import json
-import math
 import datetime
 from . import table as T
 from . import stats as S

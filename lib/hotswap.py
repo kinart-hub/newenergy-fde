@@ -30,6 +30,8 @@ except Exception:                  # 脚本模式（python lib/pipeline.py）无
     import degrade                 # noqa
 import io
 import os
+import threading
+import uuid
 import json
 import time
 
@@ -103,27 +105,55 @@ def atomic_write_text(path, text, retries=20, base_delay=0.01, max_delay=0.05):
     d = os.path.dirname(path)
     if d:
         os.makedirs(d, exist_ok=True)
-    tmp = "%s.tmp-%d" % (path, os.getpid())
+    key = os.path.abspath(path)
     last = None
-    for i in range(retries):
-        try:
-            with io.open(tmp, "w", encoding="utf-8") as f:
-                f.write(text)
-            os.replace(tmp, path)
-            _bump(path)
-            return path
-        except OSError as e:
-            last = e
-            # 只重试"只是撞上共享冲突"的情况：Windows errno 13 / WinError 5。
-            # 磁盘满、路径非法这类重试多少次都不会好，尽早把真错误抛给调用方，
-            # 免得把 ENOSPC 之类伪装成"并发冲突"拖上 20 次再报。
-            if e.errno not in (13, 5) and e.errno is not None:
-                _cleanup(tmp)
-                raise
-            # tmp 可能已生成但没换上，下一次重试会覆盖它
-            time.sleep(min(base_delay * (i + 1), max_delay) * (0.5 + random.random()))
-    _cleanup(tmp)
+    # 同一目标路径的写入必须串行。
+    # 这一段不是"加把锁求稳"，是修一个实测出来的撕裂缺陷：
+    # 临时名原先是 `<path>.tmp-<pid>`，**同进程多线程共用同一个 PID**，
+    # 于是线程 A 刚写到一半，线程 B 就把那个半成品 replace 成正品——
+    # 实测 8 线程 × 25 次写入，读到 70 次撕裂内容、6/8 写线程失败。
+    # 唯一临时名能让两人互不干扰，但这还不够：两人同时写、最后 replace 的次序
+    # 仍不可控，所以还需要串行化来保证"最后一次写入者赢"。
+    lock = _path_lock(key)
+    with lock:
+        # pid + 线程 id + 随机数三重唯一：pid 挡跨进程，tid 挡跨线程，
+        # 随机数挡"同一线程重入且 tid 相同"的边角。缺任一重都可能对撞。
+        tmp = "%s.tmp-%d-%d-%s" % (path, os.getpid(), threading.get_ident(),
+                                   uuid.uuid4().hex[:8])
+        for i in range(retries):
+            try:
+                with io.open(tmp, "w", encoding="utf-8") as f:
+                    f.write(text)
+                os.replace(tmp, path)
+                _bump(path)
+                return path
+            except OSError as e:
+                last = e
+                # 只重试"只是撞上共享冲突"的情况：Windows errno 13 / WinError 5。
+                # 磁盘满、路径非法这类重试多少次都不会好，尽早把真错误抛给调用方，
+                # 免得把 ENOSPC 之类伪装成"并发冲突"拖上 20 次再报。
+                if e.errno not in (13, 5) and e.errno is not None:
+                    _cleanup(tmp)
+                    raise
+                # tmp 可能已生成但没换上，下一次重试会覆盖它
+                time.sleep(min(base_delay * (i + 1), max_delay) * (0.5 + random.random()))
+        _cleanup(tmp)
     raise IOError("原子写失败（已重试 %d 次）：%s —— %s" % (retries, path, last))
+
+
+# 按目标路径分档的进程内写锁。全局字典本身也要一把锁，
+# 否则两个线程首次遇到同一路径会造出两把不同的锁，等于没锁。
+_WRITE_LOCKS = {}
+_WRITE_LOCKS_GUARD = threading.Lock()
+
+
+def _path_lock(key):
+    with _WRITE_LOCKS_GUARD:
+        lk = _WRITE_LOCKS.get(key)
+        if lk is None:
+            lk = threading.Lock()
+            _WRITE_LOCKS[key] = lk
+        return lk
 
 
 def _cleanup(tmp):

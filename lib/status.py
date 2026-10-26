@@ -126,6 +126,34 @@ def frame(status, method="", params=None, n_effective=None, input_digest=None,
     参数取 None 表示"本环节没这个概念"，不填 0 充数——0 是会被当成真值的。
     """
     st = normalize(status)
+    warns = list(warnings or [])
+    errs = list(errors or [])
+
+    # n_effective 必须校验，否则它是装饰而非判据。
+    # 实测：frame(SUCCESS, n_effective=-1 / "abc" / 1e18) 三个都返回 status=SUCCESS、
+    # errors 为空——一个声称成功、却连样本量都没看懂的结果，比报错更危险。
+    n_eff = n_effective
+    if n_effective is not None:
+        try:
+            n_val = int(n_effective)
+        except (TypeError, ValueError):
+            n_val = None
+        if n_val is None or n_val < 0:
+            st = normalize(FAILED)
+            n_eff = n_effective
+            errs.append("n_effective 非法（%r）：必须是非负整数，该次状态改判 FAILED"
+                        % (n_effective,))
+        elif n_val == 0:
+            n_eff = 0
+            # 声称成功却一个有效样本都没有，是内部矛盾；改成明确说"没有数据"，
+            # 而不是给出一个带着 SUCCESS 标签的空结论。
+            if st == SUCCESS:
+                st = INSUFFICIENT_DATA
+            warns.append("有效样本数为 0：本环节没有可用于下结论的数据，"
+                         "状态已按需保护为 %s" % describe(st))
+        else:
+            n_eff = n_val
+
     out = {
         "status": st,
         "status_text": describe(st),
@@ -133,10 +161,10 @@ def frame(status, method="", params=None, n_effective=None, input_digest=None,
         "must_disclose": must_disclose(st),
         "method": method,
         "params": dict(params or {}),
-        "n_effective": n_effective,
+        "n_effective": n_eff,
         "input_digest": dict(input_digest or {}),
-        "warnings": list(warnings or []),
-        "errors": list(errors or []),
+        "warnings": warns,
+        "errors": errs,
     }
     out.update(rest)
     return out

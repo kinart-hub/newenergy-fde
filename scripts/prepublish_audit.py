@@ -139,6 +139,9 @@ def scan():
         try:
             with open(full, encoding="utf-8") as f:
                 content = f.read()
+        # scan:keep 发布前审查只覆盖文本源码：二进制/非 UTF-8 产物（图片、字体、
+        # zip）不在 BLOCK_PATTERNS 的适用范围内，跳过是筛选而非降级。启用条件是
+        # 发布包里混入了二进制文件，属常态；这类跳过不影响任何分析能力。
         except (UnicodeDecodeError, OSError, IOError):
             continue      # 二进制或非 UTF-8：人工看，脚本不管
 
@@ -231,6 +234,81 @@ def selfcheck():
         if got != should_block:
             fails.append((text, should_block, got))
     return fails
+
+
+def check_manifest_coverage():
+    """部署清单完整性：manifest 说的必须和仓库实际一致。
+
+    外部核查实测：manifest.json 的 repository_files 只声明了 7 个根目录文档，
+    而仓库有 151 个受版本控制的文件——lib/、knowledge/、SKILL.md 全不在清单里。
+    后果很直接：照 manifest 打出来的离线部署包，一行代码都没有，装上跑不起来。
+    「文档说能离线部署」这件事当时是不成立的。
+
+    修法不是把数字改对（下次改代码还会漂），而是每次发布前让机器核：
+      - 运行时真正需要的文件没进清单        -> 阻断
+      - 清单声明了但仓库里没有（非 optional）-> 阻断
+      - optional 缺失                        -> 提醒
+    """
+    mpath = os.path.join(ROOT, "manifest.json")
+    if not os.path.exists(mpath):
+        return [("BLOCK", "manifest.json 不存在，无法核对部署清单")]
+    try:
+        import json as _json
+        m = _json.load(io.open(mpath, encoding="utf-8"))
+    except Exception as exc:
+        return [("BLOCK", "manifest.json 解析失败：%s" % exc)]
+
+    dep = m.get("deployment")
+    listed = m.get("repository_files")
+    if not isinstance(dep, dict) or not isinstance(listed, list):
+        return [("BLOCK",
+                 "manifest.json 缺 deployment/repository_files 结构，"
+                 "离线部署包无法按清单打包")]
+    optional = set(dep.get("optional") or [])
+    out = []
+
+    # --- 声明了却不存在 ---
+    ghost = [f for f in listed
+             if f not in optional and not os.path.exists(os.path.join(ROOT, f))]
+    if ghost:
+        out.append(("BLOCK",
+                    "部署清单声明了 %d 个仓库里没有的文件：%s%s"
+                    % (len(ghost), "、".join(ghost[:5]),
+                       " …" if len(ghost) > 5 else "")))
+
+    # --- 运行时必需却没进清单 ---
+    missing = []
+    for top in ("lib", "scripts", "knowledge"):
+        d = os.path.join(ROOT, top)
+        if not os.path.isdir(d):
+            continue
+        for dirpath, dirnames, filenames in os.walk(d):
+            dirnames[:] = [x for x in dirnames if x != "__pycache__"]
+            for fn in filenames:
+                if fn.endswith((".pyc", ".pyo", ".tmp", ".bak")):
+                    continue
+                rel = os.path.relpath(os.path.join(dirpath, fn), ROOT).replace("\\", "/")
+                if rel in optional:
+                    continue
+                if rel not in listed:
+                    missing.append(rel)
+    for f in ("SKILL.md",):
+        if os.path.exists(os.path.join(ROOT, f)) and f not in listed:
+            missing.append(f)
+    if missing:
+        out.append(("BLOCK",
+                    "有 %d 个运行时文件没进部署清单，离线包会缺件：%s%s"
+                    % (len(missing), "、".join(sorted(missing)[:5]),
+                       " …" if len(missing) > 5 else "")))
+
+    # --- optional 缺失只提醒 ---
+    absent_opt = [f for f in sorted(optional)
+                  if not os.path.exists(os.path.join(ROOT, f))]
+    if absent_opt:
+        out.append(("WARN",
+                    "清单里的可选文件（运行期按需生成）当前不存在：%s"
+                    % "、".join(absent_opt[:5])))
+    return out
 
 
 def check_required():
@@ -326,17 +404,29 @@ def main(argv=None):
 
     blocks, warns = scan()
     blocks.extend(check_library_hygiene())
+    fatal = list(blocks)
     for lvl, msg in check_doc_counts():
         if lvl == "BLOCK":
-            blocks.append(msg)
+            fatal.append({"file": os.path.join("README.md"), "line": 0,
+                          "rule": "文档自检数应与实测一致（手工维护必然漂移）",
+                          "hit": msg, "snippet": msg})
         else:
             warns.append({"file": os.path.join("README.md"), "line": 0,
                           "rule": "文档自检数应与实测一致（手工维护必然漂移）",
                           "hit": msg, "snippet": msg})
+    # 部署清单是"能不能离线装上就跑"的依据，不进这条就等于没保住离线可用性
+    for lvl, msg in check_manifest_coverage():
+        row = {"file": os.path.join("manifest.json"), "line": 0,
+               "rule": "离线部署清单必须与仓库实际一致",
+               "hit": msg, "snippet": msg}
+        if lvl == "BLOCK":
+            fatal.append(row)
+        else:
+            warns.append(row)
+
     miss_req, miss_rec = check_required()
 
     only_warnings = list(warns)
-    fatal = list(blocks)
 
     print("=" * 72)
     print("上架前审计")

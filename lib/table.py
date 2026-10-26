@@ -91,6 +91,9 @@ def parse_datetime(value):
                       "%Y%m%d %H:%M:%S", "%Y%m%d %H:%M", "%Y-%m-%dT%H:%M:%S"):
                 try:
                     return datetime.datetime.strptime(s, f)
+                # scan:keep 探测型容错：逐个日期格式试解是正常路径（"值不是日期"是
+                # 本函数的合法返回），这里每个单元格都被调用一次，逐次记账会把台账
+                # 刷爆；与同一文件 to_number@L125 的豁免同一理由，不是降级。
                 except ValueError:
                     continue
             return None
@@ -326,6 +329,9 @@ def detect_encoding(path):
             with io.open(path, "r", encoding=enc) as f:
                 f.read(65536)
             return enc
+        # scan:keep 探测型容错：逐个编码试解是正常路径；末位 latin-1 能解任意字节流，
+        # 所以"全失败、返回 utf-8 兜底"实际不可达。文件打不开属于 UnicodeDecodeError/
+        # LookupError 之外的错误（如权限），由调用侧 read_csv 自行报错并指向真原因。
         except (UnicodeDecodeError, LookupError):
             continue
     return "utf-8"

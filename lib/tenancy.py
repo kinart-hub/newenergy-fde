@@ -508,7 +508,10 @@ def list_promotions(status=None):
                 continue
             try:
                 r = json.loads(line)
-            except Exception:
+            except Exception as _dg_e:
+                # 上报表单是一条坏行就被静默跳过：审批方查到的"没有待审"其实可能
+                # 是"有一条坏了读不出来"。这是要人工决策的队列，丢一条必须可见。
+                degrade.note("tenancy.list_promotions@L509", _dg_e)
                 continue
             if status and r.get("status") != status:
                 continue

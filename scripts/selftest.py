@@ -29,7 +29,10 @@ except Exception:
 import io
 import math
 import glob
+import shutil
 import threading
+import tempfile
+import json
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
@@ -2372,6 +2375,188 @@ def test_confound_and_evidence():
               for c in hyp), "%d/%d 条假设" % (len(hyp), len(cands)))
 
 
+def test_concurrent_write_integrity():
+    """并发写不得撕裂（P2-1 隔离的数据完整性底座）。
+
+    这不是"理论上应该加把锁"，是外部核查实测出来的数据损坏：
+    临时文件原先叫 `<path>.tmp-<pid>`，同进程内**多线程共用同一 PID**，
+    于是线程 A 写到一半，线程 B 就把那个半成品 replace 成正品。
+    实测 8 线程 × 25 次写入：20 次读到的东西 json.load 直接失败、
+    70 次字段自相矛盾、6/8 写线程抛 OSError。
+
+    这里的判据不能只看"最后能不能解析"—— состояние 中途读到坏数据
+    同样会把结论带偏，而成品最终往往是好的。
+    """
+    import concurrent.futures as cf
+    from lib import hotswap as HS
+
+    d = tempfile.mkdtemp(prefix="fde_conc_")
+    target = os.path.join(d, "shared.json")
+    HS.atomic_write_json(target, {"v": 0, "pad": "y" * 200, "by": -1})
+    stop = threading.Event()
+    stat = {"reads": 0, "bad": 0}
+
+    def _writer(wid, n=25):
+        fails = []
+        for i in range(n):
+            try:
+                HS.atomic_write_json(target,
+                                     {"v": wid * 100 + i, "pad": "y" * 200, "by": wid})
+            except Exception as e:
+                fails.append("%s: %s" % (type(e).__name__, str(e)[:60]))
+        return fails
+
+    def _reader():
+        while not stop.is_set():
+            try:
+                with io.open(target, "r", encoding="utf-8") as f:
+                    raw = f.read()
+            except (FileNotFoundError, PermissionError):
+                # scan:keep 这是并发读者，读到"文件正被 replace 抢占"属预期竞争，
+                # 下一步立即重试；把它记成降级会把正常的 Windows 写锁竞争
+                # 报成故障，反而淹没真正的撕裂。真正的判据是下面的内容自洽校验。
+                continue
+            stat["reads"] += 1
+            try:
+                obj = json.loads(raw)
+            except Exception as e:
+                stat["bad"] += 1
+                stat.setdefault("why", []).append("解析失败 %s" % str(e)[:40])
+                continue
+            # 逐字段自洽：三个字段必须来自同一次写入者的同一次写入
+            if not (isinstance(obj.get("v"), int) and obj.get("pad") == "y" * 200
+                    and obj.get("by") in range(-1, 8) and len(obj) == 3):
+                stat["bad"] += 1
+                stat.setdefault("why", []).append(
+                    "字段矛盾 %s" % json.dumps(obj, ensure_ascii=False)[:60])
+
+    rt = threading.Thread(target=_reader, daemon=True)
+    rt.start()
+    fails = []
+    try:
+        with cf.ThreadPoolExecutor(max_workers=8) as ex:
+            for f in cf.as_completed([ex.submit(_writer, w) for w in range(8)]):
+                fails.extend(f.result())
+    finally:
+        stop.set()
+        rt.join(timeout=3)
+
+    check("并发写：8 线程全部写成功", not fails, str(fails[:2]))
+    check("并发写：读取samples确实发生过（测试不是空转）",
+          stat["reads"] > 100, "%d 次" % stat["reads"])
+    check("并发写：读取过程中不得出现损坏内容",
+          stat["bad"] == 0, "%d/%d 损坏 %s" % (stat["bad"], stat["reads"],
+                                               str(stat.get("why", [])[:2])))
+    try:
+        final = json.loads(io.open(target, encoding="utf-8").read())
+        ok_final = len(final) == 3
+    except Exception:
+        ok_final = False
+    check("并发写：最终成品结构完整", ok_final)
+    leftover = [p for p in os.listdir(d) if ".tmp" in p]
+    check("并发写：不得残留临时文件", not leftover, str(leftover))
+    shutil.rmtree(d, ignore_errors=True)
+
+
+def test_parameter_contracts():
+    """入口契约：非法参数必须报错/降级，不得静默产出结论。
+
+    这一组不是"防御性编程练习"，而是外部核查实测出来的四个真缺陷：
+      1. 空表喂进根因，照样吐出 3 条「机理支持」候选，和真数据长得一模一样
+      2. boundary_gate 收到零因子，判定"边界受控 ok=True"
+      3. status.frame 的 n_effective 完全不参与判定，负数也被当成样本正常
+      4. 关联算法写错名字，静默按 pearson 算完还标着新方法名
+    共同点：都不抛异常、都不改状态，只悄悄把结论弄错。
+    所以这里的每条检查都必须做到"把那段代码剥掉就会红"。
+    """
+    from lib import table as T
+    from lib import rootcause as RC
+    from lib import correlation as CORR
+    from lib import doe as D
+    from lib import status as ST
+
+    rows = [[i, 10 + 0.5 * i, 20 - 0.3 * i, float(i % 3)] for i in range(40)]
+    tb = T.Table(["序号", "A列", "B列", "班组"], rows)
+
+    def _raises(fn, exc):
+        try:
+            fn()
+            return False
+        except exc:
+            return True
+        except Exception:
+            return False
+
+    # ---- 1. 根因：数据不充分必须体现在顶层 status 上
+    empty = T.Table(["批次号", "涂布面密度"], [])
+    r = RC.rank_root_causes("面密度超差", empty, "涂布面密度",
+                            process="battery_coating", top=3)
+    check("契约：根因结果必须自带 status", bool(r and r.get("status")),
+          str((r or {}).get("status")))
+    check("契约：空表不得假装成有效结论",
+          r["status"] == ST.INSUFFICIENT_DATA, str(r["status"]))
+    check("契约：空表要给出人能读懂的原因",
+          "空" in (r["data_sufficiency"].get("reason") or ""),
+          str(r["data_sufficiency"].get("reason"))[:50])
+
+    few = T.Table(["序号", "批次号", "涂布面密度"],
+                  [[1, "A", 10.0], [2, "B", 11.0], [3, "C", 9.5]])
+    r2 = RC.rank_root_causes("面密度超差", few, "涂布面密度",
+                             process="battery_coating", top=3)
+    check("契约：样本过少时整体判为数据不足",
+          bool(r2) and r2["status"] == ST.INSUFFICIENT_DATA,
+          str((r2 or {}).get("status")))
+    check("契约：table 为 None 必须抛错而不是返回空结论",
+          _raises(lambda: RC.rank_root_causes("面密度超差", None, "x"), ValueError))
+    check("契约：缺陷名为空必须抛错",
+          _raises(lambda: RC.rank_root_causes("", tb, None), ValueError))
+    check("契约：top 非整数必须抛类型错",
+          _raises(lambda: RC.rank_root_causes("面密度超差", tb, None, top="3"), TypeError))
+
+    # ---- 2. DOE 边界门禁：零因子不得放行
+    g0 = D.boundary_gate({})
+    check("契约：零因子不得判边界受控", g0["ok"] is False, str(g0)[:70])
+    check("契约：零因子要给出阻断理由", bool(g0["blockers"]), str(g0["blockers"])[:60])
+    check("契约：边界为 None 同样阻断", D.boundary_gate(None)["ok"] is False)
+    check("契约：bounds 类型错误要抛 TypeError",
+          _raises(lambda: D.boundary_gate([None]), TypeError))
+
+    # ---- 3. status.frame 的样本量必须真参与判定
+    f_neg = ST.frame(ST.SUCCESS, n_effective=-1)
+    check("契约：负样本量必须改判 FAILED",
+          f_neg["status"] == ST.FAILED, str(f_neg["status"]))
+    f_zero = ST.frame(ST.SUCCESS, n_effective=0)
+    check("契约：零样本量不得保持 SUCCESS",
+          f_zero["status"] != ST.SUCCESS, str(f_zero["status"]))
+    f_str = ST.frame(ST.SUCCESS, n_effective="abc")
+    check("契约：非数值样本量必须改判 FAILED",
+          f_str["status"] == ST.FAILED, str(f_str["status"]))
+    check("契约：样本量非法时 errors 不得为空",
+          bool(f_str["errors"]), str(f_str["errors"])[:50])
+
+    # ---- 4. 关联算法白名单
+    bad = CORR.association_with_target(tb, "A列", method="no_such")
+    check("契约：未知关联算法必须报错而非静默兜底",
+          isinstance(bad, dict) and bad.get("status") == ST.FAILED, str(bad)[:60])
+    check("契约：未知算法的报错要说清支持哪些",
+          "pearson" in str(bad.get("error")), str(bad.get("error"))[:60])
+    check("契约：corr_matrix 未知算法抛 ValueError",
+          _raises(lambda: CORR.corr_matrix(tb, method="kendall"), ValueError))
+    check("契约：alpha 越界必须报错而非照算",
+          (CORR.association_with_target(tb, "A列", alpha=-1) or {}).get("status")
+          == ST.FAILED)
+    check("契约：min_n 非法必须报错而非照算",
+          (CORR.association_with_target(tb, "A列", min_n=-5) or {}).get("status")
+          == ST.FAILED)
+    check("契约：min_n 非整数必须报错",
+          (CORR.association_with_target(tb, "A列", min_n="3") or {}).get("status")
+          == ST.FAILED)
+    # 正常路径不能因为加了校验而坏掉
+    okm = CORR.corr_matrix(tb, method="spearman")
+    check("契约：校验不得破坏正常矩阵（值非 None）",
+          okm["matrix"][0][1] is not None, str(okm["matrix"][0][1]))
+
+
 def test_doe_safety_boundary():
     """P1-8 受控安全边界门禁（外部审计报告验收第 7 项）。
 
@@ -2548,6 +2733,8 @@ if __name__ == "__main__":
     test_status_and_lineage()
     test_confound_and_evidence()
     test_doe_safety_boundary()
+    test_parameter_contracts()
+    test_concurrent_write_integrity()
     test_tenant_path_guard()
     print("\n" + "=" * 56)
     print("通过 %d 项，失败 %d 项" % (len(PASS), len(FAIL)))

@@ -28,7 +28,10 @@
     - 只能检查"数据里带了这一列"的混杂；没采集的因素无从检查，
       这一条必须让使用者知道，否则"没检出混杂"会被读成"没有混杂"。
 """
-
+try:
+    from . import degrade          # 包模式
+except Exception:                  # 脚本模式无包上下文
+    import degrade                 # noqa
 from . import stats as S
 
 # 混杂列的识别按"字段名含义"而不是按行业写死列表：
@@ -86,7 +89,11 @@ def candidate_columns(table, exclude=None, max_levels=_MAX_LEVELS):
             continue
         try:
             vals = table.column(nm)
-        except Exception:
+        except Exception as _dg_e:
+            # 整列读不出来就整列跳过：混杂检查会把「取不到值」报成「这一列没有
+            # 分组信号」，而本模块的全部价值就是区分这两件事（见模块 docstring
+            # "只能检查数据里带了这一列的混杂"）。必须让原因出现在台账里。
+            degrade.note("confound.candidate_columns@L90", _dg_e)
             continue
         vs = [v for v in (vals or []) if v not in (None, "")]
         if not vs:

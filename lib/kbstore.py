@@ -23,7 +23,6 @@ except Exception:                  # 脚本模式（python lib/pipeline.py）无
     import degrade                 # noqa
 import io
 import json
-import math
 import os
 import re
 import copy
@@ -43,10 +42,6 @@ INBOX_FILE = os.path.join(KB_DIR, "inbox.jsonl")
 
 DEV_PROFILE_FILE = os.path.join(KB_DIR, "device_profiles.json")
 
-try:
-    from . import preprocess as PP
-except Exception:                       # 直接以脚本方式运行时回退
-    import preprocess as PP             # noqa
 try:
     from . import devices as DEV
 except Exception:
@@ -418,7 +413,10 @@ def load_candidates(status=None):
                 continue
             try:
                 rec = json.loads(line)
-            except Exception:
+            except Exception as _dg_e:
+                # 坏行被跳过 == 这条候选凭空消失：调用方看到的是"候选区没东西"，
+                # 而不是"有一行坏了"。候选是人工要审的，静默丢弃等于替人做了删除。
+                degrade.note("kbstore.load_candidates@L414", _dg_e)
                 continue
             if status and rec.get("status") != status:
                 continue
@@ -1191,7 +1189,10 @@ def harvest_from_analysis(result, table, min_corr=0.55, alias_min=0.985):
         try:
             var = sum((v - mean) ** 2 for v in vals) / (len(vals) - 1)
             cv = (var ** 0.5) / abs(mean)
-        except Exception:
+        except Exception as _dg_e:
+            # 这一列被吞掉后，harvest 的输出里它就跟"本来就不该推荐"长得一样，
+            # 知识库因此少收一条参数，且没有任何地方说明少的原因。
+            degrade.note("kbstore.harvest_from_analysis@L1189", _dg_e)
             continue
         hit = effect.get(c)
         if hit is None or abs(hit) < min_corr:

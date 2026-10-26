@@ -27,8 +27,6 @@ try:
     from . import degrade          # 包模式
 except Exception:                  # 脚本模式（python lib/pipeline.py）无包上下文
     import degrade                 # noqa
-import os
-import math
 
 from . import table as T
 from . import stats as S

@@ -133,6 +133,9 @@ def _head_meta_text(path, max_lines=12):
         for enc in ("utf-8-sig", "utf-8", "gbk", "gb18030", "latin-1"):
             try:
                 return raw.decode(enc)[:4000]
+            # scan:keep 探测型容错：逐个编码试解是正常路径，不是降级；末位 latin-1
+            # 能解任意字节流，所以"全部失败"实际不可达；真正的读失败（权限/被删）
+            # 由本函数外层 handler 记台账 devices._head_meta_text@L134。
             except (UnicodeDecodeError, LookupError):
                 continue
     except Exception as _dg_e:

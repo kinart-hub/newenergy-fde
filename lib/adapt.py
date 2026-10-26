@@ -19,17 +19,13 @@ try:
 except Exception:                  # 脚本模式（python lib/pipeline.py）无包上下文
     import degrade                 # noqa
 import re
-import os
-import json
 
 try:
     from . import table as T
     from . import preprocess as PP
-    from . import tenancy as TN
 except Exception:                        # 直接当脚本跑时回退
     import table as T                    # noqa
     import preprocess as PP              # noqa
-    import tenancy as TN                 # noqa
 
 
 _UNIT_IN_NAME = re.compile(r"[（(]([^)）]+)[)）]\s*$")
