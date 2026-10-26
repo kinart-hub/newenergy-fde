@@ -38,15 +38,34 @@ allowed-tools: Read, Write, Edit, Glob, Grep, Bash(python:*), AskUserQuestion
 
 ```bash
 cd <skill_dir>
-python scripts/fde_run.py audit                       # 约定落地核查（18 条硬判据）
-python scripts/fde_run.py audit --show-criteria       # 打印每条规则的判据
+python scripts/fde_run.py audit                       # 约定落地核查（规则数看输出，别记数字）
+python scripts/fde_run.py audit --show-criteria       # 打印每条规则的判据与变异清单
 python scripts/fde_run.py audit --selftest            # 反向验证：故意破坏，看规则喊不喊
 python scripts/fde_run.py verify                      # 质量闸门全套（含反向验证）
 python scripts/fde_run.py analyze -i <数据> -o <输出>   # 交付主流程（含 8D）
 python scripts/fde_run.py release                     # 闸门 + 分发包指纹
+python scripts/fde_run.py config                      # 可调参数清单（从代码与知识库读出）
+python scripts/fde_run.py config --init --input 数据.csv  # 按真实列名生成规格待填模板
 python scripts/static_scan.py                         # 全库静态扫描（8 类检查一次扫穿）
 python scripts/sync_install.py --check                # 核对仓库与安装目录是否一致
 ```
+
+**角色视角**：同一份结果，按使用者角色各出一份能直接用的东西。
+```bash
+python scripts/fde_run.py analyze -i 数据.csv -o out --view all
+#   process    工艺工程师：调哪个参数、统计证据、怎么验证
+#   shopfloor  现场技术：先去哪台/哪班看、核查顺序、可打印作业单（带手写栏）
+#   quality    质量管理：能不能发给客户（8D 完整性 + 证据链 + 红标）
+#   production 生产主管：批次处置建议表 + 处置判断记录（留痕）
+#   mgmt       客户/管理层：单页摘要，对外口径
+```
+视角层**只做筛选与措辞，不重算**——五个视角共用同一份 result.json，
+不存在五套结论各自漂移的风险。
+
+**`fde_run.py` 是唯一对外入口。** `lib/pipeline.py` 也能直接跑，但那是
+调试/编程集成用的内部形态（无子命令、无前置检查、无证据报告）。
+对外交付一律走编排器——它的参数透传是从 pipeline 的 argparse 定义
+**动态生成**的，pipeline 新增参数时编排器自动跟上，不存在两份清单。
 
 编排器用代码保证三件事，不靠自觉：
 
@@ -92,7 +111,7 @@ python scripts/sync_install.py --check                # 核对仓库与安装目
 
 ```bash
 cd <skill_dir>
-python lib/pipeline.py --input <数据文件> --outdir <输出目录> \
+python scripts/fde_run.py analyze --input <数据文件> --outdir <输出目录> \
        [--target <指标列>] [--process <工序key>] [--defect <缺陷类型>] \
        [--sheet <工作表名>] [--json result.json]
 ```
@@ -111,7 +130,7 @@ python lib/pipeline.py --input <数据文件> --outdir <输出目录> \
 多个文件（上游 + 本工序）一起传入时：
 
 ```bash
-python lib/pipeline.py --input 本工序数据.csv 上游数据.csv --outdir out
+python scripts/fde_run.py analyze --input 本工序数据.csv 上游数据.csv --outdir out
 ```
 
 **第一个文件被当作当前工序**，其余按知识库的工序链自动判定归属。文件里必须有
@@ -267,7 +286,7 @@ python scripts/kb_manage.py --tenant <企业id> devices --key <设备key> --enri
 **多企业部署**（云端必须带）：
 
 ```bash
-python lib/pipeline.py --input 导出.csv --tenant <企业id> --outdir out
+python scripts/fde_run.py analyze --input 导出.csv --tenant <企业id> --outdir out
 ```
 
 带 `--tenant` 后，知识库读取走「基线 + 该企业私有层」合并，
@@ -279,7 +298,7 @@ python lib/pipeline.py --input 导出.csv --tenant <企业id> --outdir out
 企业端配了行业之后，参数匹配、设备档案、改善案例都只在本行业内检索：
 
 ```bash
-python lib/pipeline.py --input 导出.csv --industry battery --outdir out   # 单次指定
+python scripts/fde_run.py analyze --input 导出.csv --industry battery --outdir out   # 单次指定
 python scripts/kb_manage.py --tenant A企业 tenants --industries battery    # 配给某企业（之后自动沿用）
 python scripts/kb_manage.py industries --show battery                      # 看该行业能检索到什么
 ```
@@ -329,11 +348,17 @@ python scripts/kb_manage.py upgrade --apply    # 确认后，才合并已审核�
    辐照度、组件温度本身不作为根因；若与目标高度相关，报告会提示核查测试台标定。
 6. **子串别名**：中文别名至少 3 字，英文别名至少 3 位且须为完整词，避免「Visc→isc」类误配。
 
-**已知限制（v1.10 尚未覆盖，遇到时须如实告知用户）**：
+**已知限制（遇到时须如实告知用户）**：
 
-- 缺陷事件表（一行一个缺陷、含坐标）的位置聚集性分析尚未实现，目前不做位置聚集结论；
 - 批号/隔膜批号等带后缀的编码不会自动派生供应商前缀分组，需由用户提供分组列；
-- 目标列在无企业规格、无指定目标时仍可能选错，报告中的目标列须向用户确认。
+- 目标列在无企业规格、无指定目标时仍可能选错，报告中的目标列须向用户确认；
+- 清洗策略（缺失值/离群值怎么处置）目前**没有命令行开关**，只能在代码里改。
+  `fde_run.py config` 里会把这条明确列出来，不要让人以为所有策略都能在命令行配。
+
+> 注：缺陷事件表（一行一个缺陷、含坐标）的**位置聚集性分析已实现**
+> （曝光加权 + BH 校正 + 二项精确检验，见 `lib/events.py` 与自检 P 组）。
+> 早期文档曾写「尚未实现」，已更正——照旧文档行事会漏掉这类结论，
+> 属于文档比代码旧导致的错误，不是能力缺失。
 
 **测试入口**（发布前或修改知识库后必跑）：
 
@@ -405,8 +430,8 @@ WorkBuddy Skill 里没有 GUI，所以"录入界面"的实际形态是**一份�
 ```
 
 ```bash
-python lib/pipeline.py -i a.csv -o out                 # 第 1 次：出骨架 + 空卡
-python lib/pipeline.py -i a.csv -o out --d2-card 卡.md  # 第 2 次：出完整 8D
+python scripts/fde_run.py analyze -i a.csv -o out                 # 第 1 次：出骨架 + 空卡
+python scripts/fde_run.py analyze -i a.csv -o out --d2-card 卡.md  # 第 2 次：出完整 8D
 ```
 
 **你要做的事**（这一步做不好，8D 就是废纸）：
@@ -543,7 +568,7 @@ python scripts/kb_manage.py backups / rollback --target specs --backup <文件�
 ## 企业规格的传入方式
 
 ```bash
-python lib/pipeline.py --input data.csv --spec spec.json
+python scripts/fde_run.py analyze --input data.csv --spec spec.json
 ```
 `spec.json` 格式：`{"列名": {"lsl": 100, "usl": 110, "target": 105}}`
 有企业规格时优先用它，知识库典型值仅作兜底。

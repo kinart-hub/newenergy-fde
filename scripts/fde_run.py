@@ -28,6 +28,8 @@ audit 的每条规则都带判据（criterion）和变异（mutants）。
 """
 
 import argparse
+import ast as _ast
+import collections
 import glob
 import hashlib
 import io
@@ -583,13 +585,17 @@ def _drop_line(needle):
     return f
 
 
-def _mutant(label, fn, target=None):
+def _mutant(label, fn, target=None, side_effect=False):
     """一个变异。target 缺省就用规则自己的目标文件。
 
     fn 返回 None = 这个变异在当前源码上做不出来（源码结构变了），
     自检必须把它记成 SKIP 暴露出来，而不是当成"验证通过"。
+
+    side_effect=True 表示这个变异靠**副作用**注入缺陷（比如往副本里
+    git add 一个私钥文件），文本本来就不需要改动。不声明的话，
+    自检的「替换没改动任何内容」检查会把它误判成变异写错了。
     """
-    return (label, fn, target)
+    return (label, fn, target, side_effect)
 
 
 # audit 规则会读到的文件。--selftest 只复制这些到临时目录做反向验证，
@@ -608,6 +614,7 @@ AUDIT_FILES = [
     os.path.join("lib", "tenancy.py"),
     os.path.join("lib", "eightd.py"),
     os.path.join("lib", "rootcause.py"),
+    os.path.join("lib", "views.py"),
     os.path.join("knowledge", "process_specs.json"),
 ]
 
@@ -995,6 +1002,8 @@ def rule_defect_refs_not_dangling():
 ROOTCAUSE_FILE = os.path.join("lib", "rootcause.py")
 EIGHTD_FILE = os.path.join("lib", "eightd.py")
 PIPELINE_FILE = os.path.join("lib", "pipeline.py")
+VIEWS_FILE = os.path.join("lib", "views.py")
+RUN_FILE = os.path.join("scripts", "fde_run.py")
 
 
 def rule_empty_data_must_stop():
@@ -1112,6 +1121,110 @@ def rule_no_dangling_verbose_hint():
     return _r(True, "", {"mentioned": len(mentioned), "registered": len(registered)})
 
 
+def rule_config_not_hardcoded():
+    """config 清单必须来自代码与知识库，不得硬编码一份副本。
+
+    「让使用者在一个地方看到所有可调参数」的价值完全取决于清单是不是真的。
+    手抄一份 CLI 开关清单、Nelson 规则表或清洗默认值，短期看着一样，
+    但代码一改清单就错——使用者照着调一个已经改名/已经失效的参数，
+    还以为生效了。这比没有清单更糟，因为它给了虚假的确定感。
+
+    另一条同等重要：规格模板的数值必须留空。拿行业典型区间填进 lsl/usl，
+    使用者很容易当成自己企业的规格直接下发——那正是
+    「用典型值算 Cpk 去答客户」这个坑最常见的入口。
+    """
+    t = _read(RUN_FILE) or ""
+    if not t:
+        return _r(False, "读不到 " + RUN_FILE)
+    if not re.search(r'^[ \t]+t = _read\(os\.path\.join\("lib", "spc\.py"\)\)',
+                     t, re.M):
+        return _r(False, "Nelson 规则集不是从 lib/spc.py 读出来的"
+                        "（硬编码副本会随规则调整而失同步）")
+    if not re.search(r'^[ \t]+t = _read\(os\.path\.join\("lib", '
+                     r'"preprocess\.py"\)\)', t, re.M):
+        return _r(False, "清洗策略默认值不是从 lib/preprocess.py 读出来的")
+    if not re.search(r'^[ \t]+item\["lsl"\] = None', t, re.M):
+        return _r(False, "规格模板的 lsl 不是 None——"
+                        "填了行业典型值会被当成企业规格下发")
+    if "flow_config" not in t:
+        return _r(False, "缺少 config 流程实现")
+    return _r(True, "", {"ok": True})
+
+
+def rule_view_disposition_safety():
+    """角色视角的处置建议必须守住 R1 四条责任约束。
+
+    批次处置涉及放行/隔离，给错了是要担责的。四条约束缺一不可：
+      1. 措辞是「建议」不是「判定」——决定权在人，工具只摆依据
+      2. 无数据依据的条目不进处置表——猜出来的建议不能出现在放行依据里
+      3. 未确审时继承红标，且红标写在正文不是脚注
+      4. 判断记录落盘——事后要能回答「当时依据什么做的决定」
+
+    本规则验的是第 2、4 条（可静态判定）；1、3 条靠 selftest 跑产物文本验。
+    """
+    t = _read(VIEWS_FILE) or ""
+    if not t:
+        return _r(False, "读不到 " + VIEWS_FILE)
+    for v in ("process", "shopfloor", "quality", "production", "mgmt"):
+        if ('"%s": view_%s' % (v, v)) not in t:
+            return _r(False, "视角 %s 未在 BUILDERS 里注册" % v)
+    # 无依据不进表
+    if not re.search(r"^[ \t]+if not ev and stat == ", t, re.M):
+        return _r(False, "处置建议表没有过滤掉无依据的条目——"
+                        "没依据的建议进了放行依据，责任说不清")
+    # 记录留痕
+    if "def write_disposition_record" not in t:
+        return _r(False, "缺少处置判断记录落盘函数")
+    if not re.search(r"^[ \t]+rec = write_disposition_record\(result, outdir\)",
+                     t, re.M):
+        return _r(False, "production 视角没有调用判断记录落盘")
+    # 视角层不得重算：它只能读 result，不能调 analyze
+    if re.search(r"^[ \t]+.*= analyze\(", t, re.M):
+        return _r(False, "视角层不得重新计算——五个视角各自算一遍会得出五套结论")
+    return _r(True, "", {"ok": True})
+
+
+def rule_entry_passthrough():
+    """统一入口必须透传 lib/pipeline.py 的全部参数，不许手写白名单。
+
+    三条判据各管一种退化：
+      1. 没走动态透传 → 任何人手抄清单都会随 pipeline 加参数而漏项；
+      2. 还留着旧白名单 → 两套机制并存时以哪个为准说不清；
+      3. specs 覆盖不全 → 动态读取本身有洞（比如只取了部分 add_argument）。
+
+    前车之鉴：白名单曾漏掉 --auto-adapt / --no-xlsx / --rules，
+    而 --auto-adapt 在 README 里有示例——使用者照文档换到统一入口，
+    命令照样跑通、只是那个能力静默没了。这类失效最难被发现：
+    不报错、不警告，只是少做一件事。
+    """
+    t = _read(RUN_FILE) or ""
+    if not t:
+        return _r(False, "读不到 " + RUN_FILE)
+    if not re.search(r"^[ \t]+cmd \+= passthrough_flags\(args, "
+                     r"pipeline_flag_specs\(\)\)", t, re.M):
+        return _r(False, "flow_analyze 没有用 passthrough_flags 动态透传"
+                        "（手写白名单必然随 pipeline 加参数而漏项）")
+    # 行首锚定 ^[ \t]+ 是必需的：本规则就在 RUN_FILE 自身里做文本搜索，
+    # 而不锚定的话会先命中下面这行判据自己写的 `for flag, val in \(`
+    # ——规则把自己判成 FAIL，且永远修不好。真代码的形态是
+    # `    for flag, val in (("--target", ...)):`，行首缩进后紧跟 for。
+    if re.search(r"^[ \t]+for flag, val in \(", t, re.M):
+        return _r(False, "仍存在手写的参数白名单 for flag, val in (...)")
+    # 判据 3 刻意做成**文本**判据而不是调用 pipeline_flag_specs()：
+    # 本规则的目标文件就是 fde_run.py 自身，而变异改的是临时副本里的文件，
+    # 规则进程里跑的 pipeline_flag_specs() 永远是原函数——调用它做判据，
+    # 等于用一个改不动的东西去验证"它坏了会怎样"，变异必然抓不到。
+    # 运行时是否真覆盖了 pipeline 的参数，由 selftest.py 跑 --help 差集来验证。
+    if not re.search(r"^[ \t]+specs\[flags\[0\]\] = ", t, re.M):
+        return _r(False, "specs 不是按 AST 遍历填充的——"
+                        "改成硬编码清单就会随 pipeline 加参数而失同步")
+    src = _read(PIPELINE_FILE) or ""
+    want = set(re.findall(r'add_argument\(\s*["\'](--[a-z][a-z0-9-]+)', src))
+    if not want:
+        return _r(False, "读不出 lib/pipeline.py 的参数定义，无法判定覆盖")
+    return _r(True, "", {"pipeline_flags": len(want)})
+
+
 def rule_defect_alias_index_used():
     """根因识别必须走「现场叫法 → 标准条目」的别名索引。
 
@@ -1133,7 +1246,11 @@ def rule_defect_alias_index_used():
     # 注意正则要精确到「行尾是冒号」的列匹配循环：hint 分支里也有一段
     # `for nn in _defect_alias_names(...)`（在 any(...) 里、后面跟 `)`），
     # 判据若不区分，改坏了列匹配它照样判过 —— 实测已被反向验证抓到一次。
-    called = re.search(r"for\s+nn\s+in\s+_defect_alias_names\(dk,\s*dv\):",
+    # 第二个参数不再写死 `dv`：v2.4 把列匹配收进了 _best_for(scope) 帮助函数，
+    # 遍历的是 scope[dk]。判据若继续咬死 `dk, dv`，源码一重构就永久 FAIL，
+    # 而 FAIL 的原因只是判据过时——那会让人去改对的源代码。
+    # 真正要守住的是**调用形态**：for nn in <别名集合>(...): 且行尾是冒号。
+    called = re.search(r"for\s+nn\s+in\s+_defect_alias_names\([^)]*\):",
                        body, re.M) is not None
     if not has_def:
         return _r(False, "缺少别名索引函数 _defect_alias_names 的定义")
@@ -1141,6 +1258,43 @@ def rule_defect_alias_index_used():
         return _r(False, "identify_defects 的列匹配未遍历别名集合"
                         "（现场叫法将对不上标准条目）")
     return _r(True, "", {"has_def": True, "called": True})
+
+
+def rule_defect_process_first():
+    """缺陷匹配必须按工序优先裁决，且借用别工序的条目要标出来。
+
+    实测抓到的真缺陷（不是假想）：identify_defects 收了 process 参数，
+    却只用在「数据驱动兜底」那一段，知识库命中这一段压根没看它。
+    于是「焊接不良」这种跨行业通用叫法，在「极耳焊接不良」(battery_winding)
+    与「虚焊」(pv_cell_el) 之间等长打平，谁赢全看 JSON 书写顺序。
+
+    判据落在三处调用形态上（缺一处就算断）：
+      1. 必须真的按 process 圈出本工序条目集合；
+      2. 裁决必须先在本工序集合里找、找不到才退回全局；
+      3. 退回全局命中的必须标 cross_process（否则报告层无从提示）。
+    """
+    t = _read(ROOTCAUSE_FILE) or ""
+    if not t:
+        return _r(False, "读不到 " + ROOTCAUSE_FILE)
+    body = _block(t, "def identify_defects(", "\ndef ")
+    if not body:
+        return _r(False, "读不出 identify_defects 函数体")
+    # 1. 本工序条目集合：必须由 process 圈定
+    if not re.search(r"in_proc\s*=\s*\{dk: dv for dk, dv in dr_all\.items\(\)\s*\n?"
+                     r"[^\n]*dv\.get\(\"process\"\) == process", body, re.S):
+        return _r(False, "没有按 process 圈出本工序条目集合——"
+                        "知识库命中会退化成全局按别名长度抢，跨工序别名等长时看 JSON 顺序")
+    # 2. 裁决顺序：本工序优先，全局兜底
+    if "for scope in (in_proc, dr_all):" not in body:
+        return _r(False, "裁决不是「本工序优先、全局兜底」的两段式")
+    # 3. 借用必须留痕
+    if "return best_dk, bool(process) and scope is dr_all" not in body:
+        return _r(False, "从全局兜底命中的条目没有标 cross_process——"
+                        "报告层无从提示「这条机理是借来的」")
+    # 4. 结果里必须把这个标记带出去，否则前面标了也没人用
+    if '"cross_process"' not in body:
+        return _r(False, "identify_defects 的返回里没有 cross_process 字段")
+    return _r(True, "", {"ok": True})
 
 
 def rule_response_defect_not_inherit():
@@ -1277,7 +1431,7 @@ AUDIT_RULES = [
          "LICENSE",
          # 判据落在 git 索引上，不在文件内容里：变异靠"在副本里 git init 并强制
          # 暂存 _private/signer_key.json"注入，target 只是给副本一个可写的落点。
-         [_mutant("仓库里暂存私钥文件", _git_add_secret)]),
+         [_mutant("仓库里暂存私钥文件", _git_add_secret, side_effect=True)]),
 
     Rule("CI 覆盖双平台且声明 UTF-8", rule_ci_matrix,
          "quality-gate.yml 必须同时含 ubuntu-latest / windows-latest / "
@@ -1426,8 +1580,8 @@ AUDIT_RULES = [
                   _re_sub(r"^def _defect_alias_names\(",
                           "def _defect_alias_names2(")),
           _mutant("identify_defects 里不再调用别名索引",
-                  _sub("for nn in _defect_alias_names(dk, dv):",
-                       "for nn in [PP._norm_name(dk)]:"))]),
+                  _re_sub(r"for\s+nn\s+in\s+_defect_alias_names\([^)]*\):",
+                          "for nn in [PP._norm_name(dk)]:"))]),
 
     Rule("响应型缺陷不得继承目标量别名", rule_response_defect_not_inherit,
          "param_key 指向结果指标（role=response 且非缺陷计量列）的缺陷条目，"
@@ -1504,6 +1658,70 @@ AUDIT_RULES = [
          [_mutant("提示里塞一个没注册的参数",
                   _re_sub(r"加 --verbose 看第 1 阶段读到几列",
                           "加 --debug-mode 看第 1 阶段读到几列"), PIPELINE_FILE)]),
+
+    Rule("config 清单不得硬编码副本、模板数值必须留空", rule_config_not_hardcoded,
+         "Nelson 规则集读 lib/spc.py、清洗默认值读 lib/preprocess.py；"
+         "规格模板的 lsl/usl/target 一律 None。"
+         "手抄清单会失同步，填了典型值会被当成企业规格下发",
+         RUN_FILE,
+         [_mutant("Nelson 规则改成硬编码列表",
+                  _re_sub(r'^[ \t]+t = _read\(os\.path\.join\("lib", "spc\.py"\)\) or ""',
+                          '    t = "NELSON_RULES = []"', flags=re.M), RUN_FILE),
+          _mutant("模板 lsl 填成行业典型值",
+                  _sub('item["lsl"] = None', 'item["lsl"] = 1'), RUN_FILE)]),
+
+    Rule("角色视角的处置建议必须守住责任约束", rule_view_disposition_safety,
+         "五视角全部注册；无依据条目不得进处置表；判断记录必须落盘；"
+         "视角层不得重算（五套结论各自漂移比没有视角更糟）",
+         VIEWS_FILE,
+         [_mutant("无依据条目也进处置表",
+                  _re_sub(r"^[ \t]+if not ev and stat == .*$",
+                          "        pass", flags=re.M), VIEWS_FILE),
+          _mutant("判断记录不再落盘",
+                  _re_sub(r"^[ \t]+rec = write_disposition_record\(result, outdir\)",
+                          "        rec = None", flags=re.M), VIEWS_FILE)]),
+
+    Rule("统一入口必须透传 pipeline 的全部参数", rule_entry_passthrough,
+         "flow_analyze 用 pipeline_flag_specs() 动态透传，不许手写白名单；"
+         "specs 必须覆盖 lib/pipeline.py 源码里的每一个 add_argument 长选项。"
+         "前车之鉴：白名单曾漏掉 --auto-adapt/--no-xlsx/--rules，"
+         "使用者换到统一入口后静默少做一件事（不报错，只是能力没了）",
+         RUN_FILE,
+         [_mutant("透传改成空（参数全部丢弃）",
+                  _re_sub(r"^[ \t]+cmd \+= passthrough_flags\(args, pipeline_flag_specs\(\)\)",
+                          "        cmd += []"), RUN_FILE),
+          _mutant("退回手写白名单（必然漏项）",
+                  _re_sub(r"^[ \t]+cmd \+= passthrough_flags\(args, pipeline_flag_specs\(\)\)",
+                          '        for _f in ("--target", "--process", "--defect"):\n'
+                          '            cmd += [_f, "x"]'), RUN_FILE),
+          _mutant("specs 改成空（参数一个都读不到）",
+                  _re_sub(r"^[ \t]+specs\[flags\[0\]\] = \{.*?\}",
+                          "        continue",
+                          flags=re.M | re.S), RUN_FILE)]),
+
+    Rule("缺陷匹配必须按工序优先裁决，不得只看别名长度", rule_defect_process_first,
+         "identify_defects 命中知识库条目时，必须先在本工序条目里裁决、"
+         "本工序没命中才退回全局，并把借用的条目标 cross_process。"
+         "为什么必须这样：process 参数原先只用在数据驱动兜底那一段，"
+         "知识库命中压根不看它。于是光伏 EL 数据里出现「焊接不良」列时，"
+         "「极耳焊接不良」(battery_winding) 与「虚焊」(pv_cell_el) 别名等长，"
+         "谁赢全看 JSON 书写顺序 —— 可能把光伏串焊缺陷判成锂电池超声焊问题，"
+         "根因指向焊接功率/压力/时间。跨行业串机理比「未收录」危险得多："
+         "它看起来很专业，没人会怀疑它。",
+         ROOTCAUSE_FILE,
+         [_mutant("裁决退回只看别名长度、不看工序",
+                  _re_sub(r"^[ \t]+for scope in \(in_proc, dr_all\):",
+                          "        for scope in (dr_all,):",
+                          flags=re.M), ROOTCAUSE_FILE),
+          _mutant("本工序条目集合置空（工序优先形同虚设）",
+                  _re_sub(r"^[ \t]+in_proc = \{dk: dv for dk, dv in dr_all\.items\(\)",
+                          "        in_proc = {}  # 变异：不再按工序圈定\n"
+                          "        _unused = {dk: dv for dk, dv in dr_all.items()",
+                          flags=re.M), ROOTCAUSE_FILE),
+          _mutant("借用的条目不再标记 cross_process",
+                  _re_sub(r"^[ \t]+return best_dk, bool\(process\) and scope is dr_all",
+                          "        return best_dk, False",
+                          flags=re.M), ROOTCAUSE_FILE)]),
 ]
 
 
@@ -1569,7 +1787,7 @@ def _selftest_one(no, rule, tmp):
                     "<mutate>", tmp, 0, time.time() - t0, [], True,
                     {"baseline_pass": base_ok, "variants": []})
 
-    for label, mfn, mtarget in rule.mutants:
+    for label, mfn, mtarget, m_side in rule.mutants:
         tgt = mtarget or rule.target
         if not tgt:
             variants.append({"label": label, "result": "SKIP",
@@ -1593,6 +1811,14 @@ def _selftest_one(no, rule, tmp):
                              "detail": (detail_err or
                                         "变异在当前源码上做不出来——源码结构变了，"
                                         "判据已经跟代码脱节")})
+            continue
+        if new == orig and not m_side:
+            # 替换没改动任何字符。这和「判据抓不到」是两回事：
+            # 前者是变异写错了（正则没命中），后者才是规则真的瞎了。
+            # 混在一起报会把排查方向带偏——实测为此白查了一轮规则判据。
+            variants.append({"label": label, "result": "SKIP",
+                             "detail": "变异没改动任何内容（正则没命中源码），"
+                                       "这条判据本次未经验证"})
             continue
         try:
             with io.open(p, "w", encoding="utf-8") as f:
@@ -1741,6 +1967,314 @@ def flow_release(args):
     return finish("发布流程", steps, args.report, started=started)
 
 
+# 编排器自己接管的参数：不透传，由编排器决定取值
+#   --input/--outdir 编排器自己解析后拼进命令行
+#   --json           编排器固定写到 <outdir>/result.json，后续步骤依赖这个路径
+_ORCH_OWNED_FLAGS = {"--input", "--outdir", "--json", "--help"}
+
+
+def pipeline_flag_specs():
+    """读 lib/pipeline.py 的 argparse 定义，返回它能接受的全部参数。
+
+    为什么不在这里手抄一份清单：手抄的清单必然失同步——
+    pipeline 加一个参数，fde_run 就少透传一个，而使用者换到统一入口
+    会以为能力还在。实测已因此漏了 4 个：
+    --auto-adapt（README 里有示例）、--json、--no-xlsx、--rules（Nelson 规则集）。
+    漏了的表现不是报错，是静默少做一件事——最难发现的那种。
+    """
+    path = os.path.join(ROOT, "lib", "pipeline.py")
+    specs = {}
+    try:
+        tree = _ast.parse(io.open(path, encoding="utf-8").read())
+    except Exception:
+        return specs                      # 读不出来就退化成不透传，不阻塞主流程
+    for node in _ast.walk(tree):
+        if not isinstance(node, _ast.Call):
+            continue
+        fn = node.func
+        if not (isinstance(fn, _ast.Attribute) and fn.attr == "add_argument"):
+            continue
+        flags = [a.value for a in node.args
+                 if isinstance(a, _ast.Constant)
+                 and isinstance(a.value, str) and a.value.startswith("--")]
+        if not flags:
+            continue
+        store, nargs, help_txt, default = False, None, "", None
+        for kw in node.keywords:
+            if kw.arg == "action" and isinstance(kw.value, _ast.Constant):
+                store = (kw.value.value == "store_true")
+            if kw.arg == "nargs" and isinstance(kw.value, _ast.Constant):
+                nargs = kw.value.value
+            if kw.arg == "help" and isinstance(kw.value, _ast.Constant):
+                help_txt = str(kw.value.value)
+            if kw.arg == "default":
+                # default 可能是 os.environ.get("X")，那种记为「环境变量可覆盖」，
+                # 不假装它是个固定值——config 清单里要如实标出来
+                if isinstance(kw.value, _ast.Constant):
+                    default = kw.value.value
+                else:
+                    try:
+                        default = "<%s>" % _ast.unparse(kw.value)
+                    except Exception:
+                        default = "<动态取值>"
+        specs[flags[0]] = {"flags": flags, "store": store, "nargs": nargs,
+                           "help": help_txt, "default": default}
+    return specs
+
+
+def passthrough_flags(args, specs):
+    """把 args 里属于 pipeline 的参数还原成命令行片段。"""
+    cmd = []
+    for name in sorted(specs):
+        if name in _ORCH_OWNED_FLAGS:
+            continue
+        key = name[2:].replace("-", "_")
+        val = getattr(args, key, None)
+        if val is None or val is False:
+            continue
+        if specs[name]["store"]:
+            cmd.append(name)
+        elif isinstance(val, (list, tuple)):
+            cmd += [name] + [str(v) for v in val]
+        else:
+            cmd += [name, str(val)]
+    return cmd
+
+
+def _nelson_block():
+    """Nelson 规则集——读 lib/spc.py 的常量，不在这里抄一份。"""
+    t = _read(os.path.join("lib", "spc.py")) or ""
+    out = []
+    m = re.search(r"^NELSON_RULES = \[(.*?)^\]", t, re.M | re.S)
+    if m:
+        for line in m.group(1).splitlines():
+            mm = re.match(r"^\s*\((\d+),\s*[\"'](.+?)[\"'],", line)
+            if mm:
+                out.append((mm.group(1), mm.group(2)))
+    return out
+
+
+def _clean_defaults():
+    """清洗策略的默认值——读 lib/preprocess.py clean() 的签名。"""
+    t = _read(os.path.join("lib", "preprocess.py")) or ""
+    m = re.search(r"^def clean\(table,(.*?)\):", t, re.M | re.S)
+    if not m:
+        return {}
+    out = {}
+    for mm in re.finditer(r"(\w+)\s*=\s*([\"'])(.+?)\2", m.group(1)):
+        out[mm.group(1)] = mm.group(3)
+    return out
+
+
+def flow_config(args):
+    """打印可调参数清单 / 生成企业规格模板。
+
+    清单的每一块都从**代码与知识库**里读出来，不手抄一份副本——
+    手抄的清单必然失同步，而失同步的清单比没有清单更糟：
+    使用者照着它调了一个早就改名或早就失效的参数，还以为生效了。
+
+    同样重要的是**如实标出调不了的项**（如清洗策略目前没有 CLI 开关），
+    而不是只列能调的让人以为全都可配。
+    """
+    print("=" * 68)
+    print("可调参数清单（来源：代码与知识库，非手工维护的副本）")
+    print("=" * 68)
+
+    # 一、命令行开关
+    specs = pipeline_flag_specs()
+    print("\n【一】命令行开关（读自 lib/pipeline.py 的 argparse 定义）")
+    if not specs:
+        print("  （读不到 lib/pipeline.py 的参数定义，本块为空）")
+    for name in sorted(specs):
+        if name in _ORCH_OWNED_FLAGS:
+            continue
+        sp = specs[name]
+        tail = ""
+        if sp["default"] not in (None, ""):
+            tail = "  默认=%s" % sp["default"]
+        print("  %s%s" % (name, " <值>" if not sp["store"] else ""))
+        if sp["help"]:
+            print("      %s%s" % (sp["help"], tail))
+
+    # 二、Nelson 规则集
+    print("\n【二】Nelson 判异规则集（读自 lib/spc.py NELSON_RULES）")
+    print("  预设名：1,2,3,5（默认基本集）/ all / basic / shift / trend")
+    print("  用法：--rules all        （也可用环境变量 FDE_SPC_RULES）")
+    for no, desc in _nelson_block():
+        print("    %s  %s" % (no, desc))
+
+    # 三、清洗策略——如实说明当前调不了
+    cd = _clean_defaults()
+    print("\n【三】清洗策略（读自 lib/preprocess.py clean() 的默认值）")
+    if cd:
+        for k in ("missing", "outlier"):
+            if k in cd:
+                print("  %s：当前 %s" % (k, cd[k]))
+    print("  ⚠ 这两项目前**没有命令行开关**，只能在代码里改。")
+    print("    清单里如实写出来，是不想让人误以为所有策略都能在命令行配。")
+
+    # 四、企业规格
+    print("\n【四】企业规格 --spec")
+    print("  格式：{\"列名\": {\"lsl\": 下限, \"usl\": 上限, \"target\": 目标}}")
+    print("  生成待填模板：python scripts/fde_run.py config --init")
+    print("  ⚠ 模板里的行业典型区间仅供对照，**不是**贵司规格——")
+    print("    用典型值算 Cpk 去答客户是错的，必须填受控规格书的数值。")
+
+    # 五、知识库
+    kb_path = os.path.join("knowledge", "process_specs.json")
+    print("\n【五】知识库可调项")
+    try:
+        kb = json.load(io.open(os.path.join(ROOT, kb_path), encoding="utf-8"))
+        print("  工序 %d 个 / 参数 %d 个 / 缺陷条目 %d 条"
+              % (len(kb.get("processes") or {}), len(kb.get("params") or {}),
+                 len(kb.get("defect_rootcause") or {})))
+    except Exception as e:
+        print("  （读不到 %s：%s）" % (kb_path, e))
+    print("  改知识库走 kb_manage.py（propose → review → sync），")
+    print("  不要直接编辑 JSON——直接改没有备份、没有版本、没有审核记录。")
+
+    if not args.init:
+        print("\n" + "=" * 68)
+        print("加 --init 生成企业规格待填模板")
+        return 0
+    return _config_init(args)
+
+
+def _config_init_from_data(args, path, params, tpl, kb):
+    """按数据文件里的真实列名生成规格模板。
+
+    键名直接取数据列名，保证 match_spec_key 一定对得上——
+    模板的价值取决于它能不能生效，而不是看起来全不全。
+    """
+    if not os.path.exists(path):
+        print("\n生成失败：数据文件不存在：%s" % path)
+        return 1
+    try:
+        sys.path.insert(0, ROOT)
+        from lib import table as T
+        from lib import preprocess as PP
+        tb = T.read_any(path, getattr(args, "sheet", None))
+        if isinstance(tb, list):
+            tb = tb[0]
+        cols = list(tb.columns or [])
+    except Exception as e:
+        print("\n生成失败：读不出数据列名（%s）" % e)
+        return 1
+    if not cols:
+        print("\n生成失败：%s 里没读到列名" % path)
+        return 1
+
+    tpl["_说明"] = ("企业规格模板（按 %s 的实际列名生成，共 %d 列）。"
+                    "lsl/usl/target 填贵司受控规格书数值；留 null 或删掉整条"
+                    "表示不参与 Cpk 判定。" % (os.path.basename(path), len(cols)))
+    n_known = 0
+    for c in cols:
+        pk = None
+        try:
+            pk = PP.match_param(c)
+        except Exception:
+            pk = None
+        pv = params.get(pk) or {} if pk else {}
+        item = collections.OrderedDict()
+        item["lsl"] = None
+        item["usl"] = None
+        item["target"] = None
+        if pv.get("typical_range"):
+            item["_行业典型区间（仅参考，不是规格）"] = pv["typical_range"]
+        if pv.get("unit"):
+            item["_单位"] = pv["unit"]
+        item["_识别为"] = (pv.get("name") or pk) if pk else "未识别——不影响使用，填了就能生效"
+        if pk:
+            n_known += 1
+        tpl[c] = item
+    out = args.out or "spec_template.json"
+    try:
+        io.open(out, "w", encoding="utf-8").write(
+            json.dumps(tpl, ensure_ascii=False, indent=2))
+    except Exception as e:
+        print("\n写模板失败：%s" % e)
+        return 1
+    print("\n已生成 %s（%d 列，其中 %d 列识别到知识库参数）"
+          % (out, len(cols), n_known))
+    print("下一步：按贵司受控规格书填 lsl/usl/target，"
+          "然后 analyze --spec %s" % out)
+    return 0
+
+
+def _config_init(args):
+    """生成企业规格模板。
+
+    值一律留空：填了行业典型区间的值，使用者很容易当成自己企业的规格
+    直接下发——那正是「用典型值答客户」这个坑最常见的入口。
+    典型区间放在 _参考 字段里，且键名带下划线前缀表明它不是规格。
+    """
+    kb_path = os.path.join(ROOT, "knowledge", "process_specs.json")
+    try:
+        kb = json.load(io.open(kb_path, encoding="utf-8"))
+    except Exception as e:
+        print("\n生成失败：读不到知识库（%s）" % e)
+        return 1
+    params = kb.get("params") or {}
+    proc = getattr(args, "process", None)
+    tpl = collections.OrderedDict()
+    tpl["_用法"] = ("python scripts/fde_run.py analyze --input 数据.csv "
+                    "--spec 规格.json --outdir out")
+    tpl["_怎么确认生效"] = ("跑完后看报告里该列的 spec_source 字段："
+                        "是「企业规格书」才算生效；"
+                        "仍是「知识库推定」说明这一条没对上，"
+                        "规格书静默失效而不报错——这是最容易踩的坑。")
+
+    # 给 --input 时按**数据里的真实列名**生成。
+    # 这不是锦上添花：spec 的匹配是列名归一化后比对，模板键名与数据列名
+    # 对不上就整份静默失效（Cpk 退回数据分布兜底，数字失真而企业以为用的是
+    # 自己的规格）。按知识库的别名生成，撞对的概率很低。
+    inputs = getattr(args, "input", None) or []
+    if inputs:
+        return _config_init_from_data(args, inputs[0], params, tpl, kb)
+
+    tpl["_说明"] = ("企业规格模板（按知识库参数生成）。lsl/usl/target 必须填贵司"
+                    "受控规格书的数值；留 null 表示不参与 Cpk 判定。"
+                    "⚠ 键名必须改成**你数据里的实际列名**，否则整份规格静默失效"
+                    "——更推荐用 --input 数据文件 直接按真实列名生成。")
+    n = 0
+    for key in sorted(params):
+        pv = params[key] or {}
+        if proc and pv.get("process") != proc:
+            continue
+        aliases = pv.get("aliases") or []
+        col = aliases[0] if aliases else pv.get("name") or key
+        item = collections.OrderedDict()
+        item["lsl"] = None
+        item["usl"] = None
+        item["target"] = None
+        rng = pv.get("typical_range")
+        if rng:
+            item["_行业典型区间（仅参考，不是规格）"] = rng
+        if pv.get("unit"):
+            item["_单位"] = pv["unit"]
+        if aliases:
+            item["_也叫"] = aliases[:8]
+        tpl[col] = item
+        n += 1
+    if proc and n == 0:
+        print("\n没有属于工序「%s」的参数。可不加 --process 生成全量模板。" % proc)
+        return 1
+    out = args.out or "spec_template.json"
+    try:
+        d = os.path.dirname(os.path.abspath(out))
+        if d:
+            os.makedirs(d, exist_ok=True)
+        io.open(out, "w", encoding="utf-8").write(
+            json.dumps(tpl, ensure_ascii=False, indent=2))
+    except Exception as e:
+        print("\n写模板失败：%s" % e)
+        return 1
+    print("\n已生成 %s（%d 个参数条目，数值留空待填）" % (out, n))
+    print("下一步：按贵司受控规格书填 lsl/usl/target，"
+          "然后 analyze --spec %s" % out)
+    return 0
+
+
 def flow_analyze(args):
     started = time.time()
     outdir = os.path.abspath(args.outdir)
@@ -1762,20 +2296,11 @@ def flow_analyze(args):
     steps.append(run_check("1. 环境预检", env_check))
     steps.append(run_check("2. 残留锁清理", check_stale_locks))
 
+    # 透传清单由 lib/pipeline.py 的 argparse 定义生成，不手抄——
+    # 手抄的清单会随 pipeline 加参数而漏项，且漏了不会报错只会静默少做。
     cmd = [PY, "lib/pipeline.py", "--input"] + list(args.input) + \
           ["--outdir", outdir, "--json", result_json]
-    for flag, val in (("--target", args.target), ("--process", args.process),
-                      ("--defect", args.defect), ("--sheet", args.sheet),
-                      ("--spec", args.spec), ("--tenant", args.tenant),
-                      ("--d2-card", args.d2_card)):
-        if val:
-            cmd += [flag, val]
-    if args.no_doe:
-        cmd.append("--no-doe")
-    if args.verbose:
-        cmd.append("--verbose")
-    if args.industry:
-        cmd += ["--industry"] + list(args.industry)
+    cmd += passthrough_flags(args, pipeline_flag_specs())
 
     steps.append(run_cmd("3. 流水线分析", cmd, timeout=args.timeout))
 
@@ -1857,9 +2382,11 @@ def flow_analyze(args):
 def main(argv=None):
     ap = argparse.ArgumentParser(
         description="newenergy-fde 唯一入口编排器（流程代码化 + 证据落盘）")
-    ap.add_argument("flow", choices=["audit", "verify", "analyze", "release"],
+    ap.add_argument("flow",
+                    choices=["audit", "verify", "analyze", "release", "config"],
                     help="audit=约定落地核查  verify=质量闸门  "
-                         "analyze=交付主流程  release=发布")
+                         "analyze=交付主流程  release=发布  "
+                         "config=可调参数清单与企业规格模板")
     ap.add_argument("--input", "-i", nargs="+", help="analyze：数据文件")
     ap.add_argument("--outdir", "-o", default="output", help="analyze：输出目录")
     ap.add_argument("--target", help="analyze：目标指标列")
@@ -1880,6 +2407,27 @@ def main(argv=None):
     ap.add_argument("--verbose", action="store_true",
                     help="逐阶段打印「这份数据被理解成了什么」（失败时先看这个）")
     ap.add_argument("--timeout", type=int, default=900, help="单步超时（秒）")
+    ap.add_argument("--init", action="store_true",
+                    help="config：生成企业规格待填模板（数值一律留空）")
+    ap.add_argument("--out", help="config --init：模板输出路径")
+
+    # 把 lib/pipeline.py 的全部参数动态补进来（取长选项，不抢短选项）。
+    # 目的是让「唯一入口」名副其实：pipeline 新增参数时编排器自动跟上，
+    # 不会出现「换了统一入口反而少一个开关」这种静默降级。
+    _have = set()
+    for _act in ap._actions:
+        _have.update(_act.option_strings)
+    for _name, _sp in sorted(pipeline_flag_specs().items()):
+        if _name in _ORCH_OWNED_FLAGS or _name in _have:
+            continue
+        if _sp["store"]:
+            ap.add_argument(_name, action="store_true",
+                            help="analyze：透传给 lib/pipeline.py")
+        elif _sp["nargs"] == "+":
+            ap.add_argument(_name, nargs="+",
+                            help="analyze：透传给 lib/pipeline.py")
+        else:
+            ap.add_argument(_name, help="analyze：透传给 lib/pipeline.py")
     args = ap.parse_args(argv)
 
     if args.flow == "analyze" and not args.input:
@@ -1889,6 +2437,8 @@ def main(argv=None):
     print("newenergy-fde 编排器 —— %s" % args.flow)
     print("=" * 68)
 
+    if args.flow == "config":
+        return flow_config(args)
     if args.flow == "audit":
         return flow_audit(args)
     if args.flow == "verify":

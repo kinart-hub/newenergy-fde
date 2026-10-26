@@ -1600,6 +1600,193 @@ def test_clustering():
     check("p 值判定：None 不显著", S.is_sig(None) is False)
 
 
+def test_entry_parity():
+    """统一入口（fde_run.py analyze）必须能接受 pipeline 的全部参数。
+
+    这是**运行时**验证，和 audit 规则 31 互为补充：
+    规则 31 是文本判据，只能确认代码里写了动态透传；
+    而「pipeline 新增了一个参数、编排器没跟上」这种失同步，
+    只有真跑一遍两边的 --help 求差集才看得出来。
+
+    实测这条断言的价值：白名单时代曾漏掉 --auto-adapt / --no-xlsx /
+    --rules，其中 --auto-adapt 在 README 里有示例——使用者照文档换到
+    统一入口，命令照样跑通、只是那个能力静默没了，不报错也不警告。
+    """
+    print("\nO. 入口对等：统一入口不得比 pipeline 少参数")
+    import re
+    import shutil
+    import subprocess
+
+    def _flags(argv, cwd=None):
+        r = subprocess.run([sys.executable] + argv, capture_output=True,
+                           text=True, encoding="utf-8", errors="replace",
+                           cwd=cwd or ROOT, timeout=120)
+        return set(re.findall(r"^\s+(?:-[a-zA-Z],\s+)?(--[a-z][a-z0-9-]+)",
+                              r.stdout or "", re.M))
+
+    orch = _flags(["scripts/fde_run.py", "analyze", "--help"])
+    pipe = _flags(["lib/pipeline.py", "--help"])
+    # 编排器自己接管的：--json 由它固定写到 <outdir>/result.json，
+    # 后续步骤依赖这个路径，不该由使用者指定
+    owned = {"--help", "--json"}
+    missing = sorted(pipe - orch - owned)
+    check("统一入口覆盖 pipeline 的全部参数", not missing,
+          "缺失：%s" % "、".join(missing) if missing
+          else "pipeline %d 个参数全部可达" % len(pipe - owned))
+    check("统一入口确实读到了 pipeline 参数（不是空跑）",
+          len(pipe) >= 8, "pipeline 参数 %d 个" % len(pipe))
+
+    # 上面两条查的是「参数在不在 --help 里」。**在 help 里不等于真的透传了**——
+    # 实测把透传改成 cmd += [] 之后，这两条依然全绿，因为注册与透传是两码事。
+    # 所以必须再验一次真实行为：参数有没有真的改变产物。
+    # 选 --no-xlsx 是因为它最容易被观察，而且它正是当年被白名单漏掉的 4 个之一。
+    import tempfile
+    src = os.path.join(ROOT, "examples", "01_涂布工艺数据.csv")
+    if not os.path.exists(src):
+        check("统一入口的 --no-xlsx 真透传到 pipeline", False,
+              "示例数据缺失，无法判定：%s" % src)
+        return
+    out = tempfile.mkdtemp(prefix="fde_entry_")
+    try:
+        subprocess.run([sys.executable, "scripts/fde_run.py", "analyze",
+                        "-i", src, "-o", out, "--no-xlsx"],
+                       capture_output=True, cwd=ROOT, timeout=600)
+        xl = [f for f in os.listdir(out) if f.lower().endswith(".xlsx")]
+        ran = os.path.exists(os.path.join(out, "result.json"))
+        check("统一入口的 --no-xlsx 真透传到 pipeline（产物无 xlsx）",
+              ran and not xl,
+              "产物 %s" % (os.listdir(out)[:5] if not ran else xl or "无 xlsx"))
+    finally:
+        shutil.rmtree(out, ignore_errors=True)
+
+
+def test_views():
+    """角色视角（v2.4.0）：五类使用者各拿一份能直接用的东西。
+
+    静态规则（audit 32）只能验「无依据不进表」「记录落盘」；
+    措辞是不是「建议」、红标有没有进正文，只能看产物文本——放这里验。
+    """
+    print("\nP. 角色视角与处置建议的责任约束")
+    import shutil
+    import tempfile
+    sys.path.insert(0, ROOT)
+    try:
+        from lib import views as V
+    except Exception as e:
+        check("角色视角模块可导入", False, str(e))
+        return
+
+    check("五个视角全部注册",
+          sorted(V.VIEW_KEYS) == ["mgmt", "process", "production",
+                                  "quality", "shopfloor"],
+          "、".join(V.VIEW_KEYS))
+
+    # 构造最小 result：有依据的候选 + 无依据的候选 + 未确审
+    res = {
+        "process_name": "极片涂布", "target": "不良率(%)",
+        "confidence": {"level": "中高"},
+        "shape": [180, 11], "groups": ["设备号", "班次"],
+        "eightd": {"signoff": {"all_signed": False}, "d2_filled": False,
+                   "d0": {"rows": [], "missing": ["24h 内应急反应（ERA）"]},
+                   "fmea": {"rows": [{"a": 1}]},
+                   "d5": {}, "d6": {}, "d7": {}, "d8": {}},
+        "rootcause": {
+            "mechanism": "供料量与基材速度失配",
+            "quick_checks": ["确认固含是否在配方窗口内", "核对泵速与车速比"],
+            "five_why": ["为什么面密度超差？"],
+            "candidates": [
+                {"param": "浆料固含(wt%)", "evidence_score": 0.96,
+                 "detail": {"r": -0.958, "p": 1e-99, "n": 180,
+                            "note": "Pearson r=-0.958"}},
+                {"param": "猜测参数", "evidence_score": 0.0,
+                 "detail": {}},          # 无依据：不得进处置表
+            ],
+        },
+        "unit_hotspots": [{"dim": "班次", "levels": 2, "rows": [
+            {"level": "甲班", "mean": 1.2, "others_mean": 2.3,
+             "p_adj": 0.0002}]}],
+        "gaps": [{"item": "涂布速度 的企业规格"}],
+    }
+    tmp = tempfile.mkdtemp(prefix="fde_view_")
+    try:
+        out = V.build_all(res, tmp)
+        check("全套视角生成无错", not (out.get("errors") or []),
+              "、".join(out.get("errors") or []))
+        files = out.get("files") or []
+        names = [os.path.basename(f) for f in files]
+        for v, base in V.BASENAME.items():
+            check("视角产物 %s 已生成" % v,
+                  any(n.startswith(base) for n in names), "")
+
+        # R1 第 1 条：措辞是「建议」不是「判定」
+        prod = os.path.join(tmp, V.BASENAME["production"] + ".md")
+        ptext = io.open(prod, encoding="utf-8").read() if os.path.exists(prod) else ""
+        check("处置表措辞为「建议」而非「判定」",
+              ("建议" in ptext) and ("判定" not in ptext.replace("不是放行判定", "").replace("最终判定", "")),
+              "")
+        # R1 第 2 条：无依据的条目不出现
+        check("无依据条目不进处置表", "猜测参数" not in ptext,
+              "出现了无依据的「猜测参数」")
+        # R1 第 3 条：红标进正文
+        check("未确审时红标写在正文", "红标" in ptext, "")
+        # R1 第 4 条：判断记录落盘
+        rec = os.path.join(tmp, "处置判断记录.md")
+        check("处置判断记录已留痕", os.path.exists(rec), "")
+        # 现场作业单要能打印：有核查顺序与手写栏
+        shop = os.path.join(tmp, V.BASENAME["shopfloor"] + ".md")
+        stext = io.open(shop, encoding="utf-8").read() if os.path.exists(shop) else ""
+        check("现场作业单含核查顺序", "核查顺序" in stext, "")
+        check("现场作业单留了手写栏", "实际看到" in stext, "")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_defect_process_priority():
+    """缺陷匹配必须按工序优先裁决（审计规则 34 只验得动源码形态，验不动运行时）。
+
+    守的是这条真实事故：process 参数原先只给数据驱动兜底用，知识库命中那一段
+    不看它。于是「焊接不良」这种跨行业通用叫法在「极耳焊接不良」(电池卷绕)
+    与「虚焊」(光伏 EL) 之间等长打平，谁赢全看 JSON 书写顺序 ——
+    光伏数据可能被判成锂电池超声焊问题，根因指向焊接功率/压力/时间。
+    静态规则抓不到运行时结果，必须由这条断言来兜。
+    """
+    print("\nO. 缺陷匹配：工序优先裁决")
+    tb = T.Table(["焊接不良", "虚焊", "电池片效率"],
+                 [[3, 1, 21.1], [0, 0, 21.3], [2, 0, 21.0], [1, 2, 20.9]], "焊接")
+
+    def pick(proc):
+        got = RC.identify_defects(tb, process=proc)
+        return {d.get("column"): d.get("defect") for d in got
+                if d.get("column") in ("焊接不良", "虚焊")}
+
+    pv = pick("pv_cell_el")
+    check("光伏工序下「焊接不良」列判给本工序的「虚焊」",
+          pv.get("焊接不良") == "虚焊", pv)
+
+    bt = pick("battery_winding")
+    check("锂电工序下「焊接不良」列判给本工序的「极耳焊接不良」",
+          bt.get("焊接不良") == "极耳焊接不良", bt)
+
+    # 借用的条目必须留痕，否则报告层无从提示
+    borrowed = [d for d in RC.identify_defects(tb, process="battery_winding")
+                if d.get("cross_process")]
+    check("借用别工序的机理会标 cross_process",
+          any(d.get("defect") == "虚焊" for d in borrowed),
+          [d.get("defect") for d in borrowed])
+
+    # 工序未知时不能乱标 cross（没有基准就谈"跨"是无的放矢）
+    unknown = RC.identify_defects(tb)
+    check("工序未知时一律不标 cross_process",
+          not any(d.get("cross_process") for d in unknown),
+          [(d.get("defect"), d.get("cross_process")) for d in unknown])
+
+    # --defect 提示同样按工序优先
+    hinted = RC.identify_defects(tb, hint="焊接不良", process="pv_cell_el")
+    check("--defect 提示也按工序排在前面",
+          hinted and hinted[0].get("defect") == "虚焊",
+          [d.get("defect") for d in hinted[:3]])
+
+
 def test_v19_delivery():
     """v1.9：行级追溯、清洗留痕、Excel 结果表、报告责任边界"""
     print("\nN. 交付形态：追溯 / 留痕 / 导出 / 责任边界")
@@ -1704,6 +1891,9 @@ if __name__ == "__main__":
     test_kb()
     test_clustering()
     test_v19_delivery()
+    test_entry_parity()
+    test_views()
+    test_defect_process_priority()
     print("\n" + "=" * 56)
     print("通过 %d 项，失败 %d 项" % (len(PASS), len(FAIL)))
     if FAIL:

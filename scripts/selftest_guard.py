@@ -402,7 +402,12 @@ if _HAS8:
 # 真正的坑不在 os.replace，在于 kbstore 原来用裸 except 兜住它、
 # 于是 PermissionError 被当成"文件坏了"静默返回空知识库——
 # 报告照出、结论全错、还没有报错。所以守护的是"读必须拿到真实内容"。
-if True:
+def _p_concurrency_probe():
+    """起一读一写两个线程对同一个知识库文件压 1.2 秒，验证读侧永远拿到完整内容。
+
+    包成函数而不是裸写在模块里：原来用 `if True:` 只为圈出变量作用域，
+    被扫描器判成恒真条件。改成函数既消掉这条，作用域也还是隔离的。
+    """
     import threading as _TH
 
     _pdir = tempfile.mkdtemp()
@@ -453,6 +458,9 @@ if True:
           _ps["reads"] > 200, "reads=%d" % _ps["reads"])
 
     shutil.rmtree(_pdir, ignore_errors=True)
+
+
+_p_concurrency_probe()
 
 
 # --------------------------------------------------------------- Q 组

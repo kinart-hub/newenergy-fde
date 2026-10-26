@@ -128,14 +128,14 @@ cd newenergy-fde
 python scripts/make_demo_data.py
 
 # 分析（最简）
-python lib/pipeline.py --input examples/01_涂布工艺数据.csv --outdir output/coating
+python scripts/fde_run.py analyze --input examples/01_涂布工艺数据.csv --outdir output/coating
 
 # 指定指标、工序、缺陷（推荐，结论更准）
-python lib/pipeline.py --input data.xlsx --target "不良率(%)" \
+python scripts/fde_run.py analyze --input data.xlsx --target "不良率(%)" \
        --process battery_coating --defect "针孔气泡" --outdir out
 
 # 传入企业规格（强烈建议，Cpk 才有效力）
-python lib/pipeline.py --input data.csv --spec spec.json --outdir out
+python scripts/fde_run.py analyze --input data.csv --spec spec.json --outdir out
 
 # 自检（279 项，含设备适配层、跨工序追溯、多企业隔离、行业作用域、基线热更新、设备记忆与知识库演进）
 python scripts/selftest.py
@@ -334,7 +334,7 @@ python scripts/kb_manage.py scaffold --type device_profile # 拿份骨架登记�
 
 ```bash
 # 第一个文件是当前工序，其余按工序链自动判定归属
-python lib/pipeline.py --input 本工序.csv 上游.csv --spec 规格.json --outdir out
+python scripts/fde_run.py analyze --input 本工序.csv 上游.csv --spec 规格.json --outdir out
 ```
 
 可验证：`examples/crossprocess/` 下三组数据各植入一种已知成因（本工序主导 / 上游越限 /
@@ -372,8 +372,8 @@ python lib/pipeline.py --input 本工序.csv 上游.csv --spec 规格.json --out
 
 
 ```bash
-python lib/pipeline.py --input 导出.csv --outdir out              # 认不出来的列只提示
-python lib/pipeline.py --input 导出.csv --auto-adapt              # 自动登记别名（仅私有层）
+python scripts/fde_run.py analyze --input 导出.csv --outdir out              # 认不出来的列只提示
+python scripts/fde_run.py analyze --input 导出.csv --auto-adapt              # 自动登记别名（仅私有层）
 ```
 
 ---
@@ -395,11 +395,11 @@ promotion/                     想把私有成果贡献给基线时的投递区
 - 私有层随时可删，删掉即回到基线，不会留下半个坏库
 
 ```bash
-python lib/pipeline.py --input 导出.csv --tenant 宁德时代 --outdir out
+python scripts/fde_run.py analyze --input 导出.csv --tenant 宁德时代 --outdir out
 python scripts/kb_manage.py tenants                      # 看有哪些企业、各有多少私有参数
 python scripts/kb_manage.py tenants --reset 某企业        # 一键复原（回到基线）
 python scripts/kb_manage.py --tenant 某企业 status        # 只查这一家
-FDE_TENANT=某企业 python lib/pipeline.py ...              # 也可走环境变量
+FDE_TENANT=某企业 python scripts/fde_run.py analyze ...              # 也可走环境变量
 ```
 
 并发安全（云端必须）：
@@ -427,7 +427,7 @@ python scripts/kb_manage.py --tenant A企业 tenants --industries battery
 python scripts/kb_manage.py --tenant B企业 tenants --industries battery pv
 
 # 单次分析指定（也可 FDE_INDUSTRY=battery 环境变量）
-python lib/pipeline.py --input 导出.csv --industry battery --outdir out
+python scripts/fde_run.py analyze --input 导出.csv --industry battery --outdir out
 ```
 
 配了之后无需每次传参：`tenants/<企业id>/tenant.json` 里的 `industries` 会被自动沿用。  
@@ -863,7 +863,7 @@ python scripts/package.py       # 生成 dist/newenergy-fde-<version>.zip
   "能力充足"把真因盖住）；Cpk>3 强制提示先核对规格、列匹配与伪重复。
 - **运行清单**：报告附输入文件 SHA-256 与本次自动决策清单，结论可被第三方复现。
 - **入口一致性（缺陷修复）**：`lib/events.py` 只用相对导入，而官方 CLI 是  
-  `python lib/pipeline.py`（脚本模式），此时 `from . import events` 会抛 ImportError  
+  `python scripts/fde_run.py analyze`（脚本模式），此时 `from . import events` 会抛 ImportError  
   并被"导入失败不能拖垮流水线"的兜底吞掉 → 事件表/位置聚集在 CLI 下**静默失效**，  
   退回 1.9 的旧行为（S5 判成 pv_module_iv、目标成"面积占比"）。评测走的是  
   `import lib.pipeline` 包模式，所以 6/6 全绿也照发现不了。已改为按入口分支导入，  

@@ -127,21 +127,45 @@ def identify_defects(table, hint=None, process=None):
     #    为什么必须先裁决：别名一多就会出现交叉命中 ——
     #    「边缘短路」同时含「短路」（内短路的别名）和「边缘漏电」，
     #    不裁决就会把同一列算进两个缺陷，Pareto 总量虚高、根因指向也跟着错。
-    #    裁决规则：**最长别名优先**，别名越长越具体。
+    #
+    #    裁决规则（v2.4 修的两处）：
+    #      ① **工序优先**。原来 process 参数只用在下面 1b 的数据驱动兜底里，
+    #         知识库命中这一段压根没看它 —— 于是光伏 EL 数据里出现「焊接不良」列时，
+    #         「极耳焊接不良」与「虚焊」两条的别名等长，谁赢全看 JSON 书写顺序，
+    #         结果可能把光伏串焊缺陷判成锂电池超声焊问题，
+    #         根因指向 welding power/pressure/time —— 跨行业串机理。
+    #         这比「未收录」糟得多：它看起来很专业，没人会怀疑它。
+    #      ② 同工序内**最长别名优先**，别名越长越具体。
+    #      ③ 仍平局按键名排序，保证确定性（不再取决于 JSON 里的书写顺序）。
+    dr_all = kb["defect_rootcause"]
+    in_proc = {dk: dv for dk, dv in dr_all.items()
+               if process and dv.get("process") == process}
+
+    def _best_for(nc):
+        """返回 (条目键, 是否跨工序借用)；没命中返回 (None, False)。"""
+        for scope in (in_proc, dr_all):
+            if not scope:
+                continue
+            best_dk, best_len = None, 0
+            for dk in sorted(scope):
+                for nn in _defect_alias_names(dk, scope[dk]):
+                    if _name_hits(nn, nc) and len(nn) > best_len:
+                        best_dk, best_len = dk, len(nn)
+            if best_dk:
+                # 从全局兜底命中的，说明本工序没登记这条机理
+                return best_dk, bool(process) and scope is dr_all
+        return None, False
+
     col_best = {}
     for c in table.columns:
         nc = PP._norm_name(c)
-        best_dk, best_len = None, 0
-        for dk, dv in kb["defect_rootcause"].items():
-            for nn in _defect_alias_names(dk, dv):
-                if _name_hits(nn, nc) and len(nn) > best_len:
-                    best_dk, best_len = dk, len(nn)
-        if best_dk:
-            col_best[c] = best_dk
+        dk, cross = _best_for(nc)
+        if dk:
+            col_best[c] = (dk, cross)
 
-    for dk, dv in kb["defect_rootcause"].items():
+    for dk, dv in dr_all.items():
         for c in table.columns:
-            if col_best.get(c) != dk:
+            if not col_best.get(c) or col_best[c][0] != dk:
                 continue
             vals = table.numeric_column(c)
             valid = [v for v in vals if v is not None]
@@ -154,6 +178,10 @@ def identify_defects(table, hint=None, process=None):
                               # 算出 200%+ 的荒唐值（8D D2 直接踩到）。
                               "n_positive": len([v for v in valid if v > 0]),
                               "mean": S.mean(valid), "process": dv["process"],
+                              # 本工序没登记这条机理、借用了别的工序的条目。
+                              # 报告层据此提示"机理来源与当前工序不符，请确认"，
+                              # 不直接当成结论（R1：没依据的不下判定）。
+                              "cross_process": col_best[c][1],
                               "is_count": _is_count_series(valid)})
     # 1b. 数据驱动补充：知识库没有的缺陷叫法（企业自定义），只要确实是计数列就纳入。
     #     否则「掉料」这类现场常用名会被整列忽略，Pareto 与根因都会跑偏。
@@ -180,20 +208,32 @@ def identify_defects(table, hint=None, process=None):
     # 2. 分类列中包含缺陷名称作为取值
     for c in table.text_columns():
         vals = [str(v) for v in table.column(c) if v not in (None, "")]
-        for dk, dv in kb["defect_rootcause"].items():
+        for dk in sorted(dr_all):
+            dv = dr_all[dk]
             dnames = _defect_alias_names(dk, dv)
             hits = sum(1 for v in vals
                        if any(_name_hits(nn, PP._norm_name(v)) for nn in dnames))
             if hits:
                 found.append({"defect": dk, "column": c, "count": hits,
                               "n_records": len(vals), "as_category": True,
-                              "process": kb["defect_rootcause"][dk]["process"]})
+                              "process": dv["process"],
+                              "cross_process": bool(process)
+                              and dv.get("process") != process})
     if hint:
         nd = PP._norm_name(hint)
-        for dk, dv in kb["defect_rootcause"].items():
+        # 与列匹配同一套优先级：本工序条目排前面，其次是键名长的（更具体），
+        # 最后按键名排序保证确定性。insert(0) 会反序，所以倒着插。
+        cands = []
+        for dk in sorted(dr_all):
+            dv = dr_all[dk]
             if any(nn in nd or nd in nn for nn in _defect_alias_names(dk, dv)):
-                found.insert(0, {"defect": dk, "column": None, "from_hint": True,
-                                 "process": dv["process"]})
+                cands.append((0 if dk in in_proc else 1, -len(dk), dk, dv))
+        cands.sort()
+        for _pri, _nlen, dk, dv in reversed(cands):
+            found.insert(0, {"defect": dk, "column": None, "from_hint": True,
+                             "process": dv["process"],
+                             "cross_process": bool(process)
+                             and dv.get("process") != process})
     # 去重
     seen, out = set(), []
     for f in found:

@@ -17,7 +17,8 @@
 S1 静默吞异常：except 分支里只有 pass/continue，异常被吃掉且不落任何痕迹。
                ——最危险的一类：不崩、不报、不留痕，问题只在结论里表现。
 S2 定义未调用：函数/常量定义了，全库找不到任何一处引用（"脑袋有知识代码却没运行"）。
-S3 知识库悬空：knowledge/*.json 里的条目，代码里从未读取过。
+S3 知识库悬空：条目引用了不存在的参数、或没有任何现场叫法能命中它、
+              或别名被多个条目抢用。（不是「键名在代码里出现」——见函数内说明）
 S4 参数透传链：analyze() 形参 ↔ pipeline CLI ↔ fde_run 透传，三处必须对齐。
 S5 文档承诺：SKILL.md / README 里写的命令与参数，必须在代码里真实存在。
 S6 不可达分支：if False / 恒真恒假条件 / 死循环无出口。
@@ -278,36 +279,117 @@ def scan_dead_code():
 
 
 # ------------------------------------------------------------------- S3
-def scan_dangling_knowledge():
-    """知识库悬空：JSON 里定义了的条目，代码里从未读取。
+def _norm(s):
+    """列名归一化。与 lib/preprocess._norm_name 同源，导入失败时用等价实现兜底。
 
-    只扫「标识性」字段（defect 键名、process 键名、param key、device id），
-    不做全字段匹配——描述性文案不出现在代码里是正常的。
+    为什么要导入而不是复制一份：别名是否撞车、能否命中，完全取决于归一化结果。
+    扫描器自己抄一份判据，两侧一旦漂移，扫描器就会用另一套口径下结论——
+    「扫出来没问题」就成了假的。
+    """
+    try:
+        sys.path.insert(0, ROOT)
+        from lib import preprocess as _PP
+        return _PP._norm_name(s)
+    except Exception:
+        s = re.sub(r"[\(（][^)）]*[\)）]", "", str(s))
+        s = re.sub(r"[\s_\-/、,，.。:：\[\]【】]+", "", s)
+        return s.lower()
+
+
+def scan_dangling_knowledge():
+    """知识库悬空：条目定义了，但**现场叫法命中不到它**，或它引用了不存在的条目。
+
+    ⚠️ 这里踩过一个判据错误，写新判据前先看这段：
+    旧判据是「缺陷键名在代码文本里出现」。这是错的——缺陷匹配是**数据驱动**的，
+    键名与 aliases 都由知识库读进来参与列名匹配，代码里本来就不会写这些名字。
+    所以旧判据实际测的是「这条碰巧被硬编码进 _BAD_HINT 了吗」，
+    结果：新补的 6 条正常条目被判悬空，而真正无别名可命中的「极片错位」反而没报。
+
+    真正会断链的是下面三类，判据就按这三类写：
+      1. param_key / likely_params 指向的 params 条目不存在 —— 引用悬空，
+         取参数时拿到空字典，Cpk/规格全部退回推定值还不报错。
+      2. 没有任何别名来源 —— 既无 aliases，param_key 在 params 里也没有别名。
+         只有列名与条目全名一字不差才命中，现场叫法一律匹配不上，
+         现场数据进来走「未收录」兜底，D4 机理栏写「机理未收录」。
+      3. 归一化后两个不同缺陷条目共用同一别名 —— 匹配歧义，
+         命中哪一条全看字典遍历顺序，同份数据换台机器结果可能不同。
     """
     out = []
     kdir = os.path.join(ROOT, "knowledge")
     if not os.path.isdir(kdir):
         return out
-    code_text = ""
-    for rel in _py_files():
-        code_text += _read(rel) + "\n"
+    alias_owner = {}       # 归一化别名 -> [(文件, 条目键)]
     for fn in sorted(os.listdir(kdir)):
         if not fn.endswith(".json"):
             continue
-        path = os.path.join(kdir, fn)
         try:
             data = json.loads(_read(os.path.join("knowledge", fn)) or "{}")
         except Exception:
             continue
-        # 缺陷条目
-        for key in (data.get("defect_rootcause") or {}):
-            if isinstance(key, str) and len(key) > 3 and key not in code_text:
+        dr = data.get("defect_rootcause") or {}
+        if not dr:
+            continue
+        params = data.get("params") or {}
+        for key in dr:
+            if not isinstance(key, str) or not key:
+                continue
+            dv = dr[key] or {}
+            where = os.path.join("knowledge", fn)
+
+            # --- 1. 引用悬空：param_key / likely_params 指向不存在的 params 条目
+            refs = []
+            if dv.get("param_key"):
+                refs.append(dv["param_key"])
+            refs += [p for p in (dv.get("likely_params") or []) if isinstance(p, str)]
+            missing = [r for r in refs if r and r not in params]
+            if missing:
                 out.append(Finding(
-                    "S3", "LOW", os.path.join("knowledge", fn), 0,
-                    "缺陷条目「%s」在代码中零命中" % key,
-                    "知识库有这条缺陷的定义，但代码里没有任何地方引用它——"
-                    "可能只是没走到，也可能别名索引没覆盖到它。",
-                    "确认别名已登记；确认 identify_defects 能命中它"))
+                    "S3", "MED", where, 0,
+                    "缺陷条目「%s」引用的参数在 params 里不存在：%s"
+                    % (key, "、".join(sorted(set(missing))[:5])),
+                    "取规格时拿到空字典，Cpk 与上下限全部退回知识库推定值，"
+                    "报告照出、数字是猜的、还不报错。",
+                    "在 params 里补上这些条目，或把引用改成已有的参数键"))
+
+            # --- 2. 无别名可命中
+            names = [key] + list(dv.get("aliases") or [])
+            pk = dv.get("param_key")
+            if pk and not dv.get("response_defect"):
+                names += list((params.get(pk) or {}).get("aliases") or [])
+            normed = sorted({_norm(n) for n in names if n and _norm(n)})
+            # 键名本身就只有一个来源、且没有更短的现场叫法可命中
+            if len(normed) <= 1:
+                out.append(Finding(
+                    "S3", "MED", where, 0,
+                    "缺陷条目「%s」没有任何现场叫法别名，只有键名本身可命中" % key,
+                    "现场列名不会跟条目全名一字不差（叫「水分超标」不叫「电芯水分超标」），"
+                    "于是这条机理永远匹配不上，数据进来走「未收录」兜底，"
+                    "工程师拿到的 D4 栏只能写着「机理未收录」。",
+                    "在条目的 aliases 里补上现场叫法（短名、口语名、英文名）"))
+
+            # --- 3. 别名撞车
+            # 只在**同一工序内**才算真歧义。跨工序撞车（「焊接不良」同时是
+            # 电池卷绕的「极耳焊接不良」和光伏 EL 的「虚焊」）是正常现象：
+            # 现场叫法本来就跨行业通用，运行时由 identify_defects 的
+            # 「工序优先裁决」化解（审计规则 34 守着这条裁决不许退化）。
+            # 若这里不分工序一律报警，报的全是运行时已经处理好的情况，
+            # 反而把同工序内的真歧义淹掉——那才是没人管的。
+            for n in normed:
+                scope_key = (fn, dv.get("process") or "")
+                alias_owner.setdefault((scope_key, n), []).append(key)
+
+    for (scope_key, n), owners in sorted(alias_owner.items(),
+                                         key=lambda kv: str(kv[0])):
+        uniq = sorted(set(owners))
+        if len(uniq) > 1:
+            out.append(Finding(
+                "S3", "MED", os.path.join("knowledge", scope_key[0]), 0,
+                "工序「%s」内别名「%s」被多个缺陷条目同时占用：%s"
+                % (scope_key[1] or "未标工序", n, "、".join(uniq)),
+                "两个机理抢同一个列名，而运行时裁决的第一级就是工序——"
+                "同工序内撞车意味着工序优先也救不了，命中哪一条仍看遍历顺序，"
+                "同一份数据在不同机器上可能给出不同根因。",
+                "给其中一条改别名，或在条目上标明优先级"))
     return out
 
 
@@ -343,30 +425,68 @@ def scan_param_chain():
         passed.add(mm.group(1))
 
     # analyze 形参里，应当在 CLI 暴露的那些（排除内部对象型参数）
+    # 以及形参名与实际 flag 不一致的（单复数/位置参数），逐个写清对应关系，
+    # 不能靠"名字差不多"自动放行——放行一个就再也看不见真的漏暴露。
     internal = {"spec_overrides", "d2_card", "emit_d2_card", "export_xlsx",
                 "do_doe", "max_charts", "auto_adapt", "sheet"}
+    alias = {
+        "paths": "-i/--input（位置参数，不是 --paths）",
+        "views": "--view（单数，nargs='+'）",
+    }
     for p in sig:
         flag = "--" + p.replace("_", "-")
         if p in internal:
             continue
-        if flag not in cli:
-            out.append(Finding(
-                "S4", "MED", os.path.join("lib", "pipeline.py"), 0,
-                "analyze() 形参「%s」在 CLI 里没有对应参数" % p,
-                "库调用者能传，命令行使用者传不了——同一份能力只对一半人开放。",
-                "在 argparse 里补上 %s，或明确标注它仅供库调用" % flag))
-    for flag in sorted(cli):
-        if flag in passed:
+        if flag in cli:
             continue
-        # 布尔开关与 -i 位置参数不强制要求透传
-        if flag in ("--input", "-i"):
+        if p in alias:
+            _KEPT.append({"id": "S4", "file": os.path.join("lib", "pipeline.py"),
+                          "line": 0,
+                          "reason": "形参「%s」的 CLI 入口是 %s，不是 %s" % (p, alias[p], flag)})
             continue
         out.append(Finding(
-            "S4", "LOW", os.path.join("scripts", "fde_run.py"), 0,
-            "CLI 参数「%s」未被编排器透传" % flag,
-            "走 fde_run.py 编排入口时这个参数会丢失，"
-            "两个入口行为不一致——使用者会以为自己设了，其实没生效。",
-            "在 flow_analyze 里补上透传"))
+            "S4", "MED", os.path.join("lib", "pipeline.py"), 0,
+            "analyze() 形参「%s」在 CLI 里没有对应参数" % p,
+            "库调用者能传，命令行使用者传不了——同一份能力只对一半人开放。",
+            "在 argparse 里补上 %s，或明确标注它仅供库调用" % flag))
+
+    # 动态透传：编排器不再手写 flag 白名单，改为运行时从 pipeline 的 argparse 取。
+    # 静态扫不到具体 flag，所以判据换成两层：
+    #   ① 动态构造必须还在（被删了就退回逐条静态核对，漏透传立刻显形）
+    #   ② 必须有运行时校验兜底（selftest 里真的跑一遍子进程比对），
+    #      否则"我说我全透传了"就是一句没人验证的话。
+    m_dyn = re.search(r"cmd\s*\+=\s*passthrough_flags\(\s*args\s*,\s*pipeline_flag_specs\(\)\s*\)", run)
+    dyn_line = run[:m_dyn.start()].count("\n") + 1 if m_dyn else 0
+    if not m_dyn:
+        for flag in sorted(cli):
+            if flag in passed:
+                continue
+            if flag in ("--input", "-i"):
+                continue
+            out.append(Finding(
+                "S4", "LOW", os.path.join("scripts", "fde_run.py"), 0,
+                "CLI 参数「%s」未被编排器透传" % flag,
+                "走 fde_run.py 编排入口时这个参数会丢失，"
+                "两个入口行为不一致——使用者会以为自己设了，其实没生效。",
+                "在 flow_analyze 里补上透传"))
+        return out
+
+    guard = _read(os.path.join("scripts", "selftest.py"))
+    if "def test_entry_parity" not in guard:
+        out.append(Finding(
+            "S4", "MED", os.path.join("scripts", "fde_run.py"), dyn_line,
+            "参数透传改成动态生成，但 selftest 里没有运行时校验兜底",
+            "透传是不是真的生效，静态已经看不出来了。没有运行时比对，"
+            "哪天透传断了无人知晓——参数被静默丢弃。",
+            "在 scripts/selftest.py 里补 test_entry_parity："
+            "子进程比对两个入口的 --help，并端到端验证一个开关真的生效"))
+    for flag in sorted(cli):
+        if flag in ("--input", "-i"):
+            continue
+        _KEPT.append({"id": "S4", "file": os.path.join("scripts", "fde_run.py"),
+                      "line": dyn_line,
+                      "reason": "「%s」由 passthrough_flags() 动态透传，"
+                                "静态看不到，已由 selftest test_entry_parity 运行时校验" % flag})
     return out
 
 

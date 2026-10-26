@@ -1069,5 +1069,10 @@ def render_8d(rep, res, card=None, conflicts=None, parent=None):
     rep.kv(s, [("结案批准人", st.get("by") or "（待签字）"),
                ("结案日期", st.get("date") or "（待填）")])
 
+    # d0 / fmea 必须进返回结构：报告里渲染了，但下游（角色视角的
+    # 「能不能发给客户」、以及任何读 result.json 的集成方）看不到它，
+    # 就只能猜——实测猜的结果是把「渲染了但没回传」判成「缺 D0」，
+    # 让质量人员以为这一节根本没做。
     return {"signoff": st, "missing_d2": miss, "conflicts": conflicts,
-            "d5": d5, "d6": d6, "d7": d7, "d8": d8, "d4_ok": ok4}
+            "d5": d5, "d6": d6, "d7": d7, "d8": d8, "d4_ok": ok4,
+            "d0": d0, "fmea": fmea}

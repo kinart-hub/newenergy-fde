@@ -89,7 +89,7 @@ if EV is not None and EV.__name__ != "lib.events":
 KB = PP.load_knowledge()
 _fmt = RPT._fmt
 
-ANALYZER_VERSION = "2.3.0"
+ANALYZER_VERSION = "2.4.0"
 
 
 # 空数据排查清单。
@@ -335,7 +335,8 @@ def encode_judgement(table):
 def analyze(paths, outdir="output", target=None, process=None, defect=None,
             sheet=None, spec_overrides=None, do_doe=True, max_charts=12,
             auto_adapt=False, tenant=None, industry=None, rules=None,
-            export_xlsx=True, d2_card=None, emit_d2_card=True, verbose=False):
+            export_xlsx=True, d2_card=None, emit_d2_card=True, verbose=False,
+            views=None):
     """
     auto_adapt —— 字段认不出来时，把"新别名/新参数"自动登记到**租户层**并当场生效。
                   默认关闭：知识库条目还是应该过一遍人。开了也不会碰到基线。
@@ -351,6 +352,9 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
     verbose     —— 逐阶段把「这份数据被理解成了什么」打到 stdout。
                    失败时使用者最需要的是「卡在第几步、数据被读成了什么样」，
                    而不是一句 ERROR。默认关闭以免刷屏。
+    views       —— 角色视角：process/shopfloor/quality/production/mgmt，或 ["all"]。
+                   视角层只做筛选与措辞，不重算——五类使用者各拿一份能直接用的东西，
+                   而不是都在同一份大而全的报告里自己翻。
     """
     try:
         from . import tenancy as TN
@@ -728,6 +732,20 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
     result["defects"] = defects[:10]
     if defect:
         result["defect"] = defect
+    # 机理借用告警：本工序没登记这条机理，匹配时借用了别的工序的条目。
+    # 必须说出来——跨行业串机理（把光伏串焊缺陷判成锂电池超声焊问题）
+    # 看起来很专业，没人会怀疑它，比「未收录」危险得多。
+    _borrowed = [d for d in defects[:10] if d.get("cross_process")]
+    if _borrowed:
+        _names = "、".join(sorted({str(d.get("defect")) for d in _borrowed})[:4])
+        _from = "、".join(sorted({
+            KB["processes"].get(d.get("process"), {}).get("name") or d.get("process")
+            for d in _borrowed})[:3])
+        result.setdefault("warnings", []).append(
+            "机理借用提示：%s 这几条缺陷，当前工序（%s）的知识库里没有登记，"
+            "匹配时借用了 %s 工序的条目。机理可借鉴但工艺参数（温度/压力/时间/设备）"
+            "未必通用，D4 根因与 D5 措施请按本工序实际复核后再用。"
+            % (_names, result.get("process_name") or chosen_proc or "未识别", _from))
 
     _v("[6/6] 缺陷识别：命中 %d 类%s" % (
         len(defects),
@@ -1315,6 +1333,26 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
     kbc = os.path.join(outdir, "kb_candidates.json")
     if os.path.exists(kbc):
         files["知识候选"] = kbc
+
+    # 14c. 角色视角产物。
+    #      同一份 result，按角色重排与改措辞——不重算，所以不存在五套结论
+    #      各自漂移的风险。视角失败只降级，不带走主报告。
+    if views:
+        try:
+            from . import views as VIEWS
+            want = (list(VIEWS.VIEW_KEYS) if "all" in views else list(views))
+            vres = VIEWS.build_all(result, outdir, views=want)
+            result["views"] = {"requested": list(views),
+                               "files": vres.get("files") or []}
+            for e in (vres.get("errors") or []):
+                result.setdefault("warnings", []).append("视角产物：%s" % e)
+            for i, p in enumerate(vres.get("files") or []):
+                files["视角产物%02d" % (i + 1)] = p
+        except Exception as _vw_e:
+            # 视角是交付形态，不是结论本身：它挂了不能让整轮分析白跑
+            result.setdefault("warnings", []).append(
+                "角色视角产物生成失败（主报告不受影响）：%s" % _vw_e)
+            degrade.note("pipeline.analyze@views", _vw_e)
     # 14b. 降级台账收口。
     #     沿途各模块在 except 里记的每一笔在这里汇总：让「这一节没结论」
     #     能被区分为「确实没有」与「算崩了」。没有记录就不加这一节。
@@ -2418,6 +2456,14 @@ def main():
                     help="逐阶段打印「这份数据被理解成了什么」（失败时先看这个）")
     ap.add_argument("--no-d2-card", action="store_true",
                     help="不生成空白 D2 录入卡")
+    ap.add_argument("--view", nargs="+", default=None,
+                    choices=["process", "shopfloor", "quality", "production",
+                             "mgmt", "all"],
+                    help="按角色出配套视角产物：process=工艺参数建议 "
+                         "shopfloor=现场作业单（可打印） quality=交付合规检查 "
+                         "production=批次处置建议（带判断记录留痕） "
+                         "mgmt=客户单页摘要 all=全套。"
+                         "视角层只做筛选与措辞，计算层仍是同一份结果")
     args = ap.parse_args()
 
     spec = None
@@ -2431,7 +2477,7 @@ def main():
                   tenant=args.tenant, industry=args.industry, rules=args.rules,
                   export_xlsx=not args.no_xlsx, d2_card=args.d2_card,
                   emit_d2_card=not args.no_d2_card,
-                  verbose=args.verbose)
+                  verbose=args.verbose, views=args.view)
 
     if res.get("error"):
         print("ERROR: " + res["error"])
