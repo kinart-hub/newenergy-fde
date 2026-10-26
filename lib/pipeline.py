@@ -334,6 +334,7 @@ def encode_judgement(table):
 def analyze(paths, outdir="output", target=None, process=None, defect=None,
             sheet=None, spec_overrides=None, do_doe=True, max_charts=12,
             auto_adapt=False, tenant=None, industry=None, rules=None,
+            spc_exclusion_mode="auto",
             export_xlsx=True, d2_card=None, emit_d2_card=True, verbose=False,
             views=None):
     """
@@ -942,7 +943,7 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
             # 直接用全段算限的话，异常自己会把 σ 撑大、把控制限撑宽，
             # 结果就是最该报警的那批点反而"在限内"——SPC 失效的头号原因。
             _rules = SPC.parse_rules(rules)
-            p1 = SPC.phase1_limits(vals)
+            p1 = SPC.phase1_limits(vals, mode=spc_exclusion_mode)
             if p1 and p1.get("stable"):
                 xc, rc = SPC.x_mr_with_limits(vals, p1["center"], p1["sigma"])
             else:
@@ -975,6 +976,11 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
                 "violations": vios, "capability": cap,
                 "lsl": lsl, "usl": usl, "target_value": tgt, "spec_source": _spec_src,
                 "phase1": p1, "rules_used": list(_rules),
+                "exclusion_review": {
+                    "mode": spc_exclusion_mode,
+                    "excluded_detail": (p1 or {}).get("exclusion_detail", []),
+                    "suspect_points": (p1 or {}).get("suspect_points", []),
+                },
                 "values": vals,
             })
         result["spc"] = [{k: v for k, v in d.items() if k != "values"} for d in spc_res]
@@ -2707,6 +2713,10 @@ def main():
     ap.add_argument("--rules", default=os.environ.get("FDE_SPC_RULES"),
                     help="启用的 Nelson 判异规则：1,2,3,5（默认基本集）/ all / basic / "
                          "shift / trend。规则开太多会误报泛滥，默认只开四条")
+    ap.add_argument("--spc-exclusion-mode", dest="spc_exclusion_mode",
+                    default="auto", choices=["auto", "suggest", "review"],
+                    help="SPC 剔除模式：auto=命中即剔除(默认)；suggest=只标记可疑点不剔除、"
+                         "交人复核；review=按外部复核结论剔除（需另行提供复核记录）")
     ap.add_argument("--no-xlsx", action="store_true",
                     help="不导出 Excel 结果表")
     ap.add_argument("--d2-card", default=None,
@@ -2735,6 +2745,7 @@ def main():
                   defect=args.defect, sheet=args.sheet, spec_overrides=spec,
                   do_doe=not args.no_doe, auto_adapt=args.auto_adapt,
                   tenant=args.tenant, industry=args.industry, rules=args.rules,
+                  spc_exclusion_mode=args.spc_exclusion_mode,
                   export_xlsx=not args.no_xlsx, d2_card=args.d2_card,
                   emit_d2_card=not args.no_d2_card,
                   verbose=args.verbose, views=args.view)

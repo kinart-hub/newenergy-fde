@@ -635,6 +635,7 @@ AUDIT_FILES = [
     os.path.join("lib", "doe.py"),
     # v2.7 契约规则的变异目标；缺了它同样会是静默 SKIP 而不是 FAIL
     os.path.join("lib", "contract.py"),
+    os.path.join("lib", "spc.py"),
     os.path.join("knowledge", "process_specs.json"),
 ]
 
@@ -1030,6 +1031,7 @@ TENANCY_FILE = os.path.join("lib", "tenancy.py")
 EIGHTD_FILE = os.path.join("lib", "eightd.py")
 PIPELINE_FILE = os.path.join("lib", "pipeline.py")
 PREPROCESS_FILE = os.path.join("lib", "preprocess.py")
+SPCPy = os.path.join("lib", "spc.py")
 CONTRACT_FILE = os.path.join("lib", "contract.py")
 VIEWS_FILE = os.path.join("lib", "views.py")
 RUN_FILE = os.path.join("scripts", "fde_run.py")
@@ -1768,6 +1770,48 @@ def rule_p1_field_mapping_confidence():
     return _r(True, "", {"field_mapping_confidence": True})
 
 
+def rule_p1_spc_exclusion_review():
+    """P1-2：SPC 剔除必须可审计——可切换为仅建议/审核、逐点带规则身份与审核人。
+
+    改造前 phase1_limits 默认自动剔除，缺 mode 开关；逐点只留下全局 rules_used，
+    丢了"哪个点被哪条规则触发"；且无 review_status/reviewed_by，审核动作无法追溯。
+    """
+    t = _read(SPCPy) or ""
+    if not t:
+        return _r(False, "读不到 " + SPCPy)
+    # 1) 必须有剔除模式开关（auto / suggest / review）与审核入参
+    if "def phase1_limits(" not in t:
+        return _r(False, "缺少 phase1_limits：SPC 剔除逻辑缺失")
+    if 'mode == "suggest"' not in t or 'mode == "review"' not in t:
+        return _r(False, "phase1_limits 未处理 suggest/review 模式（开关不完整）")
+    if "review=None)" not in t:
+        return _r(False, "phase1_limits 无 review 入参：审核动作无法接入")
+    # 2) 非 auto 模式必须可达（归一后才分支），否则 suggest/review 是死开关
+    if 'mode = (mode or "auto").lower()' not in t:
+        return _r(False, "mode 未归一：suggest/review 分支不可达（开关是摆设）")
+    # 3) 逐点身份：每条候选点必须带命中规则号与可读理由（exclusion_detail / suspect_points）
+    if '"exclusion_detail"' not in t:
+        return _r(False, "缺 exclusion_detail：被剔除点无逐点规则身份")
+    if '"suspect_points"' not in t:
+        return _r(False, "缺 suspect_points：仅建议/审核模式下候选点无可追溯载体")
+    if '"rules": rl' not in t:
+        return _r(False, "逐点规则身份未落字段（rules 未随点记录）")
+    # 4) 审核人/状态必须随点保留，且 review 真正被使用（不是写了不读）
+    if '"review_status"' not in t:
+        return _r(False, "suspect_points 未带 review_status：审核状态不可见")
+    if '"reviewed_by"' not in t:
+        return _r(False, "suspect_points 未带 reviewed_by：审核人不可追溯")
+    if 'rev.get("status") == "approved"' not in t:
+        return _r(False, "review 未被实际使用：approved 之外一律剔除，审核形同虚设")
+    # 5) 管线必须真正把 mode 透传下去，否则开关永远是死代码
+    tp = _read(PIPELINE_FILE) or ""
+    if "spc_exclusion_mode" not in tp:
+        return _r(False, "pipeline.analyze 未接入 spc_exclusion_mode：开关未接线")
+    if "mode=spc_exclusion_mode" not in tp:
+        return _r(False, "phase1_limits 未被传入 mode=spc_exclusion_mode：开关未生效")
+    return _r(True, "", {"spc_exclusion_review": True})
+
+
 AUDIT_RULES = [
     Rule("LICENSE 为 Elastic 2.0 官方纯文本", rule_license,
          "LICENSE 首行必须是裸文本 'Elastic License 2.0'（前面有 # 或 ## 即判不过）",
@@ -2329,6 +2373,23 @@ AUDIT_RULES = [
           _mutant("去掉 block 政策分支（低置信无法阻断）",
                   _re_sub(r'if policy == "block" and conf == "low":',
                           'if False and conf == "low":', flags=re.M), PREPROCESS_FILE)]),
+    Rule("SPC 剔除必须可审计：可切换仅建议/审核、逐点带规则身份与审核人",
+         rule_p1_spc_exclusion_review,
+         "P1-2。phase1_limits 必须支持 mode=auto/suggest/review 与 review 入参；"
+         "auto 默认仍剔除，suggest/review 不自动剔除、把候选点交人审；"
+         "每条被标记点必须带命中 Nelson 规则号与可读理由（exclusion_detail/suspect_points），"
+         "审核点必须带 review_status/reviewed_by 且 review 真正被使用；"
+         "pipeline.analyze 必须把 spc_exclusion_mode 透传给 phase1_limits。",
+         SPCPy,
+         [_mutant("剔除模式开关被焊死成 auto（suggest/review 不可达）",
+                  _re_sub(r'mode = \(mode or "auto"\)\.lower\(\)',
+                          'mode = "auto"', flags=re.M), SPCPy),
+          _mutant("逐点身份载体被改名抹掉（exclusion_detail 不落地）",
+                  _re_sub(r'"exclusion_detail": exclusion_detail,',
+                          '"excluded_points": exclusion_detail,', flags=re.M), SPCPy),
+          _mutant("review 不被实际使用（一律按 approved 剔除）",
+                  _re_sub(r'isinstance\(rev, dict\) and rev\.get\("status"\) == "approved"',
+                          'True', flags=re.M), SPCPy)]),
 ]
 
 

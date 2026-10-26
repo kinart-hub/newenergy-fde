@@ -2983,6 +2983,72 @@ def test_p1_field_mapping_confidence():
           PP._unit_mismatch(rec_mm, "涂布速度(m/min)", params_mm) is False, "")
 
 
+def test_p1_spc_exclusion_review():
+    """P1-2：SPC 剔除必须可审计——默认不掩盖失控、可切换为仅建议/审核、逐点带规则身份与审核人。
+
+    审计原话：默认仍是自动剔除，缺"仅建议/需审核"开关；逐点触发规则丢了身份，
+    只剩全局 rules_used；无逐点理由与 review_status/reviewed_by。
+    """
+    import random as _rnd
+    _g = _rnd.Random(7)
+    _stable = [_g.gauss(10, 0.5) for _ in range(40)]
+    _spike = [16.0, 17.0, 15.5, 16.8, 15.2]
+    _mix = _stable + _spike
+
+    # ① 默认 auto：命中即剔除，suspects 为空，exclusion_detail 带逐点身份
+    a = SPC.phase1_limits(_mix)
+    check("P1-2：auto 默认仍自动剔除异常点",
+          a is not None and len(a["excluded"]) == len(_spike), "excluded=%s" % a["excluded"])
+    check("P1-2：auto 下 suspect_points 为空（不遗留待审）", a["suspect_points"] == [], "")
+    check("P1-2：auto 下 exclusion_detail 逐点带规则身份",
+          len(a["exclusion_detail"]) == len(_spike)
+          and all(isinstance(d["rules"], list) and d["rules"]
+                  and isinstance(d["reason"], str) and d["reason"]
+                  for d in a["exclusion_detail"]), "")
+    check("P1-2：exclusion_detail 的 index 与 excluded 对应",
+          set(d["index"] for d in a["exclusion_detail"]) == set(a["excluded"]), "")
+
+    # ② suggest：不剔除，全部进 suspect_points，且带规则身份
+    s = SPC.phase1_limits(_mix, mode="suggest")
+    check("P1-2：suggest 模式不自动剔除（excluded 为空）",
+          s["excluded"] == [], "excluded=%s" % s["excluded"])
+    check("P1-2：suggest 模式把所有候选点交给人审（suspect_points 非空）",
+          len(s["suspect_points"]) == len(_spike), "suspects=%d" % len(s["suspect_points"]))
+    check("P1-2：suggest 候选点带命中规则号与可读理由",
+          all(isinstance(d["rules"], list) and d["rules"]
+              and isinstance(d["reason"], str) and d["reason"]
+              for d in s["suspect_points"]), "")
+    check("P1-2：suggest 模式基线偏宽（全程估计，stable=False）",
+          s["stable"] is False, "stable=%s" % s["stable"])
+
+    # ③ review：approved 才剔除，其余保留为待审并带 review_status/reviewed_by
+    _rev_approve = {d["index"]: {"status": "approved", "by": "QC-张三"}
+                    for d in s["suspect_points"]}
+    rv = SPC.phase1_limits(_mix, mode="review", review=_rev_approve)
+    check("P1-2：review 模式按 approved 真正剔除",
+          set(rv["excluded"]) == set(_rev_approve.keys()), "excluded=%s" % rv["excluded"])
+    check("P1-2：review 全 approved 后无遗留待审", rv["suspect_points"] == [], "")
+
+    _rev_pending = {d["index"]: {"status": "pending", "by": "QC-李四"}
+                    for d in s["suspect_points"]}
+    rv2 = SPC.phase1_limits(_mix, mode="review", review=_rev_pending)
+    check("P1-2：review 全 pending 时一个都不剔除", rv2["excluded"] == [], "")
+    check("P1-2：pending 候选保留为待审且带 review_status/reviewed_by",
+          len(rv2["suspect_points"]) == len(_spike)
+          and all(d.get("review_status") == "pending"
+                  and d.get("reviewed_by") == "QC-李四"
+                  for d in rv2["suspect_points"]), "")
+
+    # ④ 逐点规则身份须能记录真实 Nelson 规则号（非仅稳健预筛 rule 0）
+    _g2 = _rnd.Random(3)
+    _base = [_g2.gauss(10, 0.5) for _ in range(40)] + [10.75] * 9
+    sb = SPC.phase1_limits(_base, mode="suggest")
+    _nelson_identity = any(any(r in range(1, 9) for r in d["rules"])
+                           for d in sb["suspect_points"])
+    check("P1-2：逐点身份能记录真实 Nelson 规则号（非仅稳健预筛）",
+          _nelson_identity, "rules=%s" % [d["rules"] for d in sb["suspect_points"]])
+
+
 if __name__ == "__main__":
     print("newenergy-fde 自检开始")
     test_table()
@@ -3015,6 +3081,7 @@ if __name__ == "__main__":
     test_concurrent_write_integrity()
     test_tenant_path_guard()
     test_p1_field_mapping_confidence()
+    test_p1_spc_exclusion_review()
     print("\n" + "=" * 56)
     print("通过 %d 项，失败 %d 项" % (len(PASS), len(FAIL)))
     if FAIL:

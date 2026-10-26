@@ -174,11 +174,46 @@ def x_mr_with_limits(values, center, sigma_within, lcl=None, ucl=None):
     return x_chart, mr_chart
 
 
-def phase1_limits(values, max_iter=4, rules=(1, 2, 3), max_drop_ratio=0.25):
+def _baseline_stats(vals):
+    """从给定值列表估算中心线与 sigma（移动极差法，稳健起步）。
+
+    与 phase1_limits 内部迭代共用同一套估计，避免两套公式漂移。
+    返回 (center, sigma)；sigma 无法估计时返回 (center, None)。
+    """
+    if not vals or len(vals) < 2:
+        return None, None
+    center = S.mean(vals)
+    mr = [abs(vals[i] - vals[i - 1]) for i in range(1, len(vals))]
+    mrb = S.mean(mr) if mr else None
+    sigma = (mrb / D2[2]) if mrb else None
+    if not sigma or sigma <= 0:
+        sigma = S.stdev(vals)
+    if not sigma or sigma <= 0:
+        return center, None
+    return center, sigma
+
+
+def phase1_limits(values, max_iter=4, rules=(1, 2, 3), max_drop_ratio=0.25,
+                 mode="auto", review=None):
     """Phase I：从数据中迭代剔除非受控点，用剩下的稳定期建立控制限。
 
     返回 dict：center / sigma / lcl / ucl / n_total / n_used /
-               excluded(原始索引列表) / iterations / stable / note
+               excluded(原始索引列表，实际被剔除的点) /
+               excluded_local(在清洗后序列中的索引) /
+               exclusion_detail(每点剔除的逐点身份：规则号 + 可读理由) /
+               suspect_points(被标记但未剔除的点：suggest / review 模式) /
+               iterations / stable / note / mode / rules_used
+
+    剔除模式 mode（P1-2）：
+      - "auto"   ：默认，命中即剔除（原行为，保持向后兼容）。
+      - "suggest"：只标记候选点（suspect_points），不剔除、不动基线；
+                   由人决定是否采纳，避免系统替人做剔除决策。
+      - "review" ：按 review={orig_idx: {"status": "approved"/"rejected"/"pending",
+                    "by": 审核人, "note": ...}} 采纳 / 驳回；只有 "approved" 的点才剔除，
+                    其余进入 suspect_points 并带 review_status / reviewed_by。
+
+    逐点身份（P1-2 关键）：每条被标记的点都记录命中的 Nelson 规则号与可读理由，
+    不再只保留全局 rules_used，解决"谁触发了哪个点的剔除"不可追溯的问题。
     """
     vals = [v for v in values if v is not None]
     n_total = len(vals)
@@ -186,7 +221,8 @@ def phase1_limits(values, max_iter=4, rules=(1, 2, 3), max_drop_ratio=0.25):
         return None
     idxs_all = [i for i, v in enumerate(values) if v is not None]
     alive = list(range(n_total))          # 指向 vals 的位置
-    excluded = []
+    excluded = []                          # 指向 vals 的位置（实际剔除）
+    cand_by_idx = {}                       # 原始索引 -> 候选点细节
     iters = 0
     center, sigma = None, None
     capped = False        # 命中点太多、被剔除比例封顶拦下
@@ -202,6 +238,11 @@ def phase1_limits(values, max_iter=4, rules=(1, 2, 3), max_drop_ratio=0.25):
             if len(hit) > max_drop_ratio * n_total:
                 capped = True
             else:
+                for j in hit:
+                    orig = idxs_all[j]
+                    cand_by_idx.setdefault(orig, {
+                        "index": orig, "local_index": j, "iteration": 0,
+                        "rules": set([0]), "value": vals[j], "z": None})
                 excluded.extend(hit)
                 alive = [j for j in alive if j not in hit]
                 iters = 1
@@ -221,7 +262,18 @@ def phase1_limits(values, max_iter=4, rules=(1, 2, 3), max_drop_ratio=0.25):
         vios = nelson_violations(cur, center, sigma, rules=rules)
         hit = set()
         for v in vios:
-            hit.update(v["indexes"])
+            for jj in v["indexes"]:
+                if jj in hit:
+                    continue
+                hit.add(jj)
+                orig = idxs_all[alive[jj]]
+                d = cand_by_idx.get(orig)
+                if d is None:
+                    z = (vals[alive[jj]] - center) / sigma if sigma else None
+                    d = {"index": orig, "local_index": alive[jj], "iteration": it + 1,
+                         "rules": set(), "value": vals[alive[jj]], "z": z}
+                    cand_by_idx[orig] = d
+                d["rules"].add(v["rule"])
         if not hit:
             break
         iters = it + 1
@@ -233,45 +285,110 @@ def phase1_limits(values, max_iter=4, rules=(1, 2, 3), max_drop_ratio=0.25):
         alive = [alive[j] for j in range(len(cur)) if j not in hit]
     if not alive or center is None or not sigma:
         return None
-    if len(alive) < 8:
-        # 剔得太狠，退回全段，但要如实说明控制限偏宽
-        alive = list(range(n_total))
-        excluded = []
-        center = S.mean(vals)
-        mr = [abs(vals[i] - vals[i - 1]) for i in range(1, len(vals))]
-        mrb = S.mean(mr) if mr else None
-        sigma = (mrb / D2[2]) if mrb else S.stdev(vals)
-        iters = 0
-        stable = False
-        note = ("数据不足或异常点过多，无法分离出稳定期，已退回用全段估计控制限。"
-                "此控制限偏宽，判异灵敏度下降，结论需谨慎使用")
-    elif capped:
-        # 关键：封顶中断时必须如实说"不稳"。否则报告会写着"已建立稳定基线"，
-        # 而实际上过程一半的点都在界外——这正是"系统说没事、现场全是事"的来源。
-        # 基线不可信，就退回全段，让控制限偏宽、少报，而不是假装稳定。
-        alive = list(range(n_total))
-        excluded = []
-        center = S.mean(vals)
-        mr = [abs(vals[i] - vals[i - 1]) for i in range(1, len(vals))]
-        mrb = S.mean(mr) if mr else None
-        sigma = (mrb / D2[2]) if mrb else S.stdev(vals)
-        iters = 0
-        stable = False
-        note = ("未建立稳定基线：异常点比例超过 %.0f%%，过程整体不受控。"
-                "当前控制限由全段估计、偏宽，判异灵敏度下降，结论需谨慎使用"
-                % (max_drop_ratio * 100))
+
+    # 候选点细节：规则号 -> 排序列表 + 可读理由
+    candidates = []
+    for d in cand_by_idx.values():
+        rl = sorted(d["rules"])
+        reason = "；".join(
+            ("稳健离群剔除法(>3σ, MAD)" if r == 0
+             else "规则%d：%s" % (r, NELSON_RULES[r - 1][1]))
+            for r in rl)
+        candidates.append({
+            "index": d["index"], "local_index": d["local_index"],
+            "iteration": d["iteration"], "rules": rl, "reason": reason,
+            "value": d["value"], "z": d.get("z"),
+        })
+    candidates.sort(key=lambda x: x["index"])
+
+    mode = (mode or "auto").lower()
+    if mode == "auto":
+        base_positions = alive
+        excluded_positions = list(excluded)
+        if len(alive) < 8:
+            # 剔得太狠，退回全段，但要如实说明控制限偏宽
+            base_positions = list(range(n_total))
+            excluded_positions = []
+            stable = False
+            note = ("数据不足或异常点过多，无法分离出稳定期，已退回用全段估计控制限。"
+                    "此控制限偏宽，判异灵敏度下降，结论需谨慎使用")
+        elif capped:
+            # 关键：封顶中断时必须如实说"不稳"。否则报告会写着"已建立稳定基线"，
+            # 而实际上过程一半的点都在界外——这正是"系统说没事、现场全是事"的来源。
+            # 基线不可信，就退回全段，让控制限偏宽、少报，而不是假装稳定。
+            base_positions = list(range(n_total))
+            excluded_positions = []
+            stable = False
+            note = ("未建立稳定基线：异常点比例超过 %.0f%%，过程整体不受控。"
+                    "当前控制限由全段估计、偏宽，判异灵敏度下降，结论需谨慎使用"
+                    % (max_drop_ratio * 100))
+        else:
+            stable = True
+            note = ("稳定期由 %d 个点中筛出 %d 个点建立（迭代 %d 轮，剔除非受控点 %d 个），"
+                    "控制限不再受异常段影响" % (n_total, len(alive), iters, len(excluded)))
+    elif mode == "suggest":
+        # 不剔除：基线用全段（含候选点），把候选点交给人审
+        base_positions = list(range(n_total))
+        excluded_positions = []
+        stable = (len(candidates) == 0)
+        note = ("【仅建议模式】已标记 %d 个疑似非受控点但未剔除，控制限由全段估计、偏宽。"
+                "请逐点复核 suspect_points 后，再以 auto / review 模式采纳"
+                % len(candidates))
+    elif mode == "review":
+        approved = set()
+        for c in candidates:
+            rev = (review or {}).get(c["index"])
+            if isinstance(rev, dict) and rev.get("status") == "approved":
+                approved.add(c["local_index"])
+        base_positions = [j for j in range(n_total) if j not in approved]
+        excluded_positions = sorted(approved)
+        # 只有全部候选都已被 approved（剔除干净）才算稳定；仍有待审/驳回点
+        # 说明过程尚未裁定完，基线不可信，必须显式标 False 提醒人去审。
+        stable = (len(approved) == len(candidates))
+        note = ("【审核模式】已按 review 采纳 %d 个剔除、保留 %d 个待审点；"
+                "控制限依据已采纳的剔除建立"
+                % (len(approved), len(candidates) - len(approved)))
     else:
-        stable = True
-        note = ("稳定期由 %d 个点中筛出 %d 个点建立（迭代 %d 轮，剔除非受控点 %d 个），"
-                "控制限不再受异常段影响" % (n_total, len(alive), iters, len(excluded)))
+        # 未知 mode 回退 auto，避免静默接受错误配置
+        base_positions = alive
+        excluded_positions = list(excluded)
+        stable = not capped and len(alive) >= 8
+        note = "未知 mode=%r，回退 auto" % mode
+
+    # 基线统计量（按最终采纳的集合重算）
+    bc, bs = _baseline_stats([vals[j] for j in base_positions])
+    if bc is not None:
+        center, sigma = bc, bs
+
+    excluded_orig = [idxs_all[j] for j in excluded_positions]
+    approved_set = set(excluded_positions)
+    exclusion_detail = [c for c in candidates if c["local_index"] in approved_set]
+    if mode == "review":
+        suspects = []
+        for c in candidates:
+            if c["local_index"] in approved_set:
+                continue
+            rev = (review or {}).get(c["index"]) or {}
+            cc = dict(c)
+            cc["review_status"] = rev.get("status", "pending")
+            cc["reviewed_by"] = rev.get("by")
+            cc["review_note"] = rev.get("note")
+            suspects.append(cc)
+    elif mode == "suggest":
+        suspects = [dict(c) for c in candidates]
+    else:
+        suspects = []
+
     return {
         "center": center, "sigma": sigma,
         "lcl": center - 3 * sigma, "ucl": center + 3 * sigma,
-        "n_total": n_total, "n_used": len(alive),
-        "excluded": [idxs_all[j] for j in excluded],
-        "excluded_local": excluded,
+        "n_total": n_total, "n_used": len(base_positions),
+        "excluded": excluded_orig,
+        "excluded_local": excluded_positions,
+        "exclusion_detail": exclusion_detail,
+        "suspect_points": suspects,
         "iterations": iters, "stable": stable, "note": note,
-        "rules_used": tuple(parse_rules(rules)),
+        "mode": mode, "rules_used": tuple(parse_rules(rules)),
     }
 
 
