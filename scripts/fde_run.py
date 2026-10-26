@@ -1611,6 +1611,8 @@ def flow_analyze(args):
             cmd += [flag, val]
     if args.no_doe:
         cmd.append("--no-doe")
+    if args.verbose:
+        cmd.append("--verbose")
     if args.industry:
         cmd += ["--industry"] + list(args.industry)
 
@@ -1707,6 +1709,8 @@ def main(argv=None):
                     help="audit：打印每条规则的判据与变异清单")
     ap.add_argument("--report", default=os.path.join("output", "_fde_run_report.json"),
                     help="证据报告落盘路径")
+    ap.add_argument("--verbose", action="store_true",
+                    help="逐阶段打印「这份数据被理解成了什么」（失败时先看这个）")
     ap.add_argument("--timeout", type=int, default=900, help="单步超时（秒）")
     args = ap.parse_args(argv)
 

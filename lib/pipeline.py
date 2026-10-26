@@ -80,7 +80,7 @@ if EV is not None and EV.__name__ != "lib.events":
 KB = PP.load_knowledge()
 _fmt = RPT._fmt
 
-ANALYZER_VERSION = "2.0.0"
+ANALYZER_VERSION = "2.1.0"
 
 
 def _kb_stamp():
@@ -278,7 +278,7 @@ def encode_judgement(table):
 def analyze(paths, outdir="output", target=None, process=None, defect=None,
             sheet=None, spec_overrides=None, do_doe=True, max_charts=12,
             auto_adapt=False, tenant=None, industry=None, rules=None,
-            export_xlsx=True, d2_card=None, emit_d2_card=True):
+            export_xlsx=True, d2_card=None, emit_d2_card=True, verbose=False):
     """
     auto_adapt —— 字段认不出来时，把"新别名/新参数"自动登记到**租户层**并当场生效。
                   默认关闭：知识库条目还是应该过一遍人。开了也不会碰到基线。
@@ -291,6 +291,9 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
     d2_card    —— 已填写的 8D D2 录入卡路径。给了就把 5W2H 与数据做交叉校验，
                   并据此渲染完整 D1–D8；不给则 D2 全空并在报告中标记「不具备对外条件」。
     emit_d2_card—— 是否随报告生成空白 D2 录入卡（默认生成）。
+    verbose     —— 逐阶段把「这份数据被理解成了什么」打到 stdout。
+                   失败时使用者最需要的是「卡在第几步、数据被读成了什么样」，
+                   而不是一句 ERROR。默认关闭以免刷屏。
     """
     try:
         from . import tenancy as TN
@@ -362,6 +365,14 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
         result["_scope_stat"] = SC.last_stat()
 
     # 1. 读取 + 设备识别 + 版式归一（不同厂商导出的差异在这一步抹平）
+
+    def _v(msg):
+        if verbose:
+            try:
+                print(msg)
+            except Exception:
+                pass
+
     tables = []
     device_reports = []
     for p in paths:
@@ -479,6 +490,10 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
     result["shape"] = main.shape()
     result["columns"] = main.columns
 
+    _v("[1/6] 读取与版式归一：%d 个文件 -> 主表 %s；设备=%s%s" % (
+        len(paths), " x ".join(str(x) for x in main.shape()),
+        result.get("device_name") or "未识别",
+        ("（按%s匹配）" % result.get("device_matched_by")) if result.get("device_matched_by") else ""))
     # 2. 判定列编码 + 列名映射 + 工序识别
     judge_col = encode_judgement(main)
     _dev_map = {}
@@ -533,6 +548,9 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
     result["process"] = chosen_proc
     result["process_name"] = KB["processes"].get(chosen_proc, {}).get("name", "未知工序")
 
+    _v("[2/6] 编码与工序识别：判定列=%s；工序=%s；列名映射 %d/%d 项" % (
+        judge_col or "无", result.get("process_name") or "未知",
+        len([1 for _c, _k in col_map.items() if _k]), len(col_map) or 1))
     # 3. 清洗。log 记下每一条被剔除的行（文件+原始行号+原因），
     #    既能在报告里交代"删了什么"，也给了复核和撤销的依据。
     cleaning_log = []
@@ -560,6 +578,9 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
         result["stc_applied"] = True
         result.setdefault("decisions", []).append("STC 归一化：%s" % (_stc_note or ""))
 
+    _v("[3/6] 清洗：%s -> %s 行（剔除 %s 行，逐行明细见报告「清洗记录」）" % (
+        clean_rep.get("rows_in"), clean_rep.get("rows_out"),
+        (clean_rep.get("rows_in") or 0) - (clean_rep.get("rows_out") or 0)))
     # 4. 目标列与分组
     y_col = pick_target(work, target, spec_overrides=spec_overrides, col_map=col_map) or judge_col
     if judge_col and (target in (None, "") or target == judge_col):
@@ -584,15 +605,21 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
                 "工序判定与根因结论都不可靠。请补充列名含义对照，或登记为设备档案后重跑。"
                 % (_rate * 100, _hit, len(work.columns)))
 
+    _v("[4/6] 目标列=%s；分组维度=%s" % (
+        y_col or "未定", "、".join(groups[:5]) if groups else "无"))
     # 5. 时间列
     tcol, times = PP.parse_time_column(work)
 
+    _v("[5/6] 时间列=%s" % (tcol or "无"))
     # 6. 缺陷识别与 Pareto
     defects = RC.identify_defects(work, defect, process=chosen_proc)
     result["defects"] = defects[:10]
     if defect:
         result["defect"] = defect
 
+    _v("[6/6] 缺陷识别：命中 %d 类%s" % (
+        len(defects),
+        ("（" + "、".join(str(d.get("defect")) for d in defects[:6]) + "）") if defects else ""))
     # 6b. 跨工序追溯：上游检测合格、本工序出不良时，判定问题到底出在哪一道
     #     注意 tables 里第二张表往后的数据，在此之前只写进了来源日志、从未参与分析
     if len(tables) > 1 and chosen_proc:
@@ -2265,6 +2292,8 @@ def main():
     ap.add_argument("--d2-card", default=None,
                     help="已填写的 8D D2 录入卡路径（首次运行会随报告生成空白卡，"
                          "填好后用本参数回传，引擎会把 5W2H 与数据做交叉校验并渲染完整 D1–D8）")
+    ap.add_argument("--verbose", action="store_true",
+                    help="逐阶段打印「这份数据被理解成了什么」（失败时先看这个）")
     ap.add_argument("--no-d2-card", action="store_true",
                     help="不生成空白 D2 录入卡")
     args = ap.parse_args()
@@ -2279,7 +2308,8 @@ def main():
                   do_doe=not args.no_doe, auto_adapt=args.auto_adapt,
                   tenant=args.tenant, industry=args.industry, rules=args.rules,
                   export_xlsx=not args.no_xlsx, d2_card=args.d2_card,
-                  emit_d2_card=not args.no_d2_card)
+                  emit_d2_card=not args.no_d2_card,
+                  verbose=args.verbose)
 
     if res.get("error"):
         print("ERROR: " + res["error"])
