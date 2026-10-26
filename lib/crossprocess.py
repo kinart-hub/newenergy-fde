@@ -635,10 +635,10 @@ def _decide(contrib, probes, ups, bad_idx):
         return "证据不足", ["对齐后没有可用于判定的共同参数"], "低"
     strong_up = [c for c in contrib if c["role"] == "upstream"
                  and abs((c["corr"] or {}).get("r") or 0) >= 0.4
-                 and ((c["corr"] or {}).get("p") or 1) < 0.05]
+                 and S.is_sig((c["corr"] or {}).get("p"))]
     strong_cur = [c for c in contrib if c["role"] == "current"
                   and abs((c["corr"] or {}).get("r") or 0) >= 0.4
-                  and ((c["corr"] or {}).get("p") or 1) < 0.05]
+                  and S.is_sig((c["corr"] or {}).get("p"))]
     marginal = [p for p in (probes or []) if p.get("verdict") == "upstream_marginal"]
     violating = [p for p in (probes or []) if p.get("verdict") == "upstream_violating"]
 
@@ -736,7 +736,7 @@ def lateral_sweep(table, target_col, group_cols, min_group=5, max_levels=12,
                              if used_cov else ""})
     rows.sort(key=lambda x: x["eta_sq"], reverse=True)
     for x in rows:
-        if x["eta_sq"] >= 0.14 and (x["p"] or 1) < 0.05:
+        if x["eta_sq"] >= 0.14 and S.is_sig(x.get("p")):
             x["verdict"] = "局部性问题：集中在「%s」，建议先查这一台/一批" % x["worst_level"]
         elif x["eta_sq"] >= 0.06:
             x["verdict"] = "有一定聚集性，值得复核"

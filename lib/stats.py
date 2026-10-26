@@ -548,6 +548,26 @@ def minmax_scale(xs):
     return [None if x is None else (x - lo) / (hi - lo) for x in xs]
 
 
+def is_sig(p, alpha=0.05):
+    """p 值是否达到显著性水平 —— 全库唯一的判定入口（v1.15）。
+
+    为什么必须统一：此前多处写成 `(p or 1) < 0.05`。
+    `round(p, 6)` 会把 1e-30 压成 0.0，而 `0.0 or 1` 得到 1 —— **最强的证据被判为不显著**。
+    这类错误不会报错，只会让报告少一句结论、多一句"未见显著"，
+    属于本库最忌讳的静默错结论。0.0 必须读作"小于任何可显示精度"，不是"缺失"。
+    """
+    return p is not None and p <= alpha
+
+
+def fmt_p(p, digits=4):
+    """p 值显示：缺失写 —，极小值不失真（不要用 `p or 1` 兜底）"""
+    if p is None:
+        return "—"
+    if p < 10 ** (-digits):
+        return "<1e-%d" % digits
+    return "%.*g" % (digits, p)
+
+
 def bh_adjust(pvals, alpha=0.05):
     """Benjamini-Hochberg 多重比较校正，返回 q 值（与原顺序一致）。
 

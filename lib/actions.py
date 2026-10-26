@@ -19,6 +19,7 @@ actions.py —— 横向排查、永久措施候选、预防性参数优化
 
 from . import crossprocess as XP
 from . import kbstore as KBS
+from . import stats as S
 
 
 # ------------------------------------------------------------------ 横向排查
@@ -60,7 +61,7 @@ def lateral_plan(table, target_col=None, defect=None, current_process=None,
     if adjust_for is None and contributions:
         cand = [c for c in contributions
                 if abs((c.get("corr") or {}).get("r") or 0) >= 0.5
-                and ((c.get("corr") or {}).get("p") or 1) < 0.05]
+                and S.is_sig((c.get("corr") or {}).get("p"))]
         if cand:
             adjust_for = cand[0]["column"]
     rows = XP.lateral_sweep(table, target_col, group_cols, adjust_for=adjust_for)
@@ -85,8 +86,8 @@ def lateral_plan(table, target_col=None, defect=None, current_process=None,
                 "scope": "空间横向",
                 "action": "按「%s」逐档对比：重点核查 %s，%s"
                           % (r["dim"], r["worst_level"], quant),
-                "basis": "η²=%.3f, p=%.4g（该维度解释度 %.1f%%）%s"
-                         % (r["eta_sq"], r["p"] or 1, r["eta_sq"] * 100, r["note"]),
+                "basis": "η²=%.3f, p=%s（该维度解释度 %.1f%%）%s"
+                         % (r["eta_sq"], S.fmt_p(r["p"], 3), r["eta_sq"] * 100, r["note"]),
             })
 
     # 物料横向：凡是来料/供应商/批次维度，都要往回追到上游的同批产品。
@@ -172,7 +173,7 @@ def permanent_actions(trace_result, defect=None, current_process=None, param_key
     contribs = (trace_result or {}).get("contributions") or []
     for c in contribs[:3]:
         cr = c.get("corr") or {}
-        if abs(cr.get("r") or 0) >= 0.4 and (cr.get("p") or 1) < 0.05:
+        if abs(cr.get("r") or 0) >= 0.4 and S.is_sig(cr.get("p")):
             out["generic"].append({
                 "verdict": verdict,
                 "action": "优先锁定「%s」（%s）作为永久措施的作用点：先做单因子小批验证，"
@@ -205,7 +206,7 @@ def preventive(trace_result, table=None, target_col=None, kb=None, process=None)
     contribs = (trace_result or {}).get("contributions") or []
     hit = [c for c in contribs
            if (c.get("corr") or {}).get("r") is not None
-           and abs(c["corr"]["r"]) >= 0.4 and ((c["corr"] or {}).get("p") or 1) < 0.05]
+           and abs(c["corr"]["r"]) >= 0.4 and S.is_sig((c["corr"] or {}).get("p"))]
     for c in hit[:5]:
         probe = c.get("probe") or {}
         direction = "偏低" if (probe.get("delta") or 0) < 0 else "偏高"

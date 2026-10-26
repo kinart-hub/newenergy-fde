@@ -1502,6 +1502,69 @@ def test_hotswap():
             shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_clustering():
+    """v1.15 / v2.0.0 §4.5：位置聚集检验——曝光加权、BH、二项精确
+
+    这一组护栏存在的原因：聚集检验是最容易"看起来对、实际错"的地方。
+    12 个电池列逐个卡方而不校正，在 12 列里"发现"一个热点几乎必然；
+    期望频数不足时把期望当对照组做 2x2 Fisher，算出来的 p 没有统计意义。
+    两种错法都只在报告里表现为"多了一句结论"，不会报错。
+    """
+    print("\nP. 位置聚集检验：曝光加权 / BH / 二项精确")
+    from lib import events as EV
+
+    # 1) 二项精确检验（与 R binom.test 同口径的定性校验）
+    p_ok = EV._binom_exact_two_sided(5, 100, 0.05)
+    check("二项精确：5/100 vs p0=0.05 不显著", p_ok > 0.3, "p=%.3f" % p_ok)
+    p_hot = EV._binom_exact_two_sided(20, 100, 0.05)
+    check("二项精确：20/100 vs p0=0.05 显著", p_hot < 0.001, "p=%.2e" % p_hot)
+    # 大 n 必须走对数空间：朴素连乘在此会下溢成 0，双尾和退化为 1.0
+    p_big = EV._binom_exact_two_sided(6000, 20000, 0.25)
+    check("二项精确：大样本不下溢", p_big < 1e-30, "p=%.2e" % p_big)
+    check("二项精确：边界 k=n 不抛错",
+          EV._binom_exact_two_sided(10, 10, 0.5) > 0.0)
+
+    # 2) 卡方路径 + BH：12 列、总量 100、第 7 列占 40 必须判为热点
+    rows = []
+    for col in range(1, 13):
+        cnt = 40 if col == 7 else (5 if col <= 6 else 6)
+        rows.extend([[col]] * cnt)
+    tb = T.Table(["电池列"], rows, "ev")
+    res = EV.factor_clustering(tb, "电池列")
+    check("聚集检验：12 水平全部入检", res and res["n_levels"] == 12,
+          res["n_levels"] if res else None)
+    check("聚集检验：热点判定在第 7 列", res and res["hot_level"] == 7,
+          res.get("hot_level") if res else None)
+    _q_hot = res["worst"].get("q") if res else None
+    # 注意：不要写 `q or 1`——q 恰为 0.0 时会被假值替换成 1，断言反而误判（本组自测踩过）
+    check("聚集检验：热点通过 BH 校正",
+          bool(res and res["significant"] and _q_hot is not None and _q_hot <= 0.05),
+          "q=%.2e" % _q_hot if _q_hot is not None else None)
+    check("聚集检验：单水平期望 = 总量/列数", res and approx(res["rows"][0]["expected"],
+                                                        100 / 12, 0.01),
+          res["rows"][0]["expected"] if res else None)
+
+    # 3) 曝光加权：曝光比 3:1，期望必须按曝光分配，而不是均分
+    tb2 = T.Table(["工位"], [[1]] * 15 + [[2]] * 5, "ev2")
+    res2 = EV.factor_clustering(tb2, "工位", exposure=[3, 1])
+    check("曝光加权：期望按曝光比分配", res2 and approx(res2["rows"][0]["expected"], 15.0),
+          res2["rows"][0]["expected"] if res2 else None)
+    check("曝光加权：均匀分布不误报热点", res2 and not res2["significant"])
+
+    # 4) 期望频数不足必须走二项精确，且不得报成 Fisher 2x2
+    tb3 = T.Table(["腔位"], [["A"]] * 3 + [["B"]] * 1 + [["C"]], "ev3")
+    res3 = EV.factor_clustering(tb3, "腔位")
+    check("期望不足：降级为二项精确检验",
+          res3 and all("二项精确" in r["test"] for r in res3["rows"]),
+          res3["rows"][0]["test"] if res3 else None)
+    check("期望不足：小样本不硬报显著", res3 and res3["hot_level"] is None)
+
+    # 5) 假值陷阱本身必须锁死：round(p,6) 会把 1e-30 压成 0.0，
+    #    0.0 必须读作"极显著"，None 才是"缺失"。
+    check("p 值判定：0.0 视为显著（不是缺失）", S.is_sig(0.0) is True)
+    check("p 值判定：None 不显著", S.is_sig(None) is False)
+
+
 def test_v19_delivery():
     """v1.9：行级追溯、清洗留痕、Excel 结果表、报告责任边界"""
     print("\nN. 交付形态：追溯 / 留痕 / 导出 / 责任边界")
@@ -1604,6 +1667,7 @@ if __name__ == "__main__":
     test_hotswap()
     test_device_memory()
     test_kb()
+    test_clustering()
     test_v19_delivery()
     print("\n" + "=" * 56)
     print("通过 %d 项，失败 %d 项" % (len(PASS), len(FAIL)))

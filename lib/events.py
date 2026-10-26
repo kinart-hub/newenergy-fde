@@ -14,7 +14,7 @@
 本模块做三件事：
   1. 识别事件表并按产品汇总为「每组件各类缺陷计数」；
   2. 对位置/机构类维度做聚集性检验，按曝光加权、并对多个位置同时检验做 BH 校正；
-  3. 给出可写进报告的结论文案（含期望频数与`。
+  3. 给出可写进报告的结论文案（含期望频数与 q 值）。
 """
 import math
 from . import quality_guard as QG
@@ -175,19 +175,39 @@ def _chi2_counts(observed, expected):
     return stat, max(0, df - 1)
 
 
-def _fisher_p(a, b, c, d):
-    """2x2 Fisher 精确检验双尾 p（超几何分布，适用于期望频数不足的小样本）"""
-    def lg(n):
-        return math.lgamma(n + 1)
-    n = a + b + c + d
-    r1, r2, c1 = a + b, c + d, a + c
-    const = lg(r1) + lg(r2) + lg(c1) + lg(n - c1) - lg(n)
+def _binom_exact_two_sided(k, n, p0):
+    """二项精确检验双尾 p —— 事件表期望频数不足时的**唯一合法**精确检验。
 
-    def pr(x):
-        return math.exp(const - lg(x) - lg(r1 - x) - lg(c1 - x) - lg(r2 - c1 + x))
-    p_obs = pr(a)
-    lo, hi = max(0, c1 - r2), min(r1, c1)
-    return min(1.0, sum(pr(x) for x in range(lo, hi + 1) if pr(x) <= p_obs + 1e-12))
+    为什么不能用 2x2 Fisher（v1.15 修正）：
+    缺陷事件表只有「缺陷发生数」，没有「非缺陷对照」的逐格计数。
+    把期望频数当作对照组塞进 2x2 列联表，行列边际与自由度都不成立，
+    算出来的是一个"看起来像 Fisher"的数——这正是本项目最反对的静默错结论。
+
+    正确模型：H0 = 该水平缺陷占比等于整体占比 p0，观测 k/n。
+    双尾定义为所有 P(X=x) ≤ P(X=k) 的概率之和（与 R binom.test 同口径）。
+
+    数值实现走对数空间：大 n（上万行）下 comb*p^x 会下溢成 0，
+    连 p_obs 都变 0，双尾和会退化成 1.0 —— 这是另一条静默错路。
+    """
+    if n <= 0 or k < 0 or k > n:
+        return 1.0
+    if p0 <= 0.0 or p0 >= 1.0:
+        return 1.0
+    lg = math.lgamma
+    lp0, lq0 = math.log(p0), math.log(1.0 - p0)
+
+    def log_pr(x):
+        return (lg(n + 1) - lg(x + 1) - lg(n - x + 1)
+                + x * lp0 + (n - x) * lq0)
+
+    l_obs = log_pr(k)
+    # 用对数比较，避免 p_obs 下溢后"全部 ≤ 0"的退化
+    tot = 0.0
+    for x in range(0, n + 1):
+        lx = log_pr(x)
+        if lx <= l_obs + 1e-9:
+            tot += math.exp(lx)
+    return min(1.0, tot)
 
 
 def factor_clustering(table, factor_col, target=None, exposure=None, min_expected=5):
@@ -237,11 +257,11 @@ def factor_clustering(table, factor_col, target=None, exposure=None, min_expecte
         if min(o, rest_o, e, rest_e) < 0:
             continue
         if min(e, rest_e) < min_expected:
-            # 期望频数不足：改用 Fisher（本水平 vs 其余）
-            a, b = int(round(o)), int(round(rest_o))
-            c, d = int(round(e)), int(round(rest_e))
-            p = _fisher_p(a, b, c, d)
-            test = "Fisher 精确检验"
+            # 期望频数不足：用二项精确检验（p0 = 该水平期望占比），
+            # 不用 2x2 Fisher —— 事件表没有非缺陷对照，列联表不成立（v1.15 修正）
+            p = _binom_exact_two_sided(int(round(o)), int(round(total)),
+                                       (e / total) if total else 1.0)
+            test = "二项精确检验（期望频数不足）"
         else:
             stat, df = _chi2_counts([o, rest_o], [e, rest_e])
             p = S.chi2_sf(stat, 1) if df >= 1 else 1.0
@@ -255,7 +275,8 @@ def factor_clustering(table, factor_col, target=None, exposure=None, min_expecte
     for d, q in zip(raw, qs):
         d["q"] = q
     worst = max(raw, key=lambda d: d.get("ratio") or 0)
-    significant = [d for d in raw if (d.get("q") or 1) <= 0.05]
+    # 不要写 `q or 1`：q=0.0 是"极显著"，不是"缺失"（v1.15 修正）
+    significant = [d for d in raw if S.is_sig(d.get("q"))]
     return {
         "factor": factor_col,
         "test": raw[0]["test"],

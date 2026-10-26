@@ -9,7 +9,7 @@
 ![License](https://img.shields.io/badge/license-Elastic--2.0-blue)
 ![Python](https://img.shields.io/badge/python-3.8%2B-blue)
 ![Dependencies](https://img.shields.io/badge/dependencies-0-brightgreen)
-![Self-test](https://img.shields.io/badge/selftest-279%20passing-brightgreen)
+![Self-test](https://img.shields.io/badge/selftest-293%20passing-brightgreen)
 
 ![newenergy-fde](assets/social-preview.png)
 
