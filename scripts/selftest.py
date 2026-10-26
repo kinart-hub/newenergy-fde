@@ -2374,6 +2374,45 @@ def test_confound_and_evidence():
           all(c.get("conclusion_status") in ("机理支持", "现场待确认", "未知")
               for c in hyp), "%d/%d 条假设" % (len(hyp), len(cands)))
 
+    # P1-5：可验证性权重此前硬编码 0.5、不算进排序、不随候选输出。
+    lack_v = [c for c in cands if "verifiability_score" not in c]
+    check("P1-5：候选输出可验证性分项", not lack_v, "%d 条缺 verifiability_score" % len(lack_v))
+    check("P1-5：返回体注明权重是排序启发式而非概率",
+          "score_note" in (r or {}), "返回体缺 score_note")
+
+    # 单元验证：_verifiability 必须按候选信号动态计算，不是常数 0.5
+    v_full = RC._verifiability({"verification_steps": ["a"], "supported_by_data": True,
+                                "history_case": {"id": "x"}, "conclusion_status": "数据支持"})
+    v_steps = RC._verifiability({"verification_steps": ["a"], "supported_by_data": False,
+                                 "history_case": None})
+    v_unknown = RC._verifiability({"verification_steps": [], "supported_by_data": False,
+                                   "history_case": None, "conclusion_status": "未知"})
+    v_empty = RC._verifiability({})
+    check("P1-5：_verifiability 动态计算（多分支取值不同，不是常数 0.5）",
+          len({v_full, v_steps, v_unknown, v_empty}) >= 3,
+          "full=%.3f steps=%.3f unknown=%.3f empty=%.3f"
+          % (v_full, v_steps, v_unknown, v_empty))
+    check("P1-5：数据全支撑→可验证性最高且封顶 1.0", abs(v_full - 1.0) < 1e-9, "full=%.3f" % v_full)
+    check("P1-5：无信号『未知』→可验证性压到最低 0.1",
+          abs(v_unknown - 0.1) < 1e-9, "unknown=%.3f" % v_unknown)
+
+    # 集成验证：总分里确实含 0.10*verifiability 这一项
+    # （_evidence_gate 只可能乘 1.0 / 0.6 / 0.45，据此反推 raw 应吻合）
+    _bad = None
+    for c in cands:
+        _ev = c.get("evidence_score") or 0.0
+        _pr = c.get("prior_score") or 0.0
+        _ts = c.get("temporal_score") or 0.0
+        _vf = c.get("verifiability_score") or 0.0
+        _raw = 0.40 * _ev + 0.35 * _pr + 0.15 * _ts + 0.10 * _vf
+        if not any(abs(round(c.get("score", 0), 3) - round(_raw * k, 3)) < 1e-6
+                   for k in (1.0, 0.6, 0.45)):
+            _bad = (c.get("param_key"), c.get("score"), round(_raw, 4),
+                    (_ev, _pr, _ts, _vf))
+            break
+    check("P1-5：总分含 0.10*verifiability 权重（门禁乘数 1.0/0.6/0.45 均吻合）",
+          _bad is None, "不符：%s" % str(_bad))
+
 
 def test_concurrent_write_integrity():
     """并发写不得撕裂（P2-1 隔离的数据完整性底座）。

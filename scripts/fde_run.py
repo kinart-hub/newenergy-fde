@@ -1702,6 +1702,34 @@ def rule_d8_closure_gate():
     return _r(True, "", {"closure": True, "dates": True, "wired": True})
 
 
+def rule_p1_verifiability_weighted():
+    """P1-5：根因评分的可验证性权重必须真正生效，不得硬编码 0.5 后假装算过。
+
+    改造前 0.10*verifiability 里的 verifiability 恒等于 0.5：没算进排序分、
+    也不随候选输出，这一项权重从没生效过——等于写了一套"看起来有可解释性"的评分。
+    """
+    t = _read(ROOTCAUSE_FILE) or ""
+    if not t:
+        return _r(False, "读不到 " + ROOTCAUSE_FILE)
+    # 1) 必须有按候选动态计算可验证性的函数
+    if "def _verifiability(" not in t:
+        return _r(False, "缺少 _verifiability：可验证性权重仍可能被硬编码")
+    # 2) 不得写死 0.5：两种写法都算退化
+    if re.search(r"verifiability\s*=\s*0\.5", t):
+        return _r(False, "可验证性仍硬编码为 0.5：权重未真正生效")
+    if re.search(r"0\.10\s*\*\s*0\.5", t):
+        return _r(False, "评分仍写死 0.10*0.5：可验证性未参评")
+    # 3) 收尾段必须把可验证性分项计入总分（正确调用形态：0.10 * _vf）
+    if not re.search(r"0\.10\s*\*\s*_vf", t):
+        return _r(False, "总分未含 0.10*_vf：可验证性未计入排序")
+    # 4) 候选必须输出分项，且返回体注明权重是启发式非概率
+    if '"verifiability_score"' not in t:
+        return _r(False, "候选未输出 verifiability_score：使用者看不到这一项")
+    if '"score_note"' not in t:
+        return _r(False, "返回体未注明权重为排序启发式而非概率")
+    return _r(True, "", {"verifiability_weighted": True})
+
+
 AUDIT_RULES = [
     Rule("LICENSE 为 Elastic 2.0 官方纯文本", rule_license,
          "LICENSE 首行必须是裸文本 'Elastic License 2.0'（前面有 # 或 ## 即判不过）",
@@ -2229,6 +2257,24 @@ AUDIT_RULES = [
                   _re_sub(r"^[ \t]+d8 = derive_d8\(res, lead, card=card\)",
                           "    d8 = derive_d8(res, lead)",
                           flags=re.M), EIGHTD_FILE)]),
+
+    Rule("根因可验证性权重必须真正生效，不得硬编码 0.5",
+         rule_p1_verifiability_weighted,
+         "P1-5。根因评分的 0.10*可验证性 原先里 verifiability 恒等于 0.5："
+         "既没算进排序分，也不随候选输出，这一项权重从没生效过。"
+         "必须：① 有按候选动态计算可验证性的函数；② 不再写死 0.5；"
+         "③ 总分含 0.10*_vf；④ 候选输出 verifiability_score 且返回体注明权重是启发式非概率。",
+         ROOTCAUSE_FILE,
+         [_mutant("可验证性计算函数改名（消掉定义）",
+                  _re_sub(r"^def _verifiability\(",
+                          "def _verifiability2(", flags=re.M), ROOTCAUSE_FILE),
+          _mutant("总分写死 0.10*0.5（权重不再参评）",
+                  _re_sub(r"0\.40 \* _ev \+ 0\.35 \* _pr \+ 0\.15 \* _ts \+ 0\.10 \* _vf",
+                          "0.40 * _ev + 0.35 * _pr + 0.15 * _ts + 0.10 * 0.5",
+                          flags=re.M), ROOTCAUSE_FILE),
+          _mutant("候选不再输出可验证性分项",
+                  _re_sub(r'c\["verifiability_score"\] = round\(_vf, 3\)',
+                          "pass  # 不再输出分项", flags=re.M), ROOTCAUSE_FILE)]),
 ]
 
 

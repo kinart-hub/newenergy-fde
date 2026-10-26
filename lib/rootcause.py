@@ -6,7 +6,8 @@ rootcause.py —— 不良根因定位引擎
   A. 知识库先验：缺陷类型 → 候选参数 → 机理 → 验证清单（process_specs.json）
   B. 数据证据  ：候选参数在实际数据中的关联强度 / 分组差异 / 时序吻合度
 
-综合得分 = 0.40*数据证据 + 0.35*知识先验 + 0.15*时序吻合 + 0.10*可验证性
+综合得分（排序启发式，非概率）= 0.40*数据证据 + 0.35*知识先验 + 0.15*时序吻合 + 0.10*可验证性
+可验证性（P1-5）原为硬编码 0.5，现按候选真实信号动态计算并随候选输出。
 输出：候选根因排序、5Why 链条、良率损失 Pareto、数据缺口清单。
 """
 
@@ -399,6 +400,29 @@ def _evidence_gate(score, det):
     return score, None
 
 
+def _verifiability(c):
+    """可验证性（P1-5）：这个候选被提出后，能不能被一套明确步骤确认或推翻。
+
+    不是概率，是排序启发式的一项权重输入，取值 [0.05, 1.0]。
+    原实现硬编码为 0.5，既不算进排序、也不随候选输出——等于这一项权重从没生效。
+    现在由"提出后能否被验证"的信号决定：
+      + 有可执行的验证步骤（verification_steps 非空）
+      + 有数据支撑（supported_by_data，可重复复核）
+      + 有历史验证路径（history_case，已被现场证实过可验）
+    基线 0.2；全无信号、且连验证步骤都没有"未知"假设压到 0.1。
+    """
+    v = 0.20
+    if c.get("verification_steps"):
+        v += 0.30
+    if c.get("supported_by_data"):
+        v += 0.30
+    if c.get("history_case"):
+        v += 0.20
+    if c.get("conclusion_status") == "未知" and not c.get("verification_steps"):
+        v = 0.10
+    return max(0.05, min(1.0, v))
+
+
 def _chain_processes(proc):
     """本工序 + 上下游链内的工序集合，用于把跨工序串味的候选挡在外面"""
     if not proc:
@@ -481,15 +505,17 @@ def rank_root_causes(defect_name, table, target_col=None, top=5,
         tscore, tdet = 0.0, None
         if det.get("column") and target_col:
             tscore, tdet = _temporal_match(table, det["column"], target_col)
-        verifiability = 0.5
-        score = 0.40 * ev + 0.35 * prior + 0.15 * tscore + 0.10 * verifiability
-        score, gate_note = _evidence_gate(score, det)
+        # 注意：可验证性（P1-5）不再硬编码 0.5，留到 _annotate_evidence 之后
+        # 按候选真实信号统一计算并计入总分（见下方 post-annotation 重算段）。
+        # 这里先只累加前三项，verifiability 分项在收尾时补全。
+        base = 0.40 * ev + 0.35 * prior + 0.15 * tscore
+        gate_note = _evidence_gate(base, det)[1]
         cands.append({
             "param_key": pk,
             "param": det.get("column"),  # 原始列名，供后续取规格与实际数据用
             "param_name": spec.get("name", pk),
             "unit": spec.get("unit", ""),
-            "score": round(score, 4),
+            "score": round(base, 4),     # 占位，post-annotation 重算为含可验证性的总分
             "evidence_score": round(ev, 3),
             "prior_score": round(prior, 3),
             "temporal_score": round(tscore, 3),
@@ -540,13 +566,13 @@ def rank_root_causes(defect_name, table, target_col=None, top=5,
             if det.get("column"):
                 tscore, tdet = _temporal_match(table, det["column"], target_col)
             prior = 0.35                       # 先验低于知识库候选，但证据硬
-            score = 0.40 * ev + 0.35 * prior + 0.15 * tscore + 0.10 * 0.5
+            base = 0.40 * ev + 0.35 * prior + 0.15 * tscore
             cands.append({
                 "param_key": pk,
                 "param": det.get("column"),
                 "param_name": pspec.get("name", pk),
                 "unit": pspec.get("unit", ""),
-                "score": round(score, 4),
+                "score": round(base, 4),     # 占位，post-annotation 重算为含可验证性的总分
                 "evidence_score": round(ev, 3),
                 "prior_score": round(prior, 3),
                 "temporal_score": round(tscore, 3),
@@ -573,6 +599,20 @@ def rank_root_causes(defect_name, table, target_col=None, top=5,
     cands.sort(key=lambda d: -d["score"])
     _annotate_evidence(cands, table, target_col, info or {})
 
+    # P1-5：可验证性权重此前硬编码 0.5、不算进排序、不随候选输出。
+    # 现在统一按候选真实信号计算，并计入总分 + 输出分项（verifiability_score）。
+    for c in cands:
+        _ev = c.get("evidence_score") or 0.0
+        _pr = c.get("prior_score") or 0.0
+        _ts = c.get("temporal_score") or 0.0
+        _vf = _verifiability(c)
+        _final = 0.40 * _ev + 0.35 * _pr + 0.15 * _ts + 0.10 * _vf
+        _final, _gate = _evidence_gate(_final, c.get("detail") or {})
+        c["verifiability_score"] = round(_vf, 3)
+        c["score"] = round(_final, 4)
+        c["gate_note"] = _gate
+    cands.sort(key=lambda d: -d["score"])
+
     # 数据充分性：**排序这件事本身**能不能站得住，和每条候选的证据，是两回事。
     # 一条候选可以诚实地标着"机理支持"，但如果整张表只有两行，
     # 那这份排序整体就不能被当成"本轮数据的结论"来读。
@@ -589,6 +629,10 @@ def rank_root_causes(defect_name, table, target_col=None, top=5,
         "history_cases": [hist[k] for k in hist],
         "status": suf["status"],
         "data_sufficiency": suf,
+        # P1-5：明确权重是排序启发式而非概率，避免被读成"该参数确为根因的概率"
+        "score_note": ("综合得分为排序启发式权重之和"
+                       "（0.40 数据证据 + 0.35 知识先验 + 0.15 时序吻合 + 0.10 可验证性），"
+                       "不是概率，不代表该参数确为根因的概率；可验证性分项见各候选 verifiability_score"),
     }
 
 
