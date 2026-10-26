@@ -18,13 +18,108 @@ import math
 # ------------------------------------------------------------------ 基础数学
 
 
+def is_num(v):
+    """是否为可用于统计的**有限**数值。
+
+    None、NaN、±Inf、字符串及其他非数值类型一律算不可用。
+
+    为什么必须显式排除 NaN 与 ±Inf（而不是只判 `is not None`）：
+    - NaN 参与 sum() 会把整个均值污染成 NaN，然后一路静默传下去：
+      下游拿到 None/nan 后通常按"算不出来"处理 —— 一个真实存在的强相关
+      就这样从根因候选里消失，报告上写的是"未发现相关因素"。
+    - NaN 参与 sorted() 不产生稳定序（NaN 的任何比较都是 False），
+      中位数与分位数会取到错的那一段。
+    - to_number() 已经把 "nan"/"NaN" 挡成 None，但 **inf / Infinity 能进来**
+      （实测 to_number("inf") -> inf），所以这层不能省。
+
+    bool 保留为准入：True/False 具有明确的 1/0 语义，且不影响既有调用方。
+    """
+    if isinstance(v, bool):
+        return True
+    if not isinstance(v, (int, float)):
+        return False
+    return math.isfinite(v)
+
+
+def finite_list(xs):
+    """剔除不可用值，返回可直接参与统计的 float 列表。
+
+    遇到**非数值**（区别于 None/NaN/Inf 这类"表示缺失"的值）时记一笔降级台账：
+    那说明上游没把值转干净，静默跳过会让结果看起来正常。
+    """
+    out, bad = [], 0
+    for v in (xs or []):
+        if is_num(v):
+            out.append(float(v))
+        elif v is not None and v != v:      # NaN
+            bad += 1
+        elif isinstance(v, float) and (v == math.inf or v == -math.inf):
+            bad += 1
+        elif v is not None and not isinstance(v, (int, float)):
+            bad += 1
+    if bad and degrade is not None:
+        try:
+            degrade.note("stats.finite_list",
+                         ValueError("剔除了 %d 个不可用值（NaN/Inf/非数值）" % bad))
+        except Exception:
+            # scan:keep 台账自身必须静默：finite_list 在统计热路径上被调用，
+            # 记账失败不能反过来让 mean/stdev 抛异常。
+            # 真正的降级信号是返回值里少了那几个坏值，且 degrade.drain() 会带上。
+            pass
+    return out
+
+
+def finite_pairs(xs, ys):
+    """**按原始行号**成对取两侧都可用的观测。
+
+    这是全流水线做任意两列统计的唯一正确入口。
+
+    为什么不能有"先压缩一列再与另一列 zip"的写法：
+    那种写法在某一列**中间**存在缺失时会把第 i 行配到第 j 行，
+    样本数 n 看着还完全正常，只有配对内容是错的。
+
+    返回 (pairs, meta)。meta 记录：
+    - n_raw / n_paired / n_excluded
+    - excluded_reasons：按原因分类的计数（便于在报告里说明"为什么少了这些行"）
+    - length_mismatch：两列长度是否不一致（结构性问题，必须显性暴露）
+    """
+    xs = list(xs or [])
+    ys = list(ys or [])
+    pairs = []
+    reasons = {}
+    n = min(len(xs), len(ys))
+    mismatch = abs(len(xs) - len(ys))
+    if mismatch:
+        reasons["length_mismatch"] = mismatch
+    for i in range(n):
+        a, b = xs[i], ys[i]
+        ok_a, ok_b = is_num(a), is_num(b)
+        if ok_a and ok_b:
+            pairs.append((float(a), float(b)))
+        elif not ok_a and not ok_b:
+            reasons["both_unusable"] = reasons.get("both_unusable", 0) + 1
+        elif not ok_a:
+            reasons["x_unusable"] = reasons.get("x_unusable", 0) + 1
+        else:
+            reasons["y_unusable"] = reasons.get("y_unusable", 0) + 1
+    meta = {
+        "n_raw": max(len(xs), len(ys)),
+        "n_paired": len(pairs),
+        "n_excluded": max(len(xs), len(ys)) - len(pairs),
+        "excluded_reasons": reasons,
+        "length_mismatch": mismatch,
+        "aligned_by": "row_index",
+    }
+    return pairs, meta
+
+
 def mean(xs):
-    xs = [x for x in xs if x is not None]
+    xs = finite_list(xs)
     return sum(xs) / len(xs) if xs else None
 
 
 def variance(xs, ddof=1):
-    xs = [x for x in xs if x is not None]
+    xs = finite_list(xs)
     n = len(xs)
     if n <= ddof:
         return None
@@ -38,7 +133,7 @@ def stdev(xs, ddof=1):
 
 
 def median(xs):
-    xs = sorted(x for x in xs if x is not None)
+    xs = sorted(finite_list(xs))
     n = len(xs)
     if n == 0:
         return None
@@ -49,7 +144,7 @@ def median(xs):
 
 def quantile(xs, q):
     """q in [0,1]，线性插值"""
-    xs = sorted(x for x in xs if x is not None)
+    xs = sorted(finite_list(xs))
     n = len(xs)
     if n == 0:
         return None
@@ -102,7 +197,7 @@ def kurtosis(xs, excess=True):
 
 
 def covariance(xs, ys):
-    pairs = [(x, y) for x, y in zip(xs, ys) if x is not None and y is not None]
+    pairs, _meta = finite_pairs(xs, ys)
     n = len(pairs)
     if n < 2:
         return None
@@ -259,7 +354,7 @@ def f_sf(f, df1, df2):
 
 def pearson(xs, ys):
     """返回 (r, p, n)"""
-    pairs = [(x, y) for x, y in zip(xs, ys) if x is not None and y is not None]
+    pairs, _meta = finite_pairs(xs, ys)
     n = len(pairs)
     if n < 3:
         return None, None, n
@@ -295,7 +390,7 @@ def _rank(values):
 
 
 def spearman(xs, ys):
-    pairs = [(x, y) for x, y in zip(xs, ys) if x is not None and y is not None]
+    pairs, _meta = finite_pairs(xs, ys)
     if len(pairs) < 3:
         return None, None, len(pairs)
     xs2 = [p[0] for p in pairs]

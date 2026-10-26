@@ -27,6 +27,7 @@
 """
 
 import argparse
+import io
 import json
 import sys
 
@@ -240,6 +241,62 @@ def check_required():
     return missing_required, missing_rec
 
 
+def check_doc_counts():
+    """文档里写的自检项数必须和实测一致。
+
+    外部审计报告指出的 P2-5：README 正文写 279、徽章写 293，
+    两者不一致。但它俩都跟实际项数也对不上 —— 手工维护的数字必然漂移。
+
+    根治不是把数字改对（下次还会漂），而是**让机器去核**。
+    """
+    import subprocess
+    try:
+        r = subprocess.run([sys.executable, os.path.join("scripts", "selftest.py")],
+                           capture_output=True, text=True, timeout=900,
+                           cwd=ROOT, encoding="utf-8", errors="replace")
+        blob = (r.stdout or "") + (r.stderr or "")
+    except Exception as exc:
+        return [("BLOCK", "跑不出自检项数，无法核对文档：%s" % exc)]
+    m = re.search(r"通过 (\d+) 项，失败 (\d+) 项", blob)
+    if not m:
+        return [("BLOCK", "自检输出里读不到『通过 N 项』：可能是跑挂了")]
+    passed, failed = int(m.group(1)), int(m.group(2))
+    total = passed + failed
+    if failed:
+        return [("BLOCK", "自检本身有 %d 项失败，不允许上架" % failed)]
+
+    readme_rel = os.path.join("README.md")
+    readme = os.path.join(ROOT, readme_rel)
+    if not os.path.exists(readme):
+        return []
+    try:
+        text = io.open(readme, encoding="utf-8").read()
+    except Exception:
+        return []
+
+    # 元素结构必须与 scan() 产出的 warns 一致（file/line/rule/hit/snippet），
+    # 否则汇总那步 it["file"] 会在字符串上炸 TypeError。
+    found = []
+    # 徽章：selftest-NNN%20passing
+    for n in set(int(x) for x in re.findall(r"selftest-(\d+)%20passing", text)):
+        if n != total:
+            found.append("README 徽章写 %d 项，实测 %d 项" % (n, total))
+    # 正文：NNN 项端到端自检。只看「当前状态」那部分，
+    # 历史变更条目里的数字是当年的事实，不该被判漂移。
+    head = text[:text.find("## 变更")] if "## 变更" in text else text[:4000]
+    for n in set(int(x) for x in re.findall(r"(\d+)\s*项端到端自检", head)):
+        if n != total:
+            found.append("README 正文写 %d 项端到端自检，实测 %d 项" % (n, total))
+    return [("WARN", msg) for msg in found]
+    # 正文：NNN 项端到端自检。只看「当前状态」那部分，
+    # 历史变更条目里的数字是当年的事实，不该被判漂移。
+    head = text[:text.find("## 变更")] if "## 变更" in text else text[:4000]
+    for n in set(int(x) for x in re.findall(r"(\d+)\s*项端到端自检", head)):
+        if n != total:
+            out.append(("WARN", "README 正文写 %d 项端到端自检，实测 %d 项" % (n, total)))
+    return out
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="上架前隐私面与可上架性审计")
     ap.add_argument("--strict", action="store_true", help="WARN 也算失败")
@@ -269,6 +326,13 @@ def main(argv=None):
 
     blocks, warns = scan()
     blocks.extend(check_library_hygiene())
+    for lvl, msg in check_doc_counts():
+        if lvl == "BLOCK":
+            blocks.append(msg)
+        else:
+            warns.append({"file": os.path.join("README.md"), "line": 0,
+                          "rule": "文档自检数应与实测一致（手工维护必然漂移）",
+                          "hit": msg, "snippet": msg})
     miss_req, miss_rec = check_required()
 
     only_warnings = list(warns)

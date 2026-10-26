@@ -615,6 +615,10 @@ AUDIT_FILES = [
     os.path.join("lib", "eightd.py"),
     os.path.join("lib", "rootcause.py"),
     os.path.join("lib", "views.py"),
+    # 变异要在这两个文件里注入缺陷，缺了它们规则会静默 SKIP（不是 FAIL）
+    os.path.join("lib", "correlation.py"),
+    os.path.join("lib", "direction.py"),
+    os.path.join("lib", "stats.py"),
     os.path.join("knowledge", "process_specs.json"),
 ]
 
@@ -1000,6 +1004,8 @@ def rule_defect_refs_not_dangling():
 
 
 ROOTCAUSE_FILE = os.path.join("lib", "rootcause.py")
+CORRELATION_FILE = os.path.join("lib", "correlation.py")
+DIRECTION_FILE = os.path.join("lib", "direction.py")
 EIGHTD_FILE = os.path.join("lib", "eightd.py")
 PIPELINE_FILE = os.path.join("lib", "pipeline.py")
 VIEWS_FILE = os.path.join("lib", "views.py")
@@ -1294,6 +1300,55 @@ def rule_defect_process_first():
     # 4. 结果里必须把这个标记带出去，否则前面标了也没人用
     if '"cross_process"' not in body:
         return _r(False, "identify_defects 的返回里没有 cross_process 字段")
+    return _r(True, "", {"ok": True})
+
+
+def rule_corr_row_aligned():
+    """P0-1：目标列配对必须按原始行号，不得先压缩再 zip。
+
+    判据落在调用形态上（只查"finite_pairs 出现过"会被 Sidney 绕过去）：
+      1. 必须用 S.finite_pairs 做成对过滤；
+      2. 第二个参数必须是**原始**目标列 y_raw；
+      3. 同一文件里不许再存在"先把目标列压缩一遍"的写法——那正是错位成因。
+    """
+    t = _read(CORRELATION_FILE) or ""
+    if not t:
+        return _r(False, "读不到 " + CORRELATION_FILE)
+    if not re.search(r"pairs,\s*meta\s*=\s*S\.finite_pairs\(", t, re.M):
+        return _r(False, "association_with_target 未使用 S.finite_pairs 做成对过滤")
+    if not re.search(r"S\.finite_pairs\(vals,\s*y_raw\)", t, re.M):
+        return _r(False, "配对的目标列不是原始列 y_raw——换成压缩列表后"
+                        "第 i 行会被配到第 j 行，而样本数看起来完全正常")
+    if re.search(r"^\s*y\s*=\s*\[v for v in y_raw if v is not None\]", t, re.M):
+        return _r(False, "源码里仍存在把目标列先压缩的写法（它就是错位的成因）")
+    return _r(True, "", {"ok": True})
+
+
+def rule_direction_symmetric():
+    """P0-2：六个方向必须各自成立、两两对称。
+
+    判据不只查"有没有这个函数"，而是查四个判定式：
+      - higher_is_worse / lower_is_better -> m
+      - lower_is_worse  / higher_is_better -> -m（缺这个良率类就反向）
+      - target_is_best  -> |m - target|
+      - two_sided_spec  -> |m - center|
+    """
+    t = _read(DIRECTION_FILE) or ""
+    if not t:
+        return _r(False, "读不到 " + DIRECTION_FILE)
+    pos_ok = re.search(
+        r'if direction == "higher_is_worse" or direction == "lower_is_better":\s*\n'
+        r'\s*return m', t, re.M)
+    neg_ok = re.search(
+        r'if direction in \("lower_is_worse",\s*"higher_is_better"\):\s*\n'
+        r'\s*return -m', t, re.M)
+    if not (pos_ok and neg_ok):
+        return _r(False, "两个方向必须互为相反数；缺了 -m 那一侧，"
+                        "良率/效率这类「越大越好」的指标会被当成「越大越差」")
+    if not re.search(r"abs\(m - float\(target\)\)", t, re.M):
+        return _r(False, "target_is_best 未按与目标值的偏差判定")
+    if not re.search(r"abs\(m - center\)", t, re.M):
+        return _r(False, "two_sided_spec 未按与规格中心的偏差判定")
     return _r(True, "", {"ok": True})
 
 
@@ -1722,6 +1777,51 @@ AUDIT_RULES = [
                   _re_sub(r"^[ \t]+return best_dk, bool\(process\) and scope is dr_all",
                           "        return best_dk, False",
                           flags=re.M), ROOTCAUSE_FILE)]),
+
+    # ---- P0 统计正确性（外部深度审计报告指出，已本地复现）----
+
+    Rule("相关性分析必须按原始行号配对", rule_corr_row_aligned,
+         "association_with_target 里构造 pair 时必须把候选列与 **原始** 目标列 "
+         "y_raw 一起交给 statistical pairing，不得先把 y_raw 压缩成 [v for v in "
+         "y_raw if v is not None] 再配对。"
+         "为什么必须这样：目标列中间缺值时，压缩后的第 i 个不再是第 i 行，"
+         "样本数 n 却完全正常 —— 只有配对内容是错的。实测 Y=2X 完美线性被算成 "
+         "r=0.996523，随机数据里更造出过「本质无关 r=-0.025 却报 -0.829」的假强相关，"
+         "一个毫不相干的参数会被排进根因候选前列。",
+         CORRELATION_FILE,
+         [_mutant("改回先压缩目标列再配对的错位写法",
+                  _re_sub(r"^[ \t]+pairs, meta = S\.finite_pairs\(vals, y_raw\)",
+                          "        _yc = [v for v in y_raw if v is not None]\n"
+                          "        pairs, meta = S.finite_pairs(vals, _yc)",
+                          flags=re.M), CORRELATION_FILE),
+          _mutant("去掉行维度的配对、退回逐列过滤",
+                  _re_sub(r"^[ \t]+pairs, meta = S\.finite_pairs\(vals, y_raw\)",
+                          "        pairs = [(a, b) for a, b in zip(vals, y_raw)\n"
+                          "                  if a is not None and b is not None]\n"
+                          "        meta = {\"n_raw\": len(vals), \"n_paired\": len(pairs),\n"
+                          "                \"n_excluded\": 0, \"excluded_reasons\": {},\n"
+                          "                \"length_mismatch\": 0, \"aligned_by\": \"zip\"}",
+                          flags=re.M), CORRELATION_FILE)]),
+
+    Rule("目标方向必须对称成立", rule_direction_symmetric,
+         "lib/direction.py 里 _deviation 对 lower_is_worse / higher_is_better "
+         "必须返回 -m（反向计入不利程度），与 higher_is_worse / lower_is_better "
+         "严格对称；target_is_best / two_sided_spec 则必须按与目标值或规格中心的"
+         "偏差判定，不得退化成直接比较均值。"
+         "为什么必须这样：'最差档'写死为均值最大时，良率/效率这类越大越好的指标"
+         "会被反向指认 —— 横向排查会把全场表现最好的那台标成最差，"
+         "并生成『重点核查 A机』的行动建议。反向派人比不给建议更糟。",
+         DIRECTION_FILE,
+         [_mutant("lower_is_worse 与 higher_is_worse 同向（方向失效）",
+                  _re_sub(r'^[ \t]+if direction in \("lower_is_worse", '
+                          r'"higher_is_better"\):\n[ \t]+return -m',
+                          '    if direction in ("lower_is_worse", '
+                          '"higher_is_better"):\n        return m',
+                          flags=re.M), DIRECTION_FILE),
+          _mutant("目标值最佳不再按偏离目标判定",
+                  _re_sub(r"^[ \t]+return abs\(m - float\(target\)\)",
+                          "        return m",
+                          flags=re.M), DIRECTION_FILE)]),
 ]
 
 

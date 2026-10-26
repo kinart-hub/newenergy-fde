@@ -1741,6 +1741,294 @@ def test_views():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_p0_align_and_direction():
+    """P0-1 相关性行对齐 + P0-2 目标方向。两条都是"结论看起来完全正常、只是错的"。
+
+    P0-1 守的病灶：目标列先被 `[v for v in y_raw if v is not None]` 压缩，
+    再与原始长度的候选列 zip —— 目标列**中间**缺值时整列错位，
+    而样本数 n 看着完全正常。实测过的两个后果：
+        Y=2X 完美线性被算成 r=0.996523
+        无关数据被算成 r=-0.8288（真值 -0.0254），直接冲进根因候选前列
+
+    P0-2 守的病灶："最差档"写死为均值最大。目标是良率/效率这类"越大越好"
+    的指标时，它会把全场表现最好的那台标成最差，并生成"重点核查 A机"。
+    """
+    import random as _rd
+    print("\nQ. P0 统计正确性：行对齐与目标方向")
+    try:
+        from lib import correlation as COR, direction as DIR
+    except Exception as e:
+        check("P0 测试依赖可导入", False, str(e))
+        return
+
+    def _mk(xs, ys, yname="Y"):
+        return T.Table(["X", yname], [[x, y] for x, y in zip(xs, ys)])
+
+    # ---------- P0-1：目标列缺失位置 ----------
+    base_x = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+    cases = {
+        "中间缺失": [2, 4, None, 8, 10, 12, 14, 16, 18, 20, 22, 24],
+        "首行缺失": [None, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24],
+        "末行缺失": [2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, None],
+        "多处缺失": [2, None, 6, None, 10, 12, 14, 16, None, 20, 22, 24],
+    }
+    for label, ys in cases.items():
+        r = COR.association_with_target(_mk(base_x, ys), "Y", min_n=5)
+        got = None if not isinstance(r, list) else r[0]["r"]
+        # Y=2X 去掉缺行后仍是完美线性，r 必须精确为 1
+        check("P0-1 目标列%s时 r 仍为完美线性" % label, approx(got, 1.0, 1e-9),
+              "r=%s" % (None if got is None else round(got, 8)))
+
+    # 曾经被错位制造出来的**假强相关**（-0.8288），真值几乎无关
+    _x2 = [31.1, 42.3, 31.7, 49.2, 42.5, 46.1, 22.5, 16.6, 20.7, 21.9,
+           11.8, 29.5, 47.1, 34.8]
+    _y2 = [1.4, 1.1, 1.4, None, 1.7, None, 1.4, None, 0.0, 2.4, 3.0, 3.8,
+           2.4, 3.2]
+    r2 = COR.association_with_target(_mk(_x2, _y2), "Y", min_n=8)
+    got2 = None if not isinstance(r2, list) else r2[0]["r"]
+    check("P0-1 错位曾造出的假强相关已消失", abs(got2) < 0.15,
+          "错位版=-0.8288，现 r=%s" % (None if got2 is None else round(got2, 4)))
+
+    # 双方同一行缺失：少一行，且 r 仍应为 1
+    _x3 = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    _y3 = [2, 4, None, 8, 10, 12, 14, 16, 18, 20]
+    r3 = COR.association_with_target(_mk(_x3, _y3), "Y", min_n=5)
+    check("P0-1 自变量同位置缺失不破坏对齐",
+          isinstance(r3, list) and approx(r3[0]["r"], 1.0, 1e-9),
+          str(None if not isinstance(r3, list) else round(r3[0]["r"], 8)))
+
+    # ---------- 元数据：能交代清楚"哪些行没进分析、为什么" ----------
+    rm = COR.association_with_target(_mk(base_x, cases["中间缺失"]), "Y", min_n=5)
+    d0 = rm[0] if isinstance(rm, list) else {}
+    check("P0-1 排除行数进入结果元数据", d0.get("n_excluded") == 1,
+          "n_excluded=%s" % d0.get("n_excluded"))
+    check("P0-1 排除原因可追溯",
+          (d0.get("excluded_reasons") or {}).get("y_unusable") == 1,
+          str(d0.get("excluded_reasons")))
+    check("P0-1 明确标注按行号对齐", d0.get("aligned_by") == "row_index",
+          str(d0.get("aligned_by")))
+
+    # ---------- NaN / Inf 不得污染 ----------
+    _inf = float("inf")
+    _nan = float("nan")
+    check("NaN 不污染均值", approx(S.mean([1.0, 2.0, _nan, 4.0]), 7.0 / 3, 1e-9),
+          str(S.mean([1.0, 2.0, _nan, 4.0])))
+    check("Inf 不污染均值", approx(S.mean([1.0, 2.0, _inf, 4.0]), 7.0 / 3, 1e-9),
+          str(S.mean([1.0, 2.0, _inf, 4.0])))
+    r4 = COR.association_with_target(
+        _mk([1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+            [2, 4, 6, _inf, 10, 12, 14, 16, 18, 20]), "Y", min_n=5)
+    check("Inf 不会让相关系数退化成算不出来",
+          isinstance(r4, list) and approx(r4[0]["r"], 1.0, 1e-9),
+          str(None if not isinstance(r4, list) else round(r4[0]["r"], 8)))
+
+    # ---------- 目标列不可用：必须显性失败，不能变成"未发现相关因素" ----------
+    rempty = COR.association_with_target(_mk(base_x, [None] * 12), "Y", min_n=8)
+    check("P0-1/P0-3 目标列全空时返回显式状态而非空结论",
+          isinstance(rempty, dict) and rempty.get("status") == "INSUFFICIENT_DATA",
+          str(rempty.get("status") if isinstance(rempty, dict) else rempty))
+
+    # ---------- P0-2：方向 ----------
+    yield_means = {"A机": 0.98, "B机": 0.95, "C机": 0.82}   # 良率：越大越好
+    w = DIR.worst_group(yield_means, direction="lower_is_worse")
+    check("P0-2 良率类指标指认真正最差的那台", w["level"] == "C机",
+          "worst=%s（旧逻辑会指认 %s，即表现最好的那台）"
+          % (w["level"], max(yield_means, key=lambda k: yield_means[k])))
+
+    defect_means = {"A机": 0.02, "B机": 0.05, "C机": 0.18}   # 缺陷率：越大越差
+    check("P0-2 缺陷率类指标同样正确",
+          DIR.worst_group(defect_means, direction="higher_is_worse")["level"] == "C机")
+
+    wu = DIR.worst_group(defect_means)
+    check("P0-2 方向未知时不冒充确定性结论",
+          wu["confident"] is False and wu["assumed"] == DIR.DEFAULT_ASSUMED,
+          "confident=%s assumed=%s" % (wu["confident"], wu["assumed"]))
+
+    wt = DIR.worst_group({"A": 18.2, "B": 20.1, "C": 23.4},
+                         direction="target_is_best", target=20.0)
+    check("P0-2 目标值最佳按偏离程度判定", wt["level"] == "C",
+          "worst=%s" % wt["level"])
+
+    ws = DIR.worst_group({"A": 11, "B": 20, "C": 29.5},
+                         direction="two_sided_spec", lsl=10, usl=30)
+    check("P0-2 双侧规格按距中心偏差判定", ws["level"] == "C",
+          "worst=%s" % ws["level"])
+
+    wmiss = DIR.worst_group({"A": 11, "B": 20, "C": 29.5},
+                            direction="two_sided_spec")
+    check("P0-2 声明了方向却缺规格时不给结论",
+          wmiss["level"] is None and "lsl/usl" in (wmiss.get("note") or ""),
+          str(wmiss.get("note")))
+
+    # 措辞必须三档分明：显式/知识库 不带尾巴，推断 带"推断"，未知 带"假定"
+    check("P0-2 已确认方向不带免责尾巴", DIR.qualifier("explicit") == "")
+    check("P0-2 推断方向提示为推断", "推断" in DIR.qualifier("inferred"))
+    check("P0-2 未知方向提示为假定", "假定" in DIR.qualifier("none", "higher_is_worse"))
+
+    # ---------- 端到端：良率场景下不得反向派人 ----------
+    try:
+        from lib import crossprocess as XP
+        _rd.seed(11)
+        rows = []
+        for i in range(120):
+            eq = ["A机", "B机", "C机"][i % 3]
+            mu = {"C机": 0.82, "B机": 0.95}.get(eq, 0.98)
+            rows.append([eq, round(_rd.gauss(mu, 0.02), 4)])
+        tbl = T.Table(["机台", "涂层良率"], rows)
+        sw = XP.lateral_sweep(tbl, "涂层良率", ["机台"],
+                              target_direction="lower_is_worse")
+        check("P0-2 端到端：良率场景不把最优机台认成最差",
+              bool(sw) and sw[0]["worst_level"] == "C机",
+              str([(x["dim"], x["worst_level"]) for x in sw]))
+    except Exception as e:
+        check("P0-2 端到端横向排查", False, str(e))
+
+
+def test_p1_stdlib_oracle():
+    """P1-1 统计差分验证：用标准库 statistics 作 oracle，对标自研实现。
+
+    项目定位零依赖，所以**生产运行时**不引入 numpy/scipy；
+    但正确性不能靠"没抛异常"来证明。Python 标准库的 statistics 是
+    一条完全独立的实现路径（CPython 自己的算法），可以当 oracle：
+
+        零依赖是部署属性，不是正确性证明。
+        测试期可以用 oracle，运行期仍然零依赖。
+
+    覆盖：均值/标准差/中位数/相关系数；随机数据 + 边界（小样本、零方差、
+    常数序列、极端值）；记录轮次、最大误差、所用容差。
+    """
+    import statistics as ST
+    import random as _rd
+    print("\nR. P1-1 统计差分：stdlib oracle vs 自研实现")
+    _rd.seed(20261027)
+
+    max_err = {"mean": 0.0, "stdev": 0.0, "median": 0.0, "corr": 0.0}
+    rounds = 0
+    bad = []
+    for _ in range(300):
+        n = _rd.randint(3, 60)
+        xs = [_rd.uniform(-500, 500) for _ in range(n)]
+        ys = [_rd.uniform(-20, 20) for _ in range(n)]
+        try:
+            e = abs(S.mean(xs) - ST.mean(xs)); max_err["mean"] = max(max_err["mean"], e)
+            e = abs(S.stdev(xs) - ST.stdev(xs)); max_err["stdev"] = max(max_err["stdev"], e)
+            e = abs(S.median(xs) - ST.median(xs)); max_err["median"] = max(max_err["median"], e)
+            mine = S.pearson(xs, ys)[0]
+            theirs = ST.correlation(xs, ys)
+            e = abs(mine - theirs); max_err["corr"] = max(max_err["corr"], e)
+            rounds += 1
+            if mine is None or not (e <= 1e-9):
+                bad.append(("random", n, mine, theirs))
+        except Exception as ex:
+            bad.append(("exception", n, str(ex)))
+
+    # 边界：零方差（常数序列）——相关系数在此无定义，oracle 会抛错，自研必须返回 None
+    const = [3.0] * 12
+    try:
+        ST.correlation(const, [1.0] * 12)
+        oracle_raised = False
+    except Exception:
+        oracle_raised = True
+    mine_const = S.pearson(const, list(range(12)))[0]
+    check("差分：零方差时自研返回 None（与 oracle 一致地拒绝）",
+          oracle_raised and mine_const is None,
+          "oracle抛错=%s 自研=%s" % (oracle_raised, mine_const))
+
+    # 边界：极端值不产生数值溢出
+    big = [1e12 + i for i in range(20)]
+    check("差分：极端量级下相关系数仍在 [-1,1]",
+          -1.0 <= (S.pearson(big, [i * 2.0 for i in big])[0] or 0) <= 1.0,
+          str(S.pearson(big, [i * 2.0 for i in big])[0]))
+
+    ok = not bad
+    check("差分：%d 轮随机数据与 stdlib statistics 一致（容差 1e-9）" % rounds, ok,
+          "最大误差 mean=%.2e stdev=%.2e median=%.2e corr=%.2e；不一致 %d 例"
+          % (max_err["mean"], max_err["stdev"], max_err["median"],
+             max_err["corr"], len(bad)))
+    if bad:
+        print("        首例：%s" % (bad[0],))
+
+
+def test_p03_failure_not_disguised():
+    """P0-3：模块执行失败不得被读成"没有问题"。
+
+    报告第五章把这条列为主要风险之一：
+    「模块失败、未执行、数据不足和无异常若混为一谈，会产生危险的假阴性」。
+
+    守的是实测出来的两件事：
+      1. 某个护栏环节抛异常后，整轮不再是二次崩溃。原先 try 内部赋值的变量
+         从未被赋值，而 build_report 在 try 外引用它们 -> UnboundLocalError，
+         报错只提变量名，把真正的原因盖得一个字不剩。
+      2. 报告不再把空章节伪装成"查过没问题"，且措辞不得预设原因是数据问题。
+    """
+    import os as _os, tempfile as _tf, io as _io, glob as _gb
+    print("\nS. P0-3 失败状态不得被解释为无发现")
+    try:
+        from lib import pipeline as _PL, correlation as _COR, rootcause as _RC
+    except Exception as e:
+        check("P0-3 测试依赖可导入", False, str(e))
+        return
+
+    def _build_case():
+        tmp = _tf.mkdtemp(prefix="fde_p03_")
+        csv = _os.path.join(tmp, "d.csv")
+        _io.open(csv, "w", encoding="utf-8").write(
+            "时间,涂布速度,面密度,缺陷数\n" + "".join(
+                "2026-01-01 0%d:00,%d,%.1f,%d\n" % (i % 9 + 1, 30 + i % 5,
+                                                    180 + i % 7, i % 4)
+                for i in range(60)))
+        return tmp, csv
+
+    def _run(csv, outdir):
+        return _PL.analyze([csv], outdir=outdir, process="battery_coating",
+                           export_xlsx=False, max_charts=0)
+
+    for label, mod, fn in (("相关性", _COR, "corr_matrix"),
+                           ("根因", _RC, "rank_root_causes")):
+        orig = getattr(mod, fn)
+        def _boom(*a, _f=fn, **k):
+            raise RuntimeError("注入：%s 崩溃" % _f)
+        setattr(mod, fn, _boom)
+        try:
+            tmp, csv = _build_case()
+            outdir = _os.path.join(tmp, "o")
+            err = None
+            try:
+                r = _run(csv, outdir)
+            except Exception as ex:      # 整轮崩溃 = 本检验直接判负
+                err = "%s: %s" % (type(ex).__name__, ex)
+                r = None
+            check("P0-3 %s环节失败后整轮仍能出报告" % label, err is None,
+                  err or "")
+            if r is None:
+                continue
+            deg = [d for d in (r.get("degraded_sections") or [])
+                   if "注入" in str(d.get("error", ""))]
+            check("P0-3 %s环节的失败被记录且带 FAILED 状态" % label,
+                  bool(deg) and deg[0].get("status") == "FAILED",
+                  str(deg[:1]))
+            check("P0-3 %s环节失败标记了 incomplete" % label,
+                  r.get("incomplete") is True, str(r.get("incomplete")))
+            # 报告正文必须看得见，而不是只躺在 result.json 里
+            mds = _gb.glob(_os.path.join(outdir, "*.md"))
+            hit = None
+            for f in mds:
+                t = _io.open(f, encoding="utf-8", errors="replace").read()
+                if "未产出结论" in t and "注入" in t:
+                    hit = f
+                    break
+            check("P0-3 %s环节的失败写进了报告正文" % label, hit is not None,
+                  _os.path.basename(hit) if hit else "正文里找不到")
+            if hit:
+                t = _io.open(hit, encoding="utf-8", errors="replace").read()
+                check("P0-3 报告措辞不把失败说成『没有问题』",
+                      "不是「检查过、没有问题」" in t)
+                check("P0-3 报告措辞不预设原因是数据问题",
+                      "因数据异常未产出" not in t)
+        finally:
+            setattr(mod, fn, orig)
+
+
 def test_defect_process_priority():
     """缺陷匹配必须按工序优先裁决（审计规则 34 只验得动源码形态，验不动运行时）。
 
@@ -1894,6 +2182,9 @@ if __name__ == "__main__":
     test_entry_parity()
     test_views()
     test_defect_process_priority()
+    test_p0_align_and_direction()
+    test_p1_stdlib_oracle()
+    test_p03_failure_not_disguised()
     print("\n" + "=" * 56)
     print("通过 %d 项，失败 %d 项" % (len(PASS), len(FAIL)))
     if FAIL:

@@ -89,7 +89,7 @@ if EV is not None and EV.__name__ != "lib.events":
 KB = PP.load_knowledge()
 _fmt = RPT._fmt
 
-ANALYZER_VERSION = "2.4.0"
+ANALYZER_VERSION = "2.5.0"
 
 
 # 空数据排查清单。
@@ -437,6 +437,36 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
     tables = []
     device_reports = []
     _empty_files = []      # 读到了文件但一行数据都没有（与"读不了"是两回事）
+
+    # ------------------------------------------------------------------
+    # 各护栏环节的输出变量：一律先给默认值，再让后面的 try 去覆盖。
+    #
+    #    为什么必须前置：每一节都包在自己的 try 里，输出变量是在 try 内部赋值的，
+    #    而 build_report 在全部 try 外面统一引用它们。
+    #    某一节真的失败时变量从未赋值，整轮会以 UnboundLocalError 收场，
+    #    报错指向这个变量名，真正的原因（那一节记录在 degraded_sections 里的错误）
+    #    被彻底盖住 —— 使用者去 debug 一个根本没坏的变量。
+    #
+    #    实测：注入让 corr_matrix / rank_root_causes 崩溃，整轮都以
+    #    UnboundLocalError 结束，错误文本一个字都没提真实原因。
+    #    AST 全量排查过 analyze() 内 22 处同型风险，集中在这里一次性兜住。
+    # ------------------------------------------------------------------
+    tb = None
+    main = None
+    col_map = {}
+    spc_res = None
+    assoc = []
+    corr = None
+    lags = []
+    strong = []
+    gcomp = []
+    pare = None
+    root = None
+    gaps = None
+    conf = None
+    doe_plan = None
+    tcol = None
+    times = None
     for p in paths:
         try:
             ing = DEV.ingest(p, sheet=sheet)
@@ -901,19 +931,37 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
     try:  # 护栏：相关性 环节失败只降级本节，不中断整轮
         # 8. 相关性
         corr = CORR.corr_matrix(work, [c for c in numcols][:16])
-        result["corr_columns"] = corr["columns"]
+        # corr_matrix 一旦抛异常，本节的其余计算全都建立在它之上，
+        # 不做这层保护的话降级之后会再崩一次 TypeError（NoneType 不可下标），
+        # 把真正的原因盖掉 —— 与 'gaps' 那个 UnboundLocalError 是同一类问题。
+        if corr is None:
+            result.setdefault("degraded_sections", []).append(
+                {"section": "相关性", "status": "FAILED",
+                 "error": "corr_matrix 未产出相关矩阵",
+                 "impact": "本节结论缺失，不代表『没有问题』"})
+        else:
+            result["corr_columns"] = corr["columns"]
+            result["_corr"] = corr
+            strong = CORR.strong_pairs(corr)
+            result["strong_pairs"] = strong[:10]
+            vifs = CORR.vif(work, corr["columns"][:10])
+            result["vif"] = vifs[:8]
         assoc = []
         if y_col:
             a = CORR.association_with_target(work, y_col)
             if isinstance(a, list):
                 assoc = a
+            elif isinstance(a, dict) and a.get("status") in ("FAILED",
+                                                             "INSUFFICIENT_DATA"):
+                # 目标列不可用时必须把它带的状态一起留下来，
+                # `isinstance(a, list)` 会把带状态的 dict 静默丢成空列表，
+                # 报告上就写成"未发现相关因素"了。
+                result.setdefault("degraded_sections", []).append({
+                    "section": "相关性·目标列", "status": a.get("status"),
+                    "error": a.get("error"),
+                    "impact": "该目标的关联分析未执行，不代表『没有相关因素』"})
         result["association"] = assoc[:15]
         QG.test_condition_warnings(assoc, result)
-        result["_corr"] = corr
-        strong = CORR.strong_pairs(corr)
-        result["strong_pairs"] = strong[:10]
-        vifs = CORR.vif(work, corr["columns"][:10])
-        result["vif"] = vifs[:8]
         lags = []
         if y_col:
             for d in assoc[:5]:
@@ -1096,8 +1144,23 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
         result["confidence"] = conf
 
     except Exception as _guard_e:
+        # 本节的三个输出必须在 except 里显式复位。
+        #
+        #    否则 try 内任意一步失败时它们从未被赋值，而 build_report(...)
+        #    在 try **外面**还会引用 —— 于是降级处理自己再崩一次
+        #    UnboundLocalError: cannot access local variable 'gaps'，
+        #    把这个辜负名字的报错丢给使用者，真实原因（本行记的那条）被彻底盖住。
+        #
+        #    实测：注入让 rank_root_causes 崩溃，整轮以 UnboundLocalError 收场，
+        #    错误文本里一个字都没提根因模块。
+        root = None
+        gaps = None
+        conf = None
         result.setdefault("degraded_sections", []).append(
-            {"section": "根因", "error": str(_guard_e)})
+            {"section": "根因", "error": str(_guard_e),
+             "status": "FAILED",
+             "impact": "本节结论缺失：根因候选、证据缺口与置信等级均未产出，"
+                       "不代表『没有问题』"})
     try:  # 护栏：Pareto 环节失败只降级本节，不中断整轮
         # 11. Pareto
         pare = None
@@ -1318,6 +1381,35 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
     except Exception as _guard_e:
         result.setdefault("degraded_sections", []).append(
             {"section": "知识沉淀候选（只产出候选，绝不自动改写知识库）", "error": str(_guard_e)})
+    # ------------------------------------------------------------------
+    # 13b. 汇总各护栏环节的状态：没跑出来的环节必须显性，不能被读成"没问题"
+    #
+    #    每一节都包在自己的 try 里，失败只降级本节 —— 这是对的。
+    #    但这些节的输出变量是在 try **内部**赋值的，而 build_report 在 try 外面
+    #    统一引用。一旦某一节真的失败，变量从未赋值，整轮会以
+    #    UnboundLocalError 收场，报错文本指向这个变量名，
+    #    把真正的原因（那一节里记录在案的错误）彻底盖住。
+    #
+    #    AST 全量排查过 analyze() 内 22 处同型风险。集中在这里初始化，
+    #    比逐个在 except 里补默认值可靠：任何一个 try 加/删都不会再漏。
+    # ------------------------------------------------------------------
+    degraded = result.get("degraded_sections") or []
+    if degraded:
+        result["incomplete"] = True
+        result["module_summary"] = [
+            {"section": d.get("section"), "status": d.get("status") or "FAILED",
+             "error": d.get("error")}
+            for d in degraded]
+        result.setdefault("warnings", []).append(
+            "本轮有 %d 个分析环节未产出结论（%s）：这些环节是**执行失败**，"
+            "不等于「检查过、没有问题」。相关章节为空属实，请按下述错误排查后重跑。"
+            % (len(degraded), "、".join(str(d.get("section")) for d in degraded)))
+        for d in degraded:
+            if not d.get("status"):
+                d["status"] = "FAILED"
+                d.setdefault(
+                    "impact", "本节结论缺失，不代表『没有问题』")
+
     # 14. 生成报告
     rep = build_report(result, work, spc_res, corr, assoc, pare, root, gaps, conf,
                        doe_plan, gcomp, lags, strong, tcol, times, max_charts)
@@ -1760,10 +1852,18 @@ def build_report(res, work, spc_res, corr, assoc, pare, root, gaps, conf,
         for n in (ad.get("notes") or []):
             rep.callout(s2b, n, "warn")
         if res.get("degraded_sections"):
+            # 措辞三处不能含糊：
+            #   1. 不预设原因。旧文案写死"因数据异常未产出"，可真实原因可能是
+            #      模块缺陷、配置缺失、文件被占用 —— 一律推给数据会误导排查方向。
+            #   2. 不许读成"没问题"。空章节是"没算出来"，不是"检查过没问题"。
+            #   3. 不许写"其余部分不受影响"。下游常常依赖该节的输出。
             rep.callout(s2b,
-                        "以下分析环节因数据异常未产出（报告其余部分不受影响）：%s"
-                        % "；".join("%s（%s）" % (d.get("section"), d.get("error"))
-                                   for d in res["degraded_sections"]), "warn")
+                        "以下 %d 个分析环节**未产出结论**（不是「检查过、没有问题」）：%s。"
+                        "这些环节失败后，依赖它们的下游结论可能偏保守或部分缺失；"
+                        "请把上述错误原文连同数据一起反馈。"
+                        % (len(res["degraded_sections"]),
+                           "；".join("%s：%s" % (d.get("section"), d.get("error"))
+                                    for d in res["degraded_sections"])), "warn")
     if res.get("tenant"):
         rep.callout(s2b if (ad or res.get("degraded_sections")) else s2,
                     "本次分析在企业「%s」的私有知识层下进行，写入不影响其它企业。"
@@ -1906,8 +2006,14 @@ def build_report(res, work, spc_res, corr, assoc, pare, root, gaps, conf,
 
     # 6 相关性
     s6 = rep.section("6. 参数相关性分析")
-    if corr["columns"] and len(corr["columns"]) >= 2:
+    # corr 可能为 None：上游该节执行失败时被护栏降级了。
+    # 消费方不能假设生产者一定成功 —— 假设会换成 NoneType 不可下标的
+    # TypeError 崩掉整份报告，把那一节记下来的真实原因彻底盖住。
+    if corr and corr.get("columns") and len(corr["columns"]) >= 2:
         add_chart(s6, CH.heatmap(corr["matrix"], corr["columns"]), "数值参数相关性矩阵")
+    elif res.get("degraded_sections"):
+        rep.callout(s6, "相关性矩阵本节未产出（上游环节执行失败），"
+                        "详见报告末尾的『未产出结论的环节』。", "warn")
     if assoc:
         rep.table(s6, ["参数", "类型", "效应量", "p 值", "BH 校正后 q", "样本数", "显著性"],
                   [[a["param"], "数值" if a["type"] == "numeric" else "分类",

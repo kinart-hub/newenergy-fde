@@ -20,6 +20,10 @@ actions.py —— 横向排查、永久措施候选、预防性参数优化
 from . import crossprocess as XP
 from . import kbstore as KBS
 from . import stats as S
+try:
+    from . import direction as DIR       # 包模式
+except Exception:                        # 脚本模式无包上下文
+    import direction as DIR              # noqa
 
 
 # ------------------------------------------------------------------ 横向排查
@@ -82,10 +86,14 @@ def lateral_plan(table, target_col=None, defect=None, current_process=None,
                     r["worst_mean"], r["best_mean"], r["ratio"])
             else:
                 quant = "均值 %.4g（最优档 %.4g）" % (r["worst_mean"], r["best_mean"])
+            # 方向来自"登记/指定"才算已确认；推断或假定的必须把前提写进句子里，
+            # 否则读的人不知道这个"重点核查"是踩在一个未经核实的假定上的。
+            _qual = DIR.qualifier(r.get("direction_source"),
+                                  r.get("direction_assumed"))
             out["checklist"].append({
                 "scope": "空间横向",
-                "action": "按「%s」逐档对比：重点核查 %s，%s"
-                          % (r["dim"], r["worst_level"], quant),
+                "action": "按「%s」逐档对比：重点核查 %s，%s%s"
+                          % (r["dim"], r["worst_level"], quant, _qual),
                 "basis": "η²=%.3f, p=%s（该维度解释度 %.1f%%）%s"
                          % (r["eta_sq"], S.fmt_p(r["p"], 3), r["eta_sq"] * 100, r["note"]),
             })

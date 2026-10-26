@@ -33,6 +33,10 @@ import math
 from . import table as T
 from . import stats as S
 from . import preprocess as PP
+try:
+    from . import direction as DIR       # 包模式
+except Exception:                        # 脚本模式无包上下文
+    import direction as DIR              # noqa
 
 KB_CACHE = {}
 
@@ -693,13 +697,19 @@ def _decide(contrib, probes, ups, bad_idx):
 # ------------------------------------------------------------------ 横向排查
 
 def lateral_sweep(table, target_col, group_cols, min_group=5, max_levels=12,
-                  adjust_for=None):
+                  adjust_for=None, target_direction=None, target_value=None,
+                  spec_limits=None, kb_params=None):
     """
     横向排查：按各分组维度扫描，找出"只有某些机台/批次/班次才有问题"的热点。
 
     adjust_for —— 指定一个主导因子，先做残差化剥离它再比较分组。
     存在强主因子时这个参数不是选修课：线速切换、温度阶跃造成的波动远大于设备间差异，
     不剥离的话所有设备看起来都一样，真有偏差的那台会被淹没掉（漏报）。
+
+    target_direction —— 目标列的方向（越大越差 / 越大越好 / 有目标值…）。
+    原来这里写死 `max(means)` 当"最差档"，只在"越大越差"的指标上成立。
+    目标是良率/效率这类"越大越好"的指标时，它会把**全场表现最好的那台**
+    标成最差档，并给出"建议先查这一台"的判断 —— 反向派人。
     """
     work, used_cov, adjust_df = table, None, 0
     if adjust_for and adjust_for != target_col and table.col_index(adjust_for) is not None:
@@ -711,6 +721,10 @@ def lateral_sweep(table, target_col, group_cols, min_group=5, max_levels=12,
     value_col = "__resid__" if used_cov else target_col
 
     rows = []
+    # 方向只解析一次：它决定"哪一台最差"，搞反了整份横向排查都在反向派人
+    spec_limits = spec_limits or {}
+    _dir, _dsrc, _dok = DIR.resolve(target_col, explicit=target_direction,
+                                    kb_params=kb_params)
     for g in group_cols:
         if work.col_index(g) is None:
             continue
@@ -729,20 +743,46 @@ def lateral_sweep(table, target_col, group_cols, min_group=5, max_levels=12,
         if len(buckets) < 2:
             continue
         means = {k: S.mean(v) for k, v in buckets.items()}
-        wk = max(means, key=lambda k: means[k])
-        bk = min(means, key=lambda k: means[k])
+        # 按目标方向挑"最差档"，而不是一律取均值最大那档
+        wg = DIR.worst_group(means, direction=_dir, target=target_value,
+                             lsl=spec_limits.get("lsl"),
+                             usl=spec_limits.get("usl"))
+        wk, bk = wg.get("level"), wg.get("best_level")
+        if wk is None:
+            # 方向需要参数却没给（如 two_sided_spec 缺 lsl/usl）——
+            # 这时"最差档"根本没有定义，宁可不产这一行也不要给错的行。
+            rows.append({"dim": g, "worst_level": None, "worst_mean": None,
+                         "best_level": None, "best_mean": None,
+                         "ratio": None, "gap": None,
+                         "eta_sq": es["eta_sq"], "p": es["p"],
+                         "levels": len(buckets), "adjusted_for": used_cov,
+                         "direction_used": DIR.UNKNOWN, "direction_source": _dsrc,
+                         "note": wg.get("note") or "方向未定，无法判定最差档"})
+            continue
         rows.append({"dim": g, "worst_level": wk, "worst_mean": means[wk],
                      "best_level": bk, "best_mean": means[bk],
                      "ratio": (means[wk] / means[bk]) if means[bk] else None,
                      "gap": means[wk] - means[bk],
                      "eta_sq": es["eta_sq"], "p": es["p"], "levels": len(buckets),
                      "adjusted_for": used_cov,
+                     "direction_used": _dir or DIR.UNKNOWN,
+                     "direction_source": _dsrc,
+                     "direction_assumed": wg.get("assumed"),
+                     "direction_note": wg.get("note") or "",
                      "note": ("已剔除主因子「%s」的影响，下列数值为残差" % used_cov)
                              if used_cov else ""})
     rows.sort(key=lambda x: x["eta_sq"], reverse=True)
     for x in rows:
+        # 方向未经确认时，这条不能写成"建议先查这一台"——
+        # 那等于用一个未经核实的前提（指标越大越差）下确定性结论。
+        _dqual = DIR.qualifier(x.get("direction_source"),
+                               x.get("direction_assumed"))
         if x["eta_sq"] >= 0.14 and S.is_sig(x.get("p")):
-            x["verdict"] = "局部性问题：集中在「%s」，建议先查这一台/一批" % x["worst_level"]
+            if x.get("worst_level") is None:
+                x["verdict"] = "有明显聚集性，但目标方向未登记，无法指认具体机台/批次"
+            else:
+                x["verdict"] = ("局部性问题：集中在「%s」，建议先查这一台/一批%s"
+                                % (x["worst_level"], _dqual))
         elif x["eta_sq"] >= 0.06:
             x["verdict"] = "有一定聚集性，值得复核"
         else:

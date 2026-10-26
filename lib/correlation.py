@@ -9,6 +9,10 @@ correlation.py —— 参数相关性分析
 - 强相关对聚类：把同源参数归并，减少根因候选数量
 """
 
+try:
+    from . import direction as DIR     # 包模式
+except Exception:                      # 脚本模式无包上下文
+    import direction as DIR            # noqa
 import math
 from . import table as T
 from . import stats as S
@@ -36,22 +40,54 @@ def corr_matrix(table, columns=None, method="pearson"):
 
 
 def association_with_target(table, target_col, exclude=None, method="pearson",
-                            min_n=8, alpha=0.05):
+                            min_n=8, alpha=0.05,
+                            target_direction=None, target_value=None,
+                            spec_limits=None, kb_params=None):
     """
     响应变量 Y 与各参数列的关联强度。数值列 -> (r, p)；分类列 -> ANOVA eta²。
-    返回按 |effect| 降序的 list。
+    返回按 |effect| 降序的 list；无法分析时返回带 status 的 dict。
+
+    target_direction：目标列的**方向**（越大越差 / 越大越好 / 有目标值 …）。
+        不传则按 知识库 -> 语义推断 逐级确定；都定不了时，
+        worst_level 会带 assumed 标记，消费方措辞必须降级。
+    spec_limits：{"lsl":.., "usl":..}，方向为 two_sided_spec 时必需。
     """
+    spec_limits = spec_limits or {}
     exclude = set(exclude or [])
-    y_raw = table.numeric_column(target_col)
-    y = [v for v in y_raw if v is not None]
-    if len(y) < min_n:
-        return {"error": "目标列有效样本不足（需要 >=%d，实际 %d）" % (min_n, len(y))}
+    try:
+        y_raw = table.numeric_column(target_col) or []
+    except Exception as exc:
+        # 目标列取不出来必须显性失败：调用方 `isinstance(a, list)` 会把 error
+        # 静默丢成空列表，报告上就变成"未发现相关因素"。
+        return {"status": "FAILED", "target": target_col,
+                "error": "目标列「%s」读取失败：%s" % (target_col, exc)}
+    n_valid_y = sum(1 for v in y_raw if S.is_num(v))
+    if n_valid_y < min_n:
+        return {"status": "INSUFFICIENT_DATA", "target": target_col,
+                "error": "目标列有效样本不足（需要 >=%d，实际 %d）"
+                         % (min_n, n_valid_y),
+                "n_valid": n_valid_y, "min_n": min_n}
     out = []
+    target_meta = None
+    # 目标列方向只解析一次：它决定"哪一档最差"，解析错了整份报告反向派人。
+    direction, dir_source, dir_ok = DIR.resolve(target_col,
+                                                explicit=target_direction,
+                                                kb_params=kb_params)
     for c in table.columns:
         if c == target_col or c in exclude:
             continue
         vals = table.numeric_column(c)
-        pairs = [(v, yy) for v, yy in zip(vals, y) if v is not None and yy is not None]
+        # 必须与 **原始行** 的 y_raw 配对。
+        #
+        #    原写法是 y = [v for v in y_raw if v is not None] 之后再 zip(vals, y)：
+        #    只要目标列 **中间** 存在缺失，第 i 行就会被配到第 j 行，
+        #    而样本数 n 看着还完全正常 —— 只有配对内容是错的。
+        #    实测后果：Y=2X 的完美线性被算成 r=0.9965；
+        #    随机数据里更出现过「本质无关 r=-0.025 → 错位后 r=-0.829」的假强相关，
+        #    一个毫不相干的参数会被排进根因候选前列。
+        pairs, meta = S.finite_pairs(vals, y_raw)
+        if target_meta is None:
+            target_meta = meta
         if len(pairs) < min_n:
             continue
         if T.looks_numeric([p[0] for p in pairs]):
@@ -68,6 +104,12 @@ def association_with_target(table, target_col, exclude=None, method="pearson",
                 "significant": (p is not None and p < alpha),
                 "direction": "正相关" if r > 0 else "负相关",
                 "r2": r * r,
+                # 数据血缘：这一条结论是用哪些行算出来的、为什么少了几行。
+                # 没有它，"n=9" 这个数字无法向审核员交代。
+                "n_raw": meta.get("n_raw"),
+                "n_excluded": meta.get("n_excluded"),
+                "excluded_reasons": dict(meta.get("excluded_reasons") or {}),
+                "aligned_by": meta.get("aligned_by"),
             })
         else:
             # 分类变量 -> eta²
@@ -87,7 +129,14 @@ def association_with_target(table, target_col, exclude=None, method="pearson",
                 "abs_effect": math.sqrt(max(0.0, eta2)),
                 "significant": (an.get("p") is not None and an.get("p") < alpha),
                 "levels": len(buckets),
-                "worst_level": _worst_level(buckets),
+                "worst_level": _worst_level(
+                    buckets, direction=direction, target=target_value,
+                    lsl=spec_limits.get("lsl"), usl=spec_limits.get("usl")),
+                "direction_used": direction or DIR.UNKNOWN,
+                "direction_source": dir_source,
+                "n_raw": meta.get("n_raw"),
+                "n_excluded": meta.get("n_excluded"),
+                "excluded_reasons": dict(meta.get("excluded_reasons") or {}),
             })
     # v1.11：一次分析要检验十几到几十个关联，逐个用 α=0.05 判显著必然挑出假阳性。
     # 统一做 BH 校正，并把"显著"改成校正后显著；报告里同时保留原始 p 与 q。
@@ -102,16 +151,23 @@ def association_with_target(table, target_col, exclude=None, method="pearson",
     return out
 
 
-def _worst_level(buckets):
-    """分类变量中均值最不利的水平（假设 Y 越大越差，后续由调用方解释）"""
-    best_k, best_v = None, None
-    for k, v in buckets.items():
+def _worst_level(buckets, direction=None, target=None, lsl=None, usl=None):
+    """分类变量中**最不利**的水平。
+
+    原实现写死「均值最大 = 最差」，只在"越大越差"的指标上成立。
+    良率/效率/容量这类"越大越好"的指标会被反向指认 ——
+    报告中"重点核查 X 机台"就会指向全场表现最好的一台。
+
+    现在按 direction 判定；方向未知时退化为**带假定的建议**
+    （返回的 dict 带 assumed 标记），而不是冒充已确认结论。
+    """
+    means = {}
+    for k, v in (buckets or {}).items():
         m = S.mean(v)
-        if m is None:
-            continue
-        if best_v is None or m > best_v:
-            best_k, best_v = k, m
-    return {"level": best_k, "mean": best_v} if best_k else None
+        if m is not None:
+            means[k] = m
+    return DIR.worst_group(means, direction=direction, target=target,
+                           lsl=lsl, usl=usl)
 
 
 def lagged_correlation(table, param_col, target_col, max_lag=5, min_n=10):
