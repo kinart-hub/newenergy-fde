@@ -80,7 +80,7 @@ if EV is not None and EV.__name__ != "lib.events":
 KB = PP.load_knowledge()
 _fmt = RPT._fmt
 
-ANALYZER_VERSION = "1.14.3"
+ANALYZER_VERSION = "1.14.5"
 
 
 def _kb_stamp():

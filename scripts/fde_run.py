@@ -987,6 +987,7 @@ def rule_defect_refs_not_dangling():
 
 
 ROOTCAUSE_FILE = os.path.join("lib", "rootcause.py")
+EIGHTD_FILE = os.path.join("lib", "eightd.py")
 
 
 def rule_defect_alias_index_used():
@@ -1054,6 +1055,47 @@ def rule_response_defect_not_inherit():
                          "导致目标列被当成缺陷列）")
     return _r(True, "", {"flagged": len(MUST_FLAG)})
 
+
+def rule_8d_has_d0_era():
+    """8D 报告必须有 D0 应急反应（ERA）节。
+
+    行业口径（qmsbbs tid=282/293）：D0 决定要不要启动 8D，并要求 24h 内
+    展开 ERA 保护客户、用三现主义确认不良实况。客户第一时间关心的是
+    「你现在做了什么」，不是团队名单 —— 缺 D0 等于缺了客户最先看的那一节。
+    """
+    t = _read(EIGHTD_FILE) or ""
+    if not t:
+        return _r(False, "读不到 " + EIGHTD_FILE)
+    has_def = re.search(r"^def derive_d0\(", t, re.M) is not None
+    called = re.search(r"^[\t ]+d0 = derive_d0\(card\)", t, re.M) is not None
+
+    if not has_def:
+        return _r(False, "缺少 D0 派生函数 derive_d0")
+    if not called:
+        return _r(False, "render_8d 未调用 derive_d0 —— D0 节不会出现在报告里")
+    return _r(True, "", {"has_def": True, "called": True})
+
+
+def rule_8d_d7_has_fmea():
+    """D7 必须含 PFMEA 更新表。
+
+    行业口径（qmsbbs tid=152）：「8D 没更新 FMEA，等于病看了方子开了
+    但没进病历本，下次照样抓错药」。IATF 16949 / VDA 6.3 把
+    「8D 成果是否反馈到 FMEA」列为必查项。
+    FDE 原 D7 有 CP / SOP / SPC / 点检，唯独没有 PFMEA ——
+    审核员翻 PFMEA 发现纹丝没动，直接打回「证据链不完整」。
+    """
+    t = _read(EIGHTD_FILE) or ""
+    if not t:
+        return _r(False, "读不到 " + EIGHTD_FILE)
+    has_rows = re.search(r"^FMEA_ROWS = \[", t, re.M) is not None
+    called = re.search(r"^[\t ]+fmea = derive_d7_fmea\(", t, re.M) is not None
+
+    if not has_rows:
+        return _r(False, "缺少 FMEA_ROWS 定义 —— D7 将没有 PFMEA 更新表")
+    if not called:
+        return _r(False, "render_8d 未调用 derive_d7_fmea —— FMEA 证据链不会出现")
+    return _r(True, "", {"has_rows": True, "called": True})
 
 def rule_unregistered_hint_actionable():
     """缺陷未收录时必须给出可行动提示，不能只写「机理未收录」。
@@ -1286,6 +1328,25 @@ AUDIT_RULES = [
                        '"because": info.get("mechanism") or "机理未收录",')),
           _mutant("提示里去掉补录命令",
                   _sub("kb_manage.py scaffold", "知识库 scaffold"))]),
+    Rule("8D 必须有 D0 应急反应（ERA）节", rule_8d_has_d0_era,
+         "lib/eightd.py 必须有 derive_d0 的定义，且 render_8d 内真实调用它；"
+         "缺 D0 的 8D 缺的是客户最先看的那一节（你现在做了什么）",
+         EIGHTD_FILE,
+         [_mutant("D0 派生函数改名（消掉定义）",
+                  _re_sub(r"^def derive_d0\(", "def derive_d02("), EIGHTD_FILE),
+          _mutant("render_8d 不再调用 derive_d0",
+                  _re_sub(r"^[\t ]+d0 = derive_d0\(card\)",
+                          "        d0 = None"), EIGHTD_FILE)]),
+
+    Rule("D7 必须含 PFMEA 更新表", rule_8d_d7_has_fmea,
+         "lib/eightd.py 必须有 FMEA_ROWS 定义，且 render_8d 内真实调用 derive_d7_fmea；"
+         "缺 FMEA 的 D7 在 IATF 16949 / VDA 6.3 审核中直接判「证据链不完整」",
+         EIGHTD_FILE,
+         [_mutant("FMEA_ROWS 改名（消掉定义）",
+                  _re_sub(r"^FMEA_ROWS = \[", "FMEA_ROWS2 = ["), EIGHTD_FILE),
+          _mutant("render_8d 不再调用 derive_d7_fmea",
+                  _re_sub(r"^[\t ]+fmea = derive_d7_fmea\(res, lead, card\)",
+                          "        fmea = None"), EIGHTD_FILE)]),
 ]
 
 

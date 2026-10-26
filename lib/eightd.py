@@ -666,6 +666,158 @@ def derive_d7(res, lead=None):
 
 
 # ---------------------------------------------------------------------------
+# D0 应急反应（ERA）—— 行业口径里 FDE 原本完全没有的一节
+# ---------------------------------------------------------------------------
+# 来源：qmsbbs tid=282 / tid=293。D0 决定「要不要启动 8D」，并要求 24h 内
+# 展开 ERA 保护客户、用三现主义（现场/现物/现象）确认不良实况。
+# FDE 原报告从 D1 起 —— 而客户第一时间关心的恰恰是「你现在做了什么」。
+D0_FIELDS = [
+    ("era_24h", "24h 内应急反应（ERA）", "保护客户的动作 + 时间；未填则 D0 不成立"),
+    ("genba_3g", "三现主义确认", "现场 / 现物 / 现象 三项是否核实（照片或样品编号）"),
+    ("symptom_vs_problem", "症状 vs 问题", "客户报的是症状；本方确认的问题是什么"),
+    ("customer_sample", "不良样品/照片", "是否已取得客户处样品、照片、标签、不合格率"),
+    ("trace_info", "追溯信息", "LOT NO / 发货单号 等是否齐备"),
+]
+
+# D3 围堵范围：行业口径的七位置清单
+# 来源：qmsbbs tid=293 明确要求覆盖 市场端 / 客户端在制 / 客户端库存 / 客户端在途
+# / 供应商在制 / 供应商库存 / 供应商在途。
+# FDE 原 D3 只有 4 条通用模板 —— 漏掉任何一处，不良就从那一处继续流出。
+D3_POSITIONS = [
+    ("市场端（已售出/在使用）", "是否需召回、公告或客户现场处理"),
+    ("客户端在制", "客户产线在制品是否需暂停使用"),
+    ("客户端库存", "客户仓库存品是否需隔离/筛选/退回"),
+    ("客户端在途", "在途品是否需拦截或到货即检"),
+    ("厂内库存（成品/半成品）", "是否需隔离、复检、降级或报废"),
+    ("厂内在制", "是否需停线、降速或加严工序检验"),
+    ("供应商端（在制/库存/在途）", "来料是否需暂停使用、退回或要求供方围堵"),
+]
+
+
+def derive_d0(card=None):
+    """D0 应急反应。只给待填项与判定要求，不替现场填内容。"""
+    c = card or {}
+    rows = [{"item": label, "requirement": req,
+             "value": (str(c.get(key)) if c.get(key) not in (None, "") else "　**待填**　"),
+             "filled": c.get(key) not in (None, "")}
+            for key, label, req in D0_FIELDS]
+    miss = [r["item"] for r in rows if not r["filled"]]
+    return {"rows": rows, "missing": miss,
+            "note": "D0 未成立就往下写 D1–D8，等于还没确认问题就开始写答案。"
+                    "ERA 未填写时本报告**不具备对外发出条件**。"
+                    "**时限：ERA 需在 24 小时内展开；QE 应在收到投诉 1 个工作日内联系客户。**"}
+
+
+def derive_d3_positions():
+    """D3 围堵范围：七位置清单。
+
+    数量与处置**必须留空由现场盘点** —— 本 Skill 没有库存数据，填了就是编。
+    """
+    return [{"position": p, "question": q, "qty": "（待盘点）",
+             "action": "（待定）", "owner": "（待指定）", "verified": False}
+            for p, q in D3_POSITIONS]
+
+
+def classify_three_causes(res, lead):
+    """D4 三类原因分离：发生原因 / 流出原因 / 系统原因。
+
+    来源：qmsbbs tid=293 明确要求 D4 至少区分这三层。
+    只找发生原因 → 措施只覆盖一半（问题不再发生，但照样流出去）。
+
+    本函数只给**推导方向**与「待判定」，不下结论。
+    """
+    root = res.get("rootcause") or {}
+    cands = root.get("candidates") or []
+    # 发生原因：本次数据算出的首要候选
+    occur = (lead.get("param_name") or "—") if lead else "（待判定）"
+    occur_ev = ("综合得分 %.2f" % (lead.get("score") or 0)) if lead else \
+        "D4 未通过证据闸门，根因留空"
+    # 流出原因：候选里若指向测量/检验环节则给出，否则给方向
+    escape, escape_ev = "（待判定）", \
+        "对照第 9 节分层与现行检验方案：现有检验能否检出该类缺陷？"
+    for c in cands:
+        nm = str(c.get("param_name") or "")
+        if any(w in nm for w in ("测量", "检验", "量具", "MSA", "msa")):
+            escape, escape_ev = nm, "候选根因本身指向测量/检验环节"
+            break
+    # 系统原因：查 PFMEA / 控制计划是否识别过该失效模式
+    sysc, sys_ev = "（待判定）", \
+        "查 PFMEA / 控制计划：该失效模式是否被识别？现行控制是否仍为人工目视？"
+    return [
+        {"layer": "发生原因", "question": "为什么这个问题会产生？",
+         "candidate": occur, "evidence": occur_ev},
+        {"layer": "流出原因", "question": "为什么没有被检出？",
+         "candidate": escape, "evidence": escape_ev},
+        {"layer": "系统原因", "question": "为什么管理机制没有预防住？",
+         "candidate": sysc, "evidence": sys_ev},
+    ]
+
+
+# ---------------------------------------------------------------------------
+# D7 的 PFMEA 更新表 —— 行业口径里 D7 的「证据链」核心
+# ---------------------------------------------------------------------------
+# 来源：qmsbbs tid=152《客户投诉8D中把FMEA作为防止再发证据链》。
+# 原文关键句：「8D 没更新 FMEA，等于病看了方子开了但没进病历本，下次照样抓错药。」
+# IATF 16949 / VDA 6.3 把「8D 成果是否反馈到 FMEA」列为必查项。
+# FDE 原 D7 有 CP / SOP / SPC / 点检，**唯独没有 PFMEA** ——
+# 审核员翻 PFMEA 发现纹丝没动，直接打回「证据链不完整」。
+
+# 行业口径的「三个对应」：失效模式 / 潜在原因 / 现行控制 必须分别对应
+# D2+D4 / D4 / D5，且都要具体可测量；「加强自检」这类虚措施是退稿项。
+FMEA_ROWS = [
+    ("失效模式", "对应 D2 问题描述 + D4 根本原因",
+     "必须具体可测量（如「螺纹滑牙力矩<10N·m」）；写「外观不良」是退稿项"),
+    ("潜在原因", "对应 D4 根本原因分析",
+     "用技术语言描述（如「刀具磨损导致中径偏大」）；停留在「操作失误」等于没分析"),
+    ("现行控制", "对应 D5 永久对策",
+     "量化控制方法：有频次、有数值；写「加强自检」是退稿项"),
+    ("S（严重度）", "改善前 → 改善后", "评分变化须有依据，不得沿用旧值"),
+    ("O（频度）", "改善前 → 改善后", "须有 D6 验证数据支撑"),
+    ("D（探测度）", "改善前 → 改善后", "控制措施变更后重新评分"),
+    ("RPN / AP", "改善前后对比", "**评分不改则 RPN 不变，等于没更新**"),
+]
+
+# FMEA 更新不是质量部一个人的事 —— 行业口径明确列出五角色
+FMEA_SIGNOFF = [
+    ("质量工程师", "牵头，确保 8D 成果准确传递"),
+    ("工艺工程师", "更新技术措施，确认可行性"),
+    ("设备工程师", "涉及设备参数时必须参与"),
+    ("生产主管", "确认措施能在现场落地"),
+    ("检验员/检验主管", "验证检验标准是否需要调整"),
+]
+
+
+def derive_d7_fmea(res, lead=None, card=None):
+    """D7 的 PFMEA 更新表。
+
+    只给结构与填写要求，**不给 S/O/D 数值** —— 评分是决策，
+    且必须有 D6 验证数据支撑；本 Skill 无 FMEA 台账也无评分依据，填了就是编。
+    """
+    defect = None
+    if card:
+        defect = card.get("what")
+    if not defect:
+        defect = (res.get("rootcause") or {}).get("defect")
+    rows = []
+    for item, src, req in FMEA_ROWS:
+        pre = "（待填写）"
+        if item == "失效模式" and defect:
+            pre = "%s（来自 D2/D4，**须改写成可测量表述**）" % defect
+        elif item == "潜在原因" and lead:
+            pre = "%s（来自 D4 首要候选，**须改写成技术语言**）" % (lead.get("param_name") or "—")
+        rows.append({"item": item, "source": src, "content": pre, "requirement": req})
+    return {
+        "defect": defect or "（待填：来自 D2 问题描述）",
+        "rows": rows,
+        "signoff": [{"role": r, "duty": d, "name": "（待签字）", "date": "（待填）"}
+                    for r, d in FMEA_SIGNOFF],
+        "trace": "修订记录必填：依据 8D 编号 ______ 更新",
+        "note": "**FMEA 修订记录必须与 8D 编号对应**，S/O/D 评分须有数据支撑。"
+                "只更新 FMEA 而现场文件（CP/SOP/WI）没变，审核时同样判不符合。",
+    }
+
+
+# ---------------------------------------------------------------------------
 # D8 结案条件
 # ---------------------------------------------------------------------------
 
@@ -681,6 +833,8 @@ def derive_d8(res, lead=None):
          "evidence": "改善前后数据对照表"},
         {"item": "D7 全部预防动作已有文件编号并生效", "status": "待执行",
          "evidence": "文件编号清单"},
+        {"item": "D7 的 PFMEA 更新已完成且有修订记录（含 8D 编号）", "status": "待执行",
+         "evidence": "FMEA 修订记录 + S/O/D 评分依据"},
         {"item": "横向展开范围内已完成同类排查", "status": "待执行",
          "evidence": "排查记录"},
         {"item": "客户已反馈接受（对外 8D）", "status": "待确认",
@@ -693,7 +847,8 @@ def derive_d8(res, lead=None):
     if conf in ("低", "较低", "low"):
         blockers.append("结论置信度为「%s」，P0 数据缺口未补齐前不得结案。" % conf)
     return {"gates": gates, "blockers": blockers,
-            "note": "任一 gate 未满足即不得结案。本节是检查清单，不是结案声明。"}
+            "note": "任一 gate 未满足即不得结案。本节是检查清单，不是结案声明。"
+                    "**时限：完整 8D 需在接到客户投诉后 5 个工作日内提交。**"}
 
 
 # ---------------------------------------------------------------------------
@@ -720,6 +875,19 @@ def render_8d(rep, res, card=None, conflicts=None, parent=None):
             "warn")
 
     # ---- D1 ----
+    # ---- D0 应急反应（ERA）----
+    # 行业口径要求先有 D0 再谈 D1–D8：客户第一时间关心的是「你现在做了什么」，
+    # 不是你的团队名单。缺 D0 的 8D 在客户端第一关就过不去。
+    s = rep.section("D0 应急反应（ERA）与三现确认", level=3)
+    d0 = derive_d0(card)
+    rep.table(s, ["项目", "填报", "要求"],
+              [[r["item"], r["value"], r["requirement"]] for r in d0["rows"]],
+              caption=d0["note"])
+    if d0["missing"]:
+        rep.callout(s, "D0 仍有 %d 项未填：%s。"
+                    "**D0 未成立时，本报告不具备对外发出条件。**"
+                    % (len(d0["missing"]), "、".join(d0["missing"])), "warn")
+
     s = rep.section("D1 成立团队", level=3)
     rep.kv(s, [("组长（工艺/质量）", "（待指定）"),
                ("工艺工程师", "参数分析与对策"),
@@ -778,6 +946,15 @@ def render_8d(rep, res, card=None, conflicts=None, parent=None):
                ["4", "客户端风险评估与沟通（对外 8D）", "（待指定）", "（待定）", "（待填）"]],
               caption="遏制措施为通用模板，**范围必须按本次分层结论收窄**；"
                       "「验证结果」栏必须有数据，只写「已执行」无效。")
+    # 围堵范围七位置：行业口径要求逐处清点，漏一处就从那一处继续流出。
+    # 数量与处置由现场盘点，本 Skill 无库存数据，一律留空。
+    rep.text(s, "**围堵范围逐处清点（七位置，缺一处即视为围堵不完整）：**")
+    rep.table(s, ["位置", "必须回答的问题", "数量", "处置", "责任人", "已确认"],
+              [[p["position"], p["question"], p["qty"], p["action"], p["owner"],
+                "☑" if p["verified"] else "☐"] for p in derive_d3_positions()],
+              caption="围堵不是简单加检。加检只是手段之一，"
+                      "真正重要的是把影响范围查清楚、把风险控制住。"
+                      "**时限：ICA 需在 3 个工作日内确定并执行。**")
 
     # ---- D4 ----
     s = rep.section("D4 根本原因", level=3)
@@ -788,6 +965,12 @@ def render_8d(rep, res, card=None, conflicts=None, parent=None):
                    ("归属（5M1E）", classify_root(lead, res))])
     else:
         rep.kv(s, [("D4 最可能根因", "【留空】%s" % why4)])
+    # 三类原因分离：行业口径要求 D4 至少区分发生/流出/系统三层。
+    # 只写发生原因 → 措施只覆盖一半（问题不再产生，但照样流出去）。
+    rep.text(s, "**三类原因分离（每层都要有证据，缺层则措施覆盖不全）：**")
+    rep.table(s, ["层次", "要回答的问题", "候选/方向", "证据要求"],
+              [[c["layer"], c["question"], c["candidate"], c["evidence"]]
+               for c in classify_three_causes(res, lead)])
     # 5Why
     fw = root.get("five_why") or []
     if fw:
@@ -851,6 +1034,21 @@ def render_8d(rep, res, card=None, conflicts=None, parent=None):
     if d7["lateral_scope"]:
         rep.text(s, "**横向展开范围（由工序上下游关系推出，不是猜测）**：%s"
                  % "、".join(d7["lateral_scope"]))
+    rep.text(s, "横向展开还需自行覆盖以下四个维度（本 Skill 无产品/供应商台账，无法推出）："
+                "**同类产品、同类工序、同类供应商、新产品导入风险点**。"
+                "只在本次这个产品上加检查，价值有限。")
+    # ---- D7 的 PFMEA 更新（行业口径的证据链核心）----
+    fmea = derive_d7_fmea(res, lead, card)
+    rep.text(s, "**PFMEA 更新表（D7 的证据链，审核必查）：**")
+    rep.table(s, ["要素", "对应来源", "内容", "填写要求"],
+              [[r["item"], r["source"], r["content"], r["requirement"]]
+               for r in fmea["rows"]],
+              caption=fmea["note"])
+    rep.table(s, ["角色", "职责", "签名", "日期"],
+              [[g["role"], g["duty"], g["name"], g["date"]] for g in fmea["signoff"]],
+              caption="FMEA 更新**不是质量部一个人的事**。"
+                      "跨部门签名不完整，审核时判「质量部门一言堂」。")
+    rep.kv(s, [("FMEA 修订记录", fmea["trace"])])
 
     # ---- D8 ----
     s = rep.section("D8 结案检查清单", level=3)

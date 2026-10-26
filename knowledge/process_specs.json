@@ -2963,6 +2963,72 @@
         "mode": null
       },
       "note": "化成/搁置期间产气导致电芯厚度超出公差。判定阈值由企业内控标准决定，本库不预设。"
+    },
+    "el_short_black": {
+      "name": "短路黑片",
+      "process": "pv_cell_el",
+      "unit": "片",
+      "aliases": [
+        "短路黑片",
+        "全黑片",
+        "短路黑",
+        "无功率片",
+        "black cell"
+      ],
+      "typical_range": [
+        0,
+        500
+      ],
+      "control": {
+        "mode": null
+      },
+      "note": "整片全黑，多由焊接短路或混入无功率电池片造成，需与少子寿命类黑心区分。",
+      "role": "response"
+    },
+    "el_reverse_black": {
+      "name": "非短路黑片",
+      "process": "pv_cell_el",
+      "unit": "片",
+      "aliases": [
+        "非短路黑片",
+        "反片",
+        "反向片",
+        "放反片",
+        "PN结反向",
+        "reverse cell"
+      ],
+      "typical_range": [
+        0,
+        500
+      ],
+      "control": {
+        "mode": null
+      },
+      "note": "除边缘发光外全黑，多为扩散面放反致 PN 结反向，属工艺方向性错误而非材料缺陷。",
+      "role": "response"
+    },
+    "el_mismatch": {
+      "name": "明暗片",
+      "process": "pv_cell_el",
+      "unit": "片",
+      "aliases": [
+        "明暗片",
+        "混档",
+        "混档片",
+        "亮暗片",
+        "效率混档",
+        "mismatch",
+        "明暗差异"
+      ],
+      "typical_range": [
+        0,
+        500
+      ],
+      "control": {
+        "mode": null
+      },
+      "note": "转换效率不同的电池片混入同一组件，电流差异越大明暗差异越明显，是热斑的诱因之一。",
+      "role": "response"
     }
   },
   "defect_rootcause": {
@@ -3892,6 +3958,122 @@
         "超声焊参数记录",
         "焊头更换台账"
       ]
+    },
+    "短路黑片": {
+      "param_key": "el_short_black",
+      "aliases": [
+        "短路黑片",
+        "全黑片",
+        "短路黑",
+        "black cell",
+        "无功率片"
+      ],
+      "process": "pv_cell_el",
+      "likely_params": [
+        "dark_current",
+        "cell_efficiency",
+        "sintering_peak_temp"
+      ],
+      "mechanism": "焊接过程造成电池片内部短路，或混入了无功率电池片，EL 下整片呈全黑（区别于黑心的局部发暗）。机理属「电学连通异常」，与硅片本体少子寿命无关。",
+      "verify_data": [
+        "EL 图像是否整片全黑（无边缘发光）",
+        "该片 IV/功率实测是否为零或接近零",
+        "焊接工序温度曲线与焊带对位记录",
+        "分选工序功率档位记录（是否混入无功率片）"
+      ],
+      "quick_checks": [
+        "整片全黑 vs 局部暗（前者→短路/无功率片，后者→黑心）",
+        "是否与某一焊接机台/焊头对应（→焊接短路）",
+        "是否与分选档位混档或换批对应（→混入无功率片）",
+        "单测该片 IV 曲线是否为短路形态"
+      ],
+      "carry_over_from": [
+        "pv_cell_el"
+      ],
+      "clearing_evidence": [
+        "焊接工序参数与机台号记录",
+        "电池片分选档位与来料批次记录",
+        "该片单独 IV 复测结果"
+      ],
+      "source": "索比光伏网《干货 | 组件常见EL缺陷》",
+      "note": "机理描述取自行业公开资料，现场适用性待复核。"
+    },
+    "非短路黑片": {
+      "param_key": "el_reverse_black",
+      "aliases": [
+        "非短路黑片",
+        "反片",
+        "反向片",
+        "放反片",
+        "PN结反向",
+        "reverse cell"
+      ],
+      "process": "pv_cell_el",
+      "likely_params": [
+        "cell_efficiency",
+        "dark_current",
+        "printing_pressure"
+      ],
+      "mechanism": "单面扩散或湿法刻蚀工艺中，扩散面放反导致在背面镀膜印刷，PN 结成反向；EL 下表现为除边缘发光外的整片全黑。属工艺方向性错误，非材料缺陷。",
+      "verify_data": [
+        "EL 图像是否为「边缘发光 + 中心全黑」形态",
+        "扩散/刻蚀工序的上下料方向记录",
+        "该批次是否发生工艺切换或新员工上岗"
+      ],
+      "quick_checks": [
+        "是否存在边缘发光（有→PN 结反向；无→短路黑片）",
+        "是否与某一班次/某一上料工位集中对应",
+        "是否与工艺切换、设备维护后首批次对应"
+      ],
+      "carry_over_from": [
+        "pv_cell_el"
+      ],
+      "clearing_evidence": [
+        "扩散/刻蚀工序作业方向与点检记录",
+        "工艺变更与人员变更记录"
+      ],
+      "source": "索比光伏网《干货 | 组件常见EL缺陷》",
+      "note": "机理描述取自行业公开资料，现场适用性待复核。"
+    },
+    "明暗片": {
+      "param_key": "el_mismatch",
+      "aliases": [
+        "明暗片",
+        "混档",
+        "混档片",
+        "亮暗片",
+        "效率混档",
+        "mismatch",
+        "明暗差异"
+      ],
+      "process": "pv_cell_el",
+      "likely_params": [
+        "cell_efficiency",
+        "el_gray_mean",
+        "el_defect_area"
+      ],
+      "mechanism": "转换效率不同（电流档位不同）的电池片混入同一组件，电流大者 EL 成像亮、小者暗；电流差异越大明暗差异越明显。此类混档会导致组件热斑效应，造成热击穿并降低组件寿命。",
+      "verify_data": [
+        "组件内电池片的效率/电流档位分布",
+        "串焊前分选档位记录",
+        "EL 图像灰度按片位统计（亮暗差异幅度）",
+        "组件 IV 的 Isc 是否偏低（受最小电流片限制）"
+      ],
+      "quick_checks": [
+        "亮暗差异是否呈「整片级」而非「局部级」（→混档，非隐裂）",
+        "是否集中在换档、补片、返修后",
+        "组件 Isc 是否明显低于同档位电池片标称值",
+        "按分选档位与来料批次分层"
+      ],
+      "carry_over_from": [
+        "pv_cell_el"
+      ],
+      "clearing_evidence": [
+        "电池片分选档位台账与补片记录",
+        "来料批次与效率分布记录"
+      ],
+      "source": "索比光伏网《干货 | 组件常见EL缺陷》",
+      "note": "机理描述取自行业公开资料，现场适用性待复核。该缺陷与「热斑」条目存在因果关联（混档→热斑）。"
     }
   },
   "data_gaps": {
