@@ -285,7 +285,10 @@ def check_manifest_coverage():
         for dirpath, dirnames, filenames in os.walk(d):
             dirnames[:] = [x for x in dirnames if x != "__pycache__"]
             for fn in filenames:
-                if fn.endswith((".pyc", ".pyo", ".tmp", ".bak")):
+                # .bak 要按"含 .bak"判而非 endswith：实际产物是
+                # device_profiles.json.bak-20261010195556 这种带时间戳的副本，
+                # 只比对后缀会把备份当成必需文件，把发布卡在假缺件上。
+                if fn.endswith((".pyc", ".pyo", ".tmp")) or ".bak" in fn.lower():
                     continue
                 rel = os.path.relpath(os.path.join(dirpath, fn), ROOT).replace("\\", "/")
                 if rel in optional:
@@ -301,13 +304,9 @@ def check_manifest_coverage():
                     % (len(missing), "、".join(sorted(missing)[:5]),
                        " …" if len(missing) > 5 else "")))
 
-    # --- optional 缺失只提醒 ---
-    absent_opt = [f for f in sorted(optional)
-                  if not os.path.exists(os.path.join(ROOT, f))]
-    if absent_opt:
-        out.append(("WARN",
-                    "清单里的可选文件（运行期按需生成）当前不存在：%s"
-                    % "、".join(absent_opt[:5])))
+    # optional 缺失**刻意不报**：它们本来就是运行期按需生成的，
+    # 首次部署必然没有。每次都报，等于训练使用者把所有提醒都划掉，
+    # 真需要看的提醒也会被一起划掉——噪音比它传达的信息更贵。
     return out
 
 

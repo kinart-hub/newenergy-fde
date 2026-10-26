@@ -85,6 +85,11 @@ def is_excluded(rel):
         return True
     if "/__pycache__/" in ("/" + rel) or rel.endswith(EXCLUDE_SUFFIX):
         return True
+    # 备份副本要按"含 .bak 即排除"来判，不能只比对后缀：
+    # 实际产物叫 device_profiles.json.bak-20261010195556，后缀是带时间戳的一串，
+    # endswith(".bak") 匹配不到，于是它被当成"运行时必需文件"把发布卡住。
+    if ".bak" in rel.lower():
+        return True
     return False
 
 
