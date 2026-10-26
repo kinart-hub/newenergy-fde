@@ -9,6 +9,7 @@ table.py —— 零依赖表格引擎（CSV / XLSX 读写）
 这样 Skill 可在任意 Python 3.8+ 环境运行，无需 pip install。
 """
 
+from . import degrade
 import csv
 import io
 import os
@@ -120,10 +121,12 @@ def to_number(value):
         return None
     if "," in s:
         s = s.replace(",", "")
-    # 直通：绝大多数测量值是纯数字，不用进正则
+    # 直通：绝大多数测量值是纯数字，不用进正则。
+    # 这里转失败是**预期路径**（走下面的正则提取"12.3mm"这类带单位的值），
+    # 不是降级——这个函数每秒被调用上千次，记账会把台账刷爆。
     try:
         return float(s)
-    except ValueError:
+    except Exception:
         pass
     m = _NUM_HEAD_RE.match(s)
     if m is None:
@@ -428,8 +431,8 @@ def read_xlsx(path, sheet=None):
                         code = custom[fid]
                         if re.search(r"[dmyh]", code) and not re.search(r"^[#0.,%\s]*$", code):
                             date_styles.add(idx)
-        except ET.ParseError:
-            pass
+        except Exception as _dg_e:
+            degrade.note("table.read_xlsx@L432", _dg_e)
 
     # workbook -> sheets
     wb = ET.fromstring(zf.read("xl/workbook.xml"))
@@ -525,6 +528,7 @@ def read_any(path, sheet=None):
     return read_csv(path)
 
 
+# scan:keep 多工作簿读取。当前 XLSX 只取 --sheet 指定的一张表，需要全表合并时启用。
 def read_multi(paths):
     """多文件读入 -> {文件名: Table}"""
     out = {}

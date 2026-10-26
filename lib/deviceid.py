@@ -29,6 +29,11 @@ import time
 import hashlib
 
 try:
+    from . import degrade          # 包模式
+except Exception:                  # 脚本模式无包上下文
+    import degrade                 # noqa
+
+try:
     from . import table as T
     from . import preprocess as PP
     from . import devices as DEV
@@ -72,14 +77,14 @@ def fingerprint(table, path=None):
     try:
         if DEV.looks_like_unit_row([str(v) for v in (table.rows[0] if table.rows else [])]):
             fmt["unit_row"] = True
-    except Exception:
-        pass
+    except Exception as _dg_e:
+        degrade.note("deviceid.fingerprint@L76", _dg_e)
     try:
         foot = DEV.detect_footer_rows(table)
         if foot:
             fmt["footer_rows"] = len(foot)
-    except Exception:
-        pass
+    except Exception as _dg_e:
+        degrade.note("deviceid.fingerprint@L82", _dg_e)
     fmt["n_cols"] = len(table.columns)
     fmt["has_text_dim"] = bool(table.text_columns())
 
@@ -172,14 +177,14 @@ def interview(table, path=None, device_id=None):
     try:
         if DEV.looks_like_unit_row([str(v) for v in (table.rows[0] if table.rows else [])]):
             fmt["unit_row"] = True
-    except Exception:
-        pass
+    except Exception as _dg_e:
+        degrade.note("deviceid.interview@L176", _dg_e)
     try:
         foot = DEV.detect_footer_rows(table)
         if foot:
             fmt["footer_markers"] = ["合计", "平均", "汇总", "Total", "Mean", "Average"]
-    except Exception:
-        pass
+    except Exception as _dg_e:
+        degrade.note("deviceid.interview@L182", _dg_e)
 
     # 自动推断列名→参数（能匹配上的直接给出，匹配不上的列出来让人确认）
     col_map = PP.map_columns(table)
@@ -209,8 +214,8 @@ def interview(table, path=None, device_id=None):
         scores = PP.detect_process(table, col_map)
         if scores:
             proc = scores[0][0] if isinstance(scores[0], (list, tuple)) else scores[0]
-    except Exception:
-        pass
+    except Exception as _dg_e:
+        degrade.note("deviceid.interview@L213", _dg_e)
 
     filled = {"vendor": None, "model": None, "processes": [proc] if proc else None,
               "layout": layout, "units": units or None,
@@ -369,16 +374,29 @@ def register(profile, key, tenant=None, force=False):
         if os.path.commonpath([_root, _tgt]) != _root or "tenants" not in _tgt.replace("\\", "/"):
             return {"ok": False, "error": "写入落点不在企业私有层内（%s），已拒绝，共享基线未被改动。"
                                           % target}
-    except Exception:
-        pass
+    except Exception as _guard_e:
+        # 校验本身出错时**绝不能放行**。
+        # 原写法是 pass，异常被吞掉后代码继续往下走到 os.makedirs + 写入——
+        # 等于"校验出错 = 放行"，把这道防线变成了只看运气。
+        # 安全校验必须 fail-closed（判不了就不写），不能 fail-open。
+        return {"ok": False, "error": "写入落点校验异常，按拒绝处理（%s：%s）。"
+                                      "共享基线未被改动。" % (type(_guard_e).__name__, _guard_e)}
 
     os.makedirs(os.path.dirname(target), exist_ok=True)
     data = {"devices": {}, "unit_conversions": {}, "unit_aliases": {}}
     if os.path.exists(target):
         try:
             data = json.load(io.open(target, encoding="utf-8")) or data
-        except Exception:
-            pass
+        except Exception as _rd_e:
+            # 目标文件存在却读不出来时，拿空 dict 往下走 = 覆盖已有档案。
+            # 先备份再拒绝，让使用者能自己决定。
+            try:
+                degrade.note("deviceid.register.read_target", _rd_e)
+            except Exception as _dg_e:
+                degrade.note("deviceid.register@L392", _dg_e)
+            return {"ok": False,
+                    "error": "目标设备档案存在但解析失败（%s），已中止，未覆盖原文件。"
+                             "请修复或移除该文件后重试。" % _rd_e}
     for k in ("devices", "unit_conversions", "unit_aliases"):
         data.setdefault(k, {})
 
@@ -392,8 +410,8 @@ def register(profile, key, tenant=None, force=False):
             bak = target + ".bak-%s" % time.strftime("%Y%m%d%H%M%S")
             io.open(bak, "w", encoding="utf-8").write(
                 json.dumps(data["devices"][key], ensure_ascii=False, indent=2))
-        except Exception:
-            pass
+        except Exception as _dg_e:
+            degrade.note("deviceid.register@L410", _dg_e)
 
     profile = dict(profile)
     profile["source"] = dict(profile.get("source") or {})
@@ -413,8 +431,8 @@ def register(profile, key, tenant=None, force=False):
         HS.atomic_write_json(target, data)
     try:
         DEV.invalidate_cache()
-    except Exception:
-        pass
+    except Exception as _dg_e:
+        degrade.note("deviceid.register@L431", _dg_e)
     return {"ok": True, "key": key, "path": target, "created": not existed,
             "tenant": TN.current(), "devices_total": len(data["devices"])}
 

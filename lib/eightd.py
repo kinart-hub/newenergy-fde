@@ -29,6 +29,10 @@
 零第三方依赖：stdlib only。
 """
 
+try:
+    from . import degrade          # 包模式
+except Exception:                  # 脚本模式（python lib/pipeline.py）无包上下文
+    import degrade                 # noqa
 import math
 import os
 import re
@@ -659,8 +663,10 @@ def derive_d7(res, lead=None):
             lateral.append(specs.get(k, {}).get("name") or k)
         for k in (cur.get("upstream_keys") or [])[:2]:
             lateral.append(specs.get(k, {}).get("name") or k)
-    except Exception:
-        pass
+    except Exception as _dg_e:
+        # 横向展开范围为空时，D7 少的是审核员必查的那一栏，
+        # 且看起来与"本工序确无横向展开点"一样。
+        degrade.note("eightd.lateral_scope", _dg_e)
     return {"kind": kind, "rows": rows, "lateral_scope": lateral, "process": proc,
             "note": "每一项都必须落到**文件编号**，只写「已培训」「已更新」在客户审核时是退稿项。"}
 

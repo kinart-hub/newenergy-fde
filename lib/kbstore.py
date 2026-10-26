@@ -17,6 +17,10 @@ kbstore.py —— 工艺知识库持续演进引擎
 只生成候选，绝不自动改写知识库。
 """
 
+try:
+    from . import degrade          # 包模式
+except Exception:                  # 脚本模式（python lib/pipeline.py）无包上下文
+    import degrade                 # noqa
 import io
 import json
 import math
@@ -84,8 +88,8 @@ def set_root(path):
     try:
         DEV.PROFILE_FILE = DEV_PROFILE_FILE
         DEV.invalidate_cache()
-    except Exception:
-        pass
+    except Exception as _dg_e:
+        degrade.note("kbstore.set_root@L88", _dg_e)
     return KB_DIR
 
 
@@ -251,8 +255,8 @@ def _prune_backups(file_key, keep=30):
     for f in files[keep:]:
         try:
             os.remove(os.path.join(d, f))
-        except Exception:
-            pass
+        except Exception as _dg_e:
+            degrade.note("kbstore._prune_backups@L255", _dg_e)
 
 
 def list_backups(file_key=None):
@@ -670,8 +674,8 @@ def validate_candidate(ctype, payload):
                 if pr[0] != pr[1] and pr not in ok_pairs:
                     errs.append("单位换算 %s: %s→%s 无对应换算规则"
                                 % (cn, m.get("read_unit"), m.get("target_unit")))
-        except Exception:
-            pass
+        except Exception as _dg_e:
+            degrade.note("kbstore.validate_candidate@L674", _dg_e)
         sig = payload.get("signature") or {}
         if not (sig.get("meta_regex") or sig.get("col_any") or sig.get("filename_regex")):
             warns.append("未登记任何识别特征，该设备永远不会被自动匹配到（只能用 --device 手动指定）")

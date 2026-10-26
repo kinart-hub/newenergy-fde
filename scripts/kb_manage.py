@@ -1135,7 +1135,14 @@ def cmd_tenants(a):
     if a.promote:
         pend = TN.list_promotions("pending")
         if not pend:
-            print("暂无待提升的知识投递")
+            # 如实说明，而不是只说"暂无"：
+            # 「贡献回共享基线」的投递通道（tenancy.queue_promotion）目前没有任何调用者，
+            # 对外承诺只到「沉淀入库」（sync 子命令）。所以队列恒为空是设计现状，
+            # 不是数据丢了——不说清楚，使用者会当成丢数据去排查。
+            print("暂无待提升的知识投递。")
+            print("  说明：投递入口 tenancy.queue_promotion 尚未接入任何流程，")
+            print("        当前对外承诺只到「沉淀入库」（sync 子命令）。")
+            print("        队列恒为空是设计现状，不是数据丢失。")
             return
         print("待提升投递 %d 条：" % len(pend))
         for r in pend:

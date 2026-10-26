@@ -16,6 +16,11 @@ pipeline.py —— 工艺数据分析主流水线
 import os
 import sys
 
+try:
+    from . import degrade          # 包模式（python -m lib.pipeline）
+except Exception:                  # 脚本模式（python lib/pipeline.py）无包上下文
+    import degrade                 # noqa
+
 # Windows 上 stdout 被重定向到文件/管道时（CI、> log.txt）Python 会切到
 # 系统 ANSI 编码，英文 runner 上是 cp1252，输出中文会抛 UnicodeEncodeError。
 # 强制 UTF-8，保证任何 Windows 环境下 CLI 都不因中文崩掉。
@@ -23,6 +28,9 @@ try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 except Exception:
+    # 非 Windows、或 stdout 已被外部替换时没有 reconfigure，属正常分支。
+    # 这里刻意不记降级台账：本行在模块加载期执行，那时 degrade 还没导入，
+    # 而且把环境差异记成"降级"会污染每一次分析的台账。
     pass
 import io
 import json
@@ -74,13 +82,61 @@ if EV is not None and EV.__name__ != "lib.events":
     try:
         import lib.quality_guard as _QG_PKG
         EV.QG = _QG_PKG
-    except Exception:
-        pass
+    except Exception as _dg_e:
+        degrade.note("pipeline.module@L78", _dg_e)
 
 KB = PP.load_knowledge()
 _fmt = RPT._fmt
 
-ANALYZER_VERSION = "2.1.0"
+ANALYZER_VERSION = "2.2.0"
+
+
+# 空数据排查清单。
+#
+# 为什么必须显式报错：实测过四种空数据输入（0 字节文件、只有表头、
+# 列名全无意义、数值列全空），原实现**全部照常出报告**，
+# summary 里写着「SPC 判异：未检出违反 Nelson 规则的参数」——
+# 读起来像「检查过了、没问题」，实际是「一行数据都没有」。
+# 把「没有输入」包装成「没有结论」，是静默错结论里最容易被信以为真的一类：
+# 使用者拿到手的不是报错，而是一份看起来正常的报告。
+#
+# 所以空数据不降级、不兜底，直接停。停的时候给的是「下一步做什么」，
+# 不是「出了什么事」。
+_EMPTY_CHECKLIST = [
+    "文件编码：UTF-8 with BOM 与 GBK 混用会让整份文件读成空或乱码。"
+    "先用记事本打开确认能看到正常中文，另存为「UTF-8」后再试。",
+    "分隔符：文件实际是分号或制表符分隔、扩展名却写成 .csv 时，"
+    "整行会被当成一列。加 --verbose 看第 1 阶段读到几列——只有 1 列就是这个原因。",
+    "表头行：设备导出的文件常在真正的表头上方带几行标题或批次说明，"
+    "解析会把说明行当成表头。用文本编辑器确认第 1 行就是列名。",
+    "过滤条件：--sheet 指定的工作表不对（Excel 多表文件常见），"
+    "或数据行全部落在被剔除的统计尾行、单位行里。",
+]
+
+
+def _empty_data_error(stage, detail_lines=None, files=None):
+    """空数据统一报错出口。
+
+    stage        —— 'read'（读取后无数据行）/ 'clean'（清洗后归零）
+    detail_lines—— 阶段特定的附加说明，排在排查清单前面
+    files       —— 涉及的文件（read 阶段逐个列出读到了什么）
+
+    返回值结构与 analyze() 的其它错误一致（error + detail），
+    另加 checklist 供 CLI 逐条打印。
+    """
+    head = {
+        "read": "没有读到任何数据行",
+        "clean": "清洗后剩余 0 行，无法进行任何统计判定",
+    }.get(stage, "所有数值列都没有任何有效观测值")
+    msg = "数据为空，分析终止：%s。" % head
+    out = {"error": msg, "checklist": list(_EMPTY_CHECKLIST)}
+    if detail_lines:
+        out["hints"] = list(detail_lines)   # 阶段特定的先说，通用排查方向垫后
+    if files:
+        out["detail"] = files
+    out["empty_data"] = True
+    out["empty_stage"] = stage
+    return out
 
 
 def _kb_stamp():
@@ -323,8 +379,8 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
         try:
             from . import devices as _DEV
             _DEV.invalidate_cache()
-        except Exception:
-            pass
+        except Exception as _dg_e:
+            degrade.note("pipeline.analyze@L375", _dg_e)
         PP._KNOWLEDGE = None
         PP._KNOWLEDGE_SCOPE = "__unset__"
         # 原地更新而不是重新绑定：KB 是模块级全局，被本函数各处直接引用，
@@ -370,20 +426,33 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
         if verbose:
             try:
                 print(msg)
-            except Exception:
-                pass
+            except Exception as _dg_e:
+                degrade.note("pipeline.analyze@L422", _dg_e)
 
     tables = []
     device_reports = []
+    _empty_files = []      # 读到了文件但一行数据都没有（与"读不了"是两回事）
     for p in paths:
         try:
             ing = DEV.ingest(p, sheet=sheet)
             tb = ing["table"]
             if tb is None or len(tb.rows) == 0:
-                # 归一后端到零行 -> 退回裸读，再由后续步骤处理，总比直接报错强
+                # 归一后端到零行 -> 退回裸读一次。某些版式只有裸读能读出内容。
                 tb = T.read_any(p, sheet)
                 if isinstance(tb, list):
                     tb = tb[0]
+            if tb is None or len(tb.rows) == 0:
+                # 裸读也读不到数据行 —— 这时不能"降级继续跑"。
+                # 原注释写的是"总比直接报错强"，实测证明这个判断是错的：
+                # 继续跑的产物是一份写着「未检出异常」的报告，使用者会当成结论。
+                _nc = len(tb.columns) if tb is not None else 0
+                result.setdefault("read_errors", []).append({
+                    "file": p,
+                    "error": ("只有表头、没有数据行（读到 %d 列）" % _nc) if _nc
+                             else "空文件：读不到任何内容（0 字节或无法解析）",
+                })
+                _empty_files.append(p)
+                continue
             tb.name = os.path.splitext(os.path.basename(p))[0]
             # 行级追溯：记下每行在源文件里的行号。质量审计要能顺着报告里的
             # "第 N 点异常"回到原始文件核对，否则结论无法被验证。
@@ -424,6 +493,10 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
         except Exception as e:
             result.setdefault("read_errors", []).append({"file": p, "error": str(e)})
     if not tables:
+        # 文件能打开但一行数据都没有 -> 给排查清单；
+        # 文件本身读不了（编码异常/格式不支持）-> 那是另一类问题，报原始错误。
+        if _empty_files:
+            return _empty_data_error("read", files=result.get("read_errors"))
         return {"error": "没有可读取的数据文件", "detail": result.get("read_errors")}
     # 多文件场景下企业常把上游数据一起给，文件名往往写着「上游 / 本工序」。
     # 一律取第一张，就会拿上游表当本工序来分析——工序判错、列名匹配错、根因全错。
@@ -567,6 +640,22 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
         "note": "行号对应源文件的物理行（表头占第 1 行）；做过版式归一时为近似对应",
     }
     work = clean_tb
+    if len(work) == 0:
+        # 清洗把数据删光了。原实现会带着 0 行继续跑完全部章节，
+        # 每节都输出「未检出」，最后拼成一份完整报告——使用者读到的是
+        # 「这批没问题」，而真相是「一行都没看」。
+        _acts = [str(a) for a in (clean_rep.get("actions") or [])][:5]
+        return _empty_data_error(
+            "clean",
+            detail_lines=(
+                ["清洗剔除了全部 %s 行，剩余 0 行。" % (clean_rep.get("rows_in"),)]
+                + (["触发的清洗动作：" + "；".join(_acts)] if _acts else [])
+                + ["排查方向（按可能性排序）："
+                   "① 全是重复行——文件里同一条记录被复制了多次；"
+                   "② 数值全部落在物理量程之外——列名标注的单位与数据实际单位不一致"
+                   "（如数据是 mm 而列名写 m），单位换算后整列越界；"
+                   "③ 离群剔除过紧——数据本身方差极大时 MAD 会把正常点也判为离群。"]
+            ))
     # 测试条件归一：组件 Pmax 按辐照度/温度归一到 STC 后再判定（v1.10）
     _stc_raw = [c for c, k in col_map.items() if k == "pmax"]
     work, col_map, _stc_note, _stc_target = QG.stc_normalize(work, col_map, target)
@@ -611,6 +700,28 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
     tcol, times = PP.parse_time_column(work)
 
     _v("[5/6] 时间列=%s" % (tcol or "无"))
+    # 5b. 行数不为 0 却一个有效观测值都没有 —— 与「0 行」等价，
+    #     却比 0 行更容易蒙混过关：列名全对得上、工序也能判定出来，
+    #     报告看起来像"分析过了"，实际每个统计量都是 None。
+    #     必须排除时间列再数：实测「2026-01-01」会被解析成数值 2026.0，
+    #     不排除的话时间列单独就能让这个检测失效。
+    _numcols = [c for c in work.numeric_columns() if c != tcol]
+    _n_valid = 0
+    for _c in _numcols:
+        try:
+            _n_valid += sum(1 for _v in work.numeric_column(_c) if _v is not None)
+        except Exception as _dg_e:
+            degrade.note("pipeline.analyze@L706", _dg_e)
+    if (not _numcols) or _n_valid == 0:
+        return _empty_data_error(
+            "values",
+            detail_lines=[
+                "共 %d 行，除时间列外没有任何一列能解析出可用于统计的数值%s。"
+                % (len(work), "（识别到 %d 个数值列，全部无有效值）" % len(_numcols)
+                   if _numcols else "（一个数值列都没识别出来）"),
+                "排查方向：数值列里混了单位字符（如「12.3 mm」）或千分位逗号时，"
+                "整列会被当成文本；单元格里只写了「/」「-」「NA」等占位符同理。",
+            ])
     # 6. 缺陷识别与 Pareto
     defects = RC.identify_defects(work, defect, process=chosen_proc)
     result["defects"] = defects[:10]
@@ -1182,8 +1293,8 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
                                "hint": "本文件由分析自动生成，仅为候选。确认无误后执行："
                                        "python scripts/kb_manage.py harvest --file 本文件",
                                "candidates": cands}, f, ensure_ascii=False, indent=2)
-            except Exception:
-                pass
+            except Exception as _dg_e:
+                degrade.note("pipeline.analyze@L1289", _dg_e)
 
     except Exception as _guard_e:
         result.setdefault("degraded_sections", []).append(
@@ -1203,6 +1314,16 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
     kbc = os.path.join(outdir, "kb_candidates.json")
     if os.path.exists(kbc):
         files["知识候选"] = kbc
+    # 14b. 降级台账收口。
+    #     沿途各模块在 except 里记的每一笔在这里汇总：让「这一节没结论」
+    #     能被区分为「确实没有」与「算崩了」。没有记录就不加这一节。
+    try:
+        _dg = degrade.drain()
+        if _dg:
+            result["degradation_log"] = _dg
+            result.setdefault("warnings", []).extend(degrade.summary_lines())
+    except Exception as _dg_e:
+        degrade.note("pipeline.analyze@L1319", _dg_e)
     result["outputs"] = files
     result["summary"] = build_summary(result)
     return result
@@ -1275,8 +1396,8 @@ def data_driven_rootcause(assoc, spc_res, col_map, process_key, y_col, recog=Non
                     v = corr["matrix"][yi][j]
                     if v is not None:
                         r_with_y[c] = abs(v)
-                except (IndexError, TypeError):
-                    pass
+                except Exception as _dg_e:
+                    degrade.note("pipeline.data_driven_rootcause@L1393", _dg_e)
     # 共线对处理：两列 |r|≥0.95 说明它们在量同一件事，只保留与目标更相关的那个。
     # 组件 IV 里 CTM 与 Pmax 就是 r=1.000 —— 两个都留在候选里，等于说
     # 「功率低是因为功率低」。注意判据是列与列共线，不是列与目标共线：
@@ -2313,8 +2434,14 @@ def main():
 
     if res.get("error"):
         print("ERROR: " + res["error"])
+        for _line in (res.get("hints") or []):
+            print("  · " + _line)
         if res.get("detail"):
-            print(json.dumps(res["detail"], ensure_ascii=False, indent=2))
+            print("  涉及文件：" + json.dumps(res["detail"], ensure_ascii=False))
+        if res.get("checklist"):
+            print("  排查方向：")
+            for _i, _line in enumerate(res["checklist"], 1):
+                print("  %d. %s" % (_i, _line))
         sys.exit(1)
 
     slim = {k: v for k, v in res.items() if not k.startswith("_")}

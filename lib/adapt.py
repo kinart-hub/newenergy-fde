@@ -14,6 +14,10 @@ adapt.py —— 字段匹配不上 / 互相冲突时的自动适配层
 本模块所有函数保证不抛异常：适配层自己崩了，是最讽刺的失败方式。
 """
 
+try:
+    from . import degrade          # 包模式
+except Exception:                  # 脚本模式（python lib/pipeline.py）无包上下文
+    import degrade                 # noqa
 import re
 import os
 import json
@@ -318,12 +322,11 @@ def _guess_param(col, kb, floor=0.72):
         hit = PP.match_param(col, prefer_process=None)
         if hit and hit[1] >= floor:
             return hit[0], hit[1]
-    except Exception:
-        pass
-    return None
-
-
-# ------------------------------------------------------------------ 统一入口
+    except Exception as _dg_e:
+        # 别名候选生成失败 = 这一列不会被登记成候选，
+        # 表现为"它确实不像任何参数"，需要留痕以便区分。
+        degrade.note("adapt.guess_param", _dg_e)
+    return None# ------------------------------------------------------------------ 统一入口
 
 def adapt(table, col_map, kb=None, process=None, auto_approve=False,
           queue=True, source=None):

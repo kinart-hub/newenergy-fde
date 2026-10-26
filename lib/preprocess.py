@@ -604,6 +604,7 @@ def merge_tables(tables, on, how="inner"):
 
 # ------------------------------------------------------------------ 归一化
 
+# scan:keep 库能力：通用归一化。当前清洗只用 MAD/缺失策略，未做量纲归一；需要统一量纲时启用。
 def normalize(table, columns=None, method="zscore", target_map=None):
     """method: zscore | minmax | dev_pct（相对目标值偏差%）
     返回 (new_table, stats_dict)"""
@@ -635,6 +636,7 @@ def normalize(table, columns=None, method="zscore", target_map=None):
 
 # ------------------------------------------------------------------ 派生量
 
+# scan:keep 库能力：派生列。当前派生指标在报告层现算，未落到预处理层。
 def add_derived(table, col_map=None):
     """按知识库补充常用派生列：CV%、与目标偏差、移动平均、分组序号"""
     kb = load_knowledge()

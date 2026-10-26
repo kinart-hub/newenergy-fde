@@ -454,6 +454,7 @@ def check_point(point, constraints):
     return (not bad), bad
 
 
+# scan:keep RSM 寻优备用实现。当前 DOE 走 optimize（正交/爬山），RSM 在需要响应面模型时启用。
 def optimize_rsm_constrained(model, factor_specs, goal="maximize", target=None,
                              grid=21, bounds=(-1, 1), constraints=None):
     """带工程约束的响应面寻优。

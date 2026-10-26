@@ -9,6 +9,10 @@ stats.py —— 零依赖统计基础库
 分布尾概率用 Numerical Recipes 的 betai / gammap 连分数算法实现。
 """
 
+try:
+    from . import degrade          # 包模式
+except Exception:                  # 脚本模式（python lib/pipeline.py）无包上下文
+    import degrade                 # noqa
 import math
 
 # ------------------------------------------------------------------ 基础数学
@@ -299,6 +303,7 @@ def spearman(xs, ys):
     return pearson(_rank(xs2), _rank(ys2))
 
 
+# scan:keep 零依赖统计库 API（正态性检验）。当前报告未呈现正态性，能力保留，需要时接上。
 def jarque_bera(xs):
     """正态性检验，返回 (JB统计量, p值)；p<0.05 拒绝正态"""
     xs = [x for x in xs if x is not None]
@@ -313,6 +318,7 @@ def jarque_bera(xs):
     return jb, chi2_sf(jb, 2)
 
 
+# scan:keep 零依赖统计库 API（单样本 t 检验）。当前只用双样本与 Welch，能力保留。
 def t_test_1sample(xs, mu0):
     xs = [x for x in xs if x is not None]
     n = len(xs)
@@ -375,6 +381,7 @@ def anova_oneway(groups):
             "eta2": ssb / (ssb + ssw) if (ssb + ssw) > 0 else None}
 
 
+# scan:keep 零依赖统计库 API（卡方检验）。当前独立性检验走 chi2_independent，本函数为拟合优度场景保留。
 def chi2_test(table2d):
     """列联表 [[a,b],[c,d]...] 独立性检验"""
     rows = len(table2d)
@@ -457,8 +464,10 @@ def linear_regression(X, y, ridge=1e-10):
                 t = beta[a] / se if se > 0 else 0.0
                 tvals.append(t)
                 pvals.append(t_sf(t, df))
-        except Exception:
-            pass
+        except Exception as _dg_e:
+            # 显著性算不出来时，下游拿到的是空 pvals——与"确实不显著"长得一样。
+            # 记一笔，报告里就能区分「没算出来」和「算出来不显著」。
+            degrade.note("stats.regress.tvals_pvals", _dg_e)
     return {"coef": beta[1:], "intercept": beta[0], "r2": r2, "adj_r2": adj,
             "tvals": tvals[1:], "pvals": pvals[1:], "intercept_t": tvals[0] if tvals else None,
             "intercept_p": pvals[0] if pvals else None,
@@ -514,6 +523,7 @@ def moving_average(xs, window=5):
     return out
 
 
+# scan:keep 零依赖统计库 API（游程数）。当前游程检验走 runs_test，本函数为只取游程数的场景保留。
 def runs_count(xs, center=None):
     """以 center 为界统计符号游程数（趋势/振荡判异用）"""
     if center is None:

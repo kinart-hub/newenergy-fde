@@ -98,6 +98,8 @@ class ControlChart(object):
         self.subgroup_size = subgroup_size
         self.extra = extra or {}
 
+    # scan:keep 类方法：控制图分区（A/B/C 区）。当前判异走 Nelson 规则，
+    # 未用分区；规则集可配置化、需要分区判异时启用。
     def zones(self):
         """返回 A/B/C 区边界（相对中心线的 sigma 倍数）"""
         s = self.sigma_within or self.sigma_overall
@@ -304,6 +306,7 @@ def c_chart(counts):
     return ControlChart("c", cbar, max(0.0, cbar - h), cbar + h, counts)
 
 
+# scan:keep 自动选图：按数据特性选 X-R / X-s / I-MR。当前按样本量硬分档，未走自动选择。
 def auto_chart(values, subgroup_col=None, defect_count=None, sample_size=None):
     """自动选择控制图类型"""
     if defect_count is not None:
@@ -372,6 +375,7 @@ def parse_rules(spec):
     return tuple(sorted(set(got))) or DEFAULT_RULES
 
 
+# scan:keep 库能力：判异规则名称表。当前规则名硬编码在报告里，规则集可配置化后改为读这里。
 def rule_names(rules):
     rs = parse_rules(rules)
     return [NELSON_RULES[n - 1][1] for n in rs]

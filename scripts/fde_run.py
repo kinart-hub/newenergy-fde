@@ -988,6 +988,122 @@ def rule_defect_refs_not_dangling():
 
 ROOTCAUSE_FILE = os.path.join("lib", "rootcause.py")
 EIGHTD_FILE = os.path.join("lib", "eightd.py")
+PIPELINE_FILE = os.path.join("lib", "pipeline.py")
+
+
+def rule_empty_data_must_stop():
+    """空数据必须终止，不得降级跑完出报告。
+
+    实测过四种空数据输入（0 字节文件 / 只有表头 / 数值列全空 / 清洗后归零），
+    原实现全部照常出报告，summary 写着「SPC 判异：未检出违反 Nelson 规则的参数」——
+    把「没有输入」包装成「没有结论」。使用者读到的是「这批没问题」。
+
+    三个终止点都必须存在：
+      read   —— 裸读后仍 0 行（原注释写「总比直接报错强」，实测证明判断错了）
+      clean  —— 清洗后剩余 0 行
+      values —— 有行数但除时间列外无任何有效观测值
+    """
+    t = _read(PIPELINE_FILE) or ""
+    if not t:
+        return _r(False, "读不到 " + PIPELINE_FILE)
+
+    def _has(prefix_re):
+        return re.search(prefix_re, t, re.M) is not None
+
+    # read：裸读仍 0 行时记入 _empty_files 并跳过该文件。
+    # 判据落在「append 紧跟 continue」这个具体形态上——
+    # 分开查的话，别处的 continue 会让判据形同虚设。
+    read_guard = re.search(
+        r"^[\t ]+_empty_files\.append\(p\)\n[\t ]+continue$", t, re.M) is not None
+    # clean：清洗后 0 行
+    clean_guard = _has(r"^[\t ]+if len\(work\) == 0:")
+    # values：除时间列外无有效观测值
+    values_guard = _has(r"^[\t ]+if \(not _numcols\) or _n_valid == 0:")
+    # 三个终止点都必须落到 _empty_data_error，而不是各自 return 一句普通文案
+    n_calls = len(re.findall(r"return _empty_data_error\(", t))
+
+    missing = []
+    if not read_guard:
+        missing.append("read 阶段（裸读 0 行未跳过）")
+    if not clean_guard:
+        missing.append("clean 阶段（清洗后 0 行未终止）")
+    if not values_guard:
+        missing.append("values 阶段（无有效观测值未终止）")
+    if n_calls < 3:
+        missing.append("_empty_data_error 调用不足 3 处（现有 %d 处）" % n_calls)
+    if missing:
+        return _r(False, "空数据终止点缺失：" + "；".join(missing))
+    return _r(True, "", {"read": True, "clean": True, "values": True,
+                         "calls": n_calls})
+
+
+def rule_empty_error_has_checklist():
+    """空数据报错必须带排查清单，且清单要真的被打印出来。
+
+    只说「无数据」是通报，不是帮助。使用者要的是「下一步做什么」。
+    两处都要有：清单本身（至少 4 条）+ CLI 端逐条打印。
+    少打印那一处，等于把清单写在了没人看的地方。
+    """
+    t = _read(PIPELINE_FILE) or ""
+    if not t:
+        return _r(False, "读不到 " + PIPELINE_FILE)
+
+    items = re.findall(r'^_EMPTY_CHECKLIST = \[(.*?)^\]', t, re.M | re.S)
+    if not items:
+        return _r(False, "缺少 _EMPTY_CHECKLIST 定义")
+    n_items = len(re.findall(r'^    "', items[0], re.M))
+    if n_items < 4:
+        return _r(False, "排查清单只有 %d 条，要求覆盖编码/分隔符/表头行/过滤条件四类"
+                 % n_items)
+    # 打印：CLI 端 error 分支必须遍历 checklist。
+    # 判据认「语义」不认「风格」——res.get("x") 与 res["x"] 是等价写法，
+    # 只认前者的话，换个写法就误报，规则反而成了噪音。
+    printed = re.search(
+        r'for _i, _line in enumerate\(res(?:\["checklist"\]|\.get\("checklist"\)), 1\):',
+        t) is not None
+    hints = re.search(r'res\.get\("hints"\)', t) is not None
+    if not printed:
+        return _r(False, "CLI 端未逐条打印 checklist —— 清单不会被使用者看到")
+    if not hints:
+        return _r(False, "CLI 端未打印 hints —— 阶段特定的提示丢失")
+    return _r(True, "", {"items": n_items, "printed": True, "hints": True})
+
+
+def rule_no_dangling_verbose_hint():
+    """提示语里出现的参数必须真实存在。
+
+    前车之鉴：引擎提示使用者「加 --verbose 看细节」，而当时这个参数并不存在。
+    提示指向一个空入口，比不提示更糟——使用者照做只会碰壁，
+    还会连带怀疑整份提示的可信度。
+    本规则守住的是「报错文案里提到的每个 --xxx 都在 argparse 里注册过」。
+    """
+    t = _read(PIPELINE_FILE) or ""
+    if not t:
+        return _r(False, "读不到 " + PIPELINE_FILE)
+    # 收集提示/报错文案里出现的 --xxx，逐个核对是否在 argparse 里注册过。
+    # 不要求反引号包裹：实测提示文案里的参数基本都是裸写的
+    # （「加 --verbose 看第 1 阶段读到几列」），加了反引号要求就一个都扫不到。
+    # 也不做白名单：白名单本身就是一份需要人维护的副本，会失同步。
+    # 按「字符串常量」逐条判定，而不是整文件扫：
+    # 提示文案里常夹着别的脚本的命令行示例（kb_manage.py --type 之类），
+    # 整文件扫会把这些合法引用误报成悬空参数。带 .py 的常量整条跳过。
+    import ast as _ast
+    try:
+        _tree = _ast.parse(t)
+    except SyntaxError as _e:
+        return _r(False, "pipeline.py 无法解析，本规则无法判定：%s" % _e)
+    mentioned = set()
+    for _n in _ast.walk(_tree):
+        if isinstance(_n, _ast.Constant) and isinstance(_n.value, str):
+            if ".py" in _n.value:      # 指向别的脚本的示例，不归本规则管
+                continue
+            for _m in re.finditer(r"--[a-z][a-z0-9-]+", _n.value):
+                mentioned.add(_m.group(0))
+    registered = set(re.findall(r'add_argument\(\s*["\'](--[a-z][a-z0-9-]+)', t))
+    dangling = sorted(mentioned - registered)
+    if dangling:
+        return _r(False, "提示语指向了不存在的参数：" + "、".join(dangling))
+    return _r(True, "", {"mentioned": len(mentioned), "registered": len(registered)})
 
 
 def rule_defect_alias_index_used():
@@ -1347,6 +1463,41 @@ AUDIT_RULES = [
           _mutant("render_8d 不再调用 derive_d7_fmea",
                   _re_sub(r"^[\t ]+fmea = derive_d7_fmea\(res, lead, card\)",
                           "        fmea = None"), EIGHTD_FILE)]),
+
+    Rule("空数据必须终止，不得出报告", rule_empty_data_must_stop,
+         "lib/pipeline.py 必须有 read / clean / values 三个终止点，"
+         "且都调用 _empty_data_error；空数据降级跑完会把「没有输入」写成「没有结论」",
+         PIPELINE_FILE,
+         [_mutant("空文件不再跳过该文件（去掉 append+continue）",
+                  _re_sub(r"^[\t ]+_empty_files\.append\(p\)\n[\t ]+continue$",
+                          "                pass"), PIPELINE_FILE),
+          _mutant("清洗后 0 行不再终止",
+                  _re_sub(r"^[\t ]+if len\(work\) == 0:",
+                          "    if False:"), PIPELINE_FILE),
+          _mutant("无有效观测值不再终止",
+                  _re_sub(r"^[\t ]+if \(not _numcols\) or _n_valid == 0:",
+                          "    if False:"), PIPELINE_FILE)]),
+
+    Rule("空数据报错必须带排查清单且真的打印出来", rule_empty_error_has_checklist,
+         "_EMPTY_CHECKLIST 至少 4 条（编码/分隔符/表头行/过滤条件），"
+         "且 CLI 的 error 分支逐条打印 checklist 与 hints；"
+         "只说「无数据」是通报不是帮助",
+         PIPELINE_FILE,
+         [_mutant("排查清单砍到 1 条",
+                  _re_sub(r'^_EMPTY_CHECKLIST = \[.*?^\]',
+                          '_EMPTY_CHECKLIST = [\n    "检查文件。",\n]',
+                          flags=re.M | re.S), PIPELINE_FILE),
+          _mutant("CLI 不再逐条打印清单",
+                  _re_sub(r'^[\t ]+for _i, _line in enumerate\(res\["checklist"\], 1\):',
+                          '        for _i, _line in enumerate([], 1):'), PIPELINE_FILE)]),
+
+    Rule("提示语不得指向不存在的参数", rule_no_dangling_verbose_hint,
+         "报错/提示文案里用反引号标注的每个 --xxx 都必须在 argparse 里注册；"
+         "前车之鉴：曾提示使用者加 --verbose，而该参数当时并不存在",
+         PIPELINE_FILE,
+         [_mutant("提示里塞一个没注册的参数",
+                  _re_sub(r"加 --verbose 看第 1 阶段读到几列",
+                          "加 --debug-mode 看第 1 阶段读到几列"), PIPELINE_FILE)]),
 ]
 
 

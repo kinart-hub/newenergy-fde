@@ -16,6 +16,10 @@ tenancy.py —— 多企业用户隔离层
 没有 tenant id 时完全不介入（保持单库行为），老用法不受影响。
 """
 
+try:
+    from . import degrade          # 包模式
+except Exception:                  # 脚本模式（python lib/pipeline.py）无包上下文
+    import degrade                 # noqa
 import io
 import json
 import os
@@ -43,8 +47,8 @@ def set_root(path):
     try:
         from . import devices as _D
         _D.set_root(path)
-    except Exception:
-        pass
+    except Exception as _dg_e:
+        degrade.note("tenancy.set_root@L47", _dg_e)
     return SKILL_ROOT
 
 
@@ -269,6 +273,7 @@ def map_to_tenant(path):
     return os.path.join(kb, rel)
 
 
+# scan:keep 分层写入：同时写基线与租户层。当前写路径统一走 tenant_kb 单落点，本函数是为「同一条目落到两层」场景预留，启用前需先明确冲突处置规则。
 def write_layered(path, data):
     """原子写入（tmp + os.replace + Windows 退避重试），并把目标重定向到租户层"""
     target = map_to_tenant(path)
@@ -392,12 +397,12 @@ def lock(name="kb", timeout=15.0, stale=180.0):
                     for p in os.listdir(d):
                         try:
                             os.remove(os.path.join(d, p))
-                        except Exception:
-                            pass
+                        except Exception as _dg_e:
+                            degrade.note("tenancy.lock@L396", _dg_e)
                     os.rmdir(d)
                     continue
-                except Exception:
-                    pass
+                except Exception as _dg_e:
+                    degrade.note("tenancy.lock@L400", _dg_e)
             if time.time() >= deadline:
                 raise TimeoutError(
                     "获取知识库锁超时（%.0fs），可能正有其它任务在写库。"
@@ -419,12 +424,13 @@ def lock(name="kb", timeout=15.0, stale=180.0):
                 if os.path.exists(owner_file):
                     os.remove(owner_file)
                 os.rmdir(d)
-            except Exception:
-                pass
+            except Exception as _dg_e:
+                degrade.note("tenancy.lock@L423", _dg_e)
 
 
 # --------------------------------------------------------------- 提升（promote）
 
+# scan:keep 预留通道：租户把已验证知识贡献回共享基线的投递入口。当前对外承诺（见 manifest）只到「沉淀入库」（sync 链路），贡献回基线尚未纳入交付范围，故无调用者。kb_manage.py --promote 读的是同一队列，因此当前恒为空——在启用本通道前，--promote 应如实说明这一点。
 def queue_promotion(kind, payload, tenant=None, note=""):
     """
     租户想把自己验证过的知识贡献给基线：投递到共享待审区，

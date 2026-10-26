@@ -372,7 +372,13 @@ if _HAS8:
 
     # O8 D8 结案清单 +  blockers
     _d8 = E8.derive_d8({"confidence": {"level": "低"}}, None)
-    check("D8 给出 6 条结案条件", len(_d8["gates"]) == 6)
+    # 不再断言死数量：每加一条结案门槛就得改一次数字，等于把能力变更的责任
+    # 推给测试——D7 加 PFMEA 门槛时就是这样漏掉的（6 变 7，断言还写着 6）。
+    # 改判「必备项是否都在」，缺哪个报哪个。
+    _gates_txt = " ".join(str(g.get("item", "")) for g in (_d8["gates"] or []))
+    _need = ["D4", "D5", "D6", "D7", "PFMEA", "横向展开", "客户"]
+    _miss = [k for k in _need if k not in _gates_txt]
+    check("D8 结案条件覆盖全部必备项", not _miss, "、".join(_miss))
     check("低置信度会阻塞结案", len(_d8["blockers"]) >= 1)
     _d8n = E8.derive_d8({"negative_verdict": {"verdict": "no_actionable_cause"}}, None)
     check("负例结论会阻塞结案", len(_d8n["blockers"]) >= 1)

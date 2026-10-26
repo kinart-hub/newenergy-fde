@@ -24,6 +24,10 @@ hotswap.py —— 基线热更新的两道保险
     index 版本落后于正库（无害），不会出现"index 声称新版但正库还是旧的"。
 """
 
+try:
+    from . import degrade          # 包模式
+except Exception:                  # 脚本模式（python lib/pipeline.py）无包上下文
+    import degrade                 # noqa
 import io
 import os
 import json
@@ -112,8 +116,8 @@ def _cleanup(tmp):
     try:
         if os.path.exists(tmp):
             os.remove(tmp)
-    except Exception:
-        pass
+    except Exception as _dg_e:
+        degrade.note("hotswap._cleanup@L116", _dg_e)
 
 
 def atomic_write_json(path, data, retries=12, base_delay=0.02):

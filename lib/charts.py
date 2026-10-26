@@ -407,6 +407,7 @@ def boxplot(groups, title="分组分布对比", ylabel="", width=760, height=340
 
 # ------------------------------------------------------------------ 时序
 
+# scan:keep 库能力：时间序列图。当前报告只用到控制图/主效应之外的基础图，时间序列待时序分析章节启用时接上（届时报告第 5 节会调用）。
 def time_series(x_labels, series, title="时间序列", ylabel="", width=760, height=320,
                 hlines=None):
     """series: [{"name":..,"values":[..],"color":..}]"""
@@ -520,6 +521,7 @@ def scatter(xs, ys, xlabel="", ylabel="", title="相关性散点图", width=640,
 
 # ------------------------------------------------------------------ 主效应图
 
+# scan:keep 库能力：DOE 主效应图。当前 DOE 章节以表格式输出方案，未出图；改为图形化呈现时接上。
 def main_effects_plot(main_effects, title="因子主效应", width=760, height=320):
     if not main_effects:
         return ""

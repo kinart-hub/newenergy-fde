@@ -11,6 +11,10 @@
 设计原则：设备档案优先，通用侦测兜底。认不出设备时不能报错，降级处理并如实标注。
 """
 
+try:
+    from . import degrade          # 包模式
+except Exception:                  # 脚本模式（python lib/pipeline.py）无包上下文
+    import degrade                 # noqa
 import os
 import re
 import json
@@ -105,6 +109,7 @@ def invalidate_cache():
     _p_cache.clear()
 
 
+# scan:keep 对外 API：供 kb_manage.py devices 子命令与人工排查时列出已登记设备，当前由 get_profile 逐个取用，未走列表接口。
 def list_devices():
     d = load_profiles()
     return [(k, v.get("name", k), v.get("vendor", ""), v.get("category", ""))
@@ -130,8 +135,8 @@ def _head_meta_text(path, max_lines=12):
                 return raw.decode(enc)[:4000]
             except (UnicodeDecodeError, LookupError):
                 continue
-    except Exception:
-        pass
+    except Exception as _dg_e:
+        degrade.note("devices._head_meta_text@L134", _dg_e)
     return ""
 
 
@@ -227,8 +232,8 @@ def identify_device(table, path=None, head_text=None):
                         "matched_by": "fingerprint",
                         "similarity": fh.get("similarity"),
                         "fingerprint": {"col_sig": fp.get("col_sig"), "n_cols": fp.get("n_cols")}}
-        except Exception:
-            pass
+        except Exception as _dg_e:
+            degrade.note("devices.identify_device@L231", _dg_e)
         return {"device": None, "name": "未识别设备（走通用版式处理）", "score": best_score,
                 "confidence": "未识别", "evidence": best_evid, "runner_up": runner,
                 "note": "未匹配到已知设备档案，已按通用规则处理。可执行 "
@@ -841,5 +846,6 @@ def ingest(path, sheet=None, prefer_process=None, verbose=False):
     return out
 
 
+# scan:keep 批量入口：多设备文件一次性归一。当前流水线逐个文件 ingest，接批量导入需求时启用。
 def ingest_many(paths, prefer_process=None):
     return [ingest(p, prefer_process=prefer_process) for p in paths]

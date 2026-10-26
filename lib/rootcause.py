@@ -10,6 +10,10 @@ rootcause.py —— 不良根因定位引擎
 输出：候选根因排序、5Why 链条、良率损失 Pareto、数据缺口清单。
 """
 
+try:
+    from . import degrade          # 包模式
+except Exception:                  # 脚本模式（python lib/pipeline.py）无包上下文
+    import degrade                 # noqa
 import os
 import json
 import math
@@ -366,14 +370,19 @@ def _chain_processes(proc):
         kb = _kb()
         procs = kb.get("processes", {})
         if proc in procs:
-            for p in XP.upstream_of(proc, procs, chain_hops=4):
+            # 签名是 upstream_of(process, chain_hops=4)：内部自己 load_kb，
+            # 不接第二个位置参数。此前多传了一个 procs，
+            # 每次调用都抛 TypeError 并被下面的 except 吞掉 ——
+            # 于是横向排查清单每次都只剩本工序自己，而全库自检照常全绿。
+            for p in XP.upstream_of(proc, chain_hops=4):
                 out.add(p)
-            for p in XP.downstream_of(proc, procs, chain_hops=4):
+            for p in XP.downstream_of(proc, chain_hops=4):
                 out.add(p)
-    except Exception:
-        pass
+    except Exception as _dg_e:
+        # 上下游追溯失败时 out 只剩本工序自己，与"该工序确无上下游"无法区分。
+        # 横向排查清单会因此少一大片，所以要留痕。
+        degrade.note("rootcause.related_processes", _dg_e)
     return out
-
 
 def rank_root_causes(defect_name, table, target_col=None, top=5,
                      col_map=None, process=None, exclude_cols=None):

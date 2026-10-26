@@ -23,6 +23,10 @@ crossprocess.py —— 跨工序追溯引擎
 设计原则：任何一步拿不到数据就降级并如实说明，绝不假装算出来了。
 """
 
+try:
+    from . import degrade          # 包模式
+except Exception:                  # 脚本模式（python lib/pipeline.py）无包上下文
+    import degrade                 # noqa
 import os
 import math
 
@@ -580,8 +584,9 @@ def trace(tables, table_meta, target_col, current_process, defect=None,
             if len(pairs) >= 10:
                 r_, p_, n_ = S.pearson([a for a, _ in pairs], [b for _, b in pairs])
                 corr = {"r": r_, "p": p_, "n": n_}
-        except Exception:
-            pass
+        except Exception as _dg_e:
+            # corr 为 None 时，跨工序结论里这一段会静默消失。
+            degrade.note("crossprocess.align_corr", _dg_e)
         probe = None
         if bad_idx:
             sp = _pick_spec(spec, c, table_meta, params)
