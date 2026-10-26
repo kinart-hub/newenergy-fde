@@ -44,7 +44,7 @@ if __package__ in (None, ""):
     from lib import table as T, stats as S, preprocess as PP, spc as SPC, \
         correlation as CORR, doe as DOE, rootcause as RC, charts as CH, report as RPT, \
         kbstore as KBS, devices as DEV, crossprocess as XP, actions as AC, \
-        adapt as AD, quality_guard as QG, status as ST, provenance as PROV
+        adapt as AD, quality_guard as QG, status as ST, provenance as PROV, contract as CT
     try:                    # v1.11 新增模块，导入失败不能拖垮整条流水线
         from lib import events as EV
         _HAS_EVENTS = True
@@ -61,7 +61,7 @@ else:
     from . import table as T, stats as S, preprocess as PP, spc as SPC, \
         correlation as CORR, doe as DOE, rootcause as RC, charts as CH, report as RPT, \
         kbstore as KBS, devices as DEV, crossprocess as XP, actions as AC, \
-        adapt as AD, quality_guard as QG, status as ST, provenance as PROV
+        adapt as AD, quality_guard as QG, status as ST, provenance as PROV, contract as CT
     try:
         from . import events as EV
         _HAS_EVENTS = True
@@ -743,6 +743,28 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
                 "工序判定与根因结论都不可靠。请补充列名含义对照，或登记为设备档案后重跑。"
                 % (_rate * 100, _hit, len(work.columns)))
 
+    # P1-4 数据契约：未在契约里登记的列要点名隔离，不能悄悄混进结论。
+    # 「有一列我们不知道是什么」和「分析过了」是两回事——
+    # 混过去的话，报告看上去完整，实际少了几列的证据。
+    try:
+        _ci = CT.check_input(work, known_columns=set(col_map or {}))
+        result["contract"] = {
+            "schema_version": CT.SCHEMA_VERSION,
+            "n_rows": _ci.get("n_rows"),
+            "n_columns": _ci.get("n_columns"),
+            "recognized_roles": _ci.get("roles") or [],
+        }
+        if _ci.get("unknown"):
+            result["contract_quarantine"] = CT.quarantine(_ci["unknown"])
+            result.setdefault("warnings", []).append(
+                "以下 %d 列未在字段契约中登记，本次不参与工艺判定（数据保留，"
+                "结论不含它们的证据）：%s"
+                % (len(_ci["unknown"]),
+                   "、".join(list(_ci["unknown"])[:8])
+                   + ("…" if len(_ci["unknown"]) > 8 else "")))
+    except Exception as _exc:
+        degrade.note("pipeline.contract@check_input", _exc)
+
     _v("[4/6] 目标列=%s；分组维度=%s" % (
         y_col or "未定", "、".join(groups[:5]) if groups else "无"))
     # 5. 时间列
@@ -774,6 +796,12 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
     # 6. 缺陷识别与 Pareto
     defects = RC.identify_defects(work, defect, process=chosen_proc)
     result["defects"] = defects[:10]
+    # P0-3：每个环节都要自己交代"到底算过没有"。
+    # 不写 status 的话，下游只能看到"列表是空的"，
+    # 分不清"确实没有缺陷"和"这一段压根没跑成"。
+    for _d in result["defects"]:
+        if isinstance(_d, dict):
+            _d.setdefault("status", ST.SUCCESS if _d.get("total") else ST.NO_FINDING)
     if defect:
         result["defect"] = defect
     # 机理借用告警：本工序没登记这条机理，匹配时借用了别的工序的条目。
@@ -936,6 +964,17 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
                 "values": vals,
             })
         result["spc"] = [{k: v for k, v in d.items() if k != "values"} for d in spc_res]
+        # status 三态判据必须具体到"看哪个字段"，不能一律 SUCCESS：
+        # 有能力指数才算真的算过；只有判异结果没有能力指数，说明样本/规格不足以定论。
+        for _d in result["spc"]:
+            if _d.get("status"):
+                continue
+            if _d.get("violations"):
+                _d["status"] = ST.SUCCESS            # 算过了，而且查出点东西
+            elif _d.get("capability") is not None:
+                _d["status"] = ST.NO_FINDING         # 算过了，这个参数没问题
+            else:
+                _d["status"] = ST.INSUFFICIENT_DATA  # 数据不足以谈论这个参数
         result["_spc_full"] = spc_res
         result["spc_rules"] = list(_rules)
 
@@ -975,6 +1014,12 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
                     "error": a.get("error"),
                     "impact": "该目标的关联分析未执行，不代表『没有相关因素』"})
         result["association"] = assoc[:15]
+        # 样本量小到算不出可信相关时，不能和"算过且没有相关因素"混为一谈
+        for _a in (result["association"] or []):
+            if isinstance(_a, dict) and not _a.get("status"):
+                _n = _a.get("n")
+                _a["status"] = (ST.SUCCESS if (isinstance(_n, int) and _n >= 3)
+                                else ST.INSUFFICIENT_DATA)
         QG.test_condition_warnings(assoc, result)
         lags = []
         if y_col:
@@ -1502,6 +1547,25 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
     except Exception as _dg_e:
         degrade.note("pipeline.analyze@L1319", _dg_e)
     result["outputs"] = files
+
+    # P1-4 契约的下半场：出口也要校验。
+    # 这里不因为有 violation 就中断——报告已经生成到一半了，
+    # 掐掉使用者什么都拿不到。做法是把问题挂到 contract_report 上并进 warnings，
+    # 让报告自己承认"哪些环节没能证明自己算过"。
+    try:
+        _cr = CT.check_result(result)
+        result["contract_report"] = {
+            "schema_version": CT.SCHEMA_VERSION,
+            "ok": _cr.get("ok"),
+            "missing_required": _cr.get("missing_required") or [],
+            "sections_without_status": _cr.get("missing_status") or [],
+            "violations": _cr.get("violations") or [],
+        }
+        for _v in (_cr.get("violations") or []):
+            result.setdefault("warnings", []).append("数据契约：%s" % _v)
+    except Exception as _exc:
+        degrade.note("pipeline.contract@check_result", _exc)
+
     result["summary"] = build_summary(result)
 
     # 血缘收口：先把状态定下来再落盘。

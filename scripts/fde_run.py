@@ -632,6 +632,8 @@ AUDIT_FILES = [
     os.path.join("lib", "provenance.py"),
     os.path.join("lib", "confound.py"),
     os.path.join("lib", "doe.py"),
+    # v2.7 契约规则的变异目标；缺了它同样会是静默 SKIP 而不是 FAIL
+    os.path.join("lib", "contract.py"),
     os.path.join("knowledge", "process_specs.json"),
 ]
 
@@ -1026,6 +1028,7 @@ DOE_FILE = os.path.join("lib", "doe.py")
 TENANCY_FILE = os.path.join("lib", "tenancy.py")
 EIGHTD_FILE = os.path.join("lib", "eightd.py")
 PIPELINE_FILE = os.path.join("lib", "pipeline.py")
+CONTRACT_FILE = os.path.join("lib", "contract.py")
 VIEWS_FILE = os.path.join("lib", "views.py")
 RUN_FILE = os.path.join("scripts", "fde_run.py")
 
@@ -1584,6 +1587,61 @@ def rule_unregistered_hint_actionable():
     return _r(True, "", {"has_fn": True, "wired": True, "has_cmd": True})
 
 
+def rule_contract_enforced():
+    """P1-4 数据契约：三个"不许糊过去"的点必须真的在代码里。
+
+    判据刻意落在**具体赋值与返回形态**上，不停留在"字样出现过"。
+    上一轮规则 39 被自己的变异骗过一次（注入 `(False and ...)` 后
+    两个关键字都还在，规则照样判过），所以这里每条都要求看得见比较或记账动作。
+    """
+    t = _read(CONTRACT_FILE) or ""
+    if not t:
+        return _r(False, "读不到 " + CONTRACT_FILE)
+
+    # 1) 版本：主版本不同必须给出 block，且这个 block 要真的被返回出去
+    comp = _block(t, "def compatible(", "\ndef ")
+    if not re.search(r"a\[0\]\s*!=\s*b\[0\]", comp):
+        return _r(False, "版本兼容未比较主版本号：跨大版本的数据结构会被当成能用")
+    # 光有比较不够，"比较完什么都不做"同样等于没有门禁
+    if not re.search(r'return\s+False,\s*"block"', comp):
+        return _r(False, "主版本不一致时未返回 block 级结果")
+    if not comp.count('"block"') >= 2:
+        return _r(False, "不可解析的版本号也必须按 block 处理（不能默认放行）")
+
+    # 2) 结果：有输出却没 status 的环节必须被逐条记进 missing_status
+    cr = _block(t, "def check_result(", "\ndef ")
+    if not re.search(r"out\[.missing_status.\]\.append\(n\)", cr):
+        return _r(False, "缺少 missing_status 记账：无法区分『算过且无发现』与『算崩了返回 None』")
+    # 空 list 属"没产出"，判成缺失就会逼人到处补假 status
+    if not re.search(r"^\s+continue", cr, re.M):
+        return _r(False, "缺失：空列表应视为没产出而非违规，否则会诱发假 status")
+    if not re.search(r"isinstance\(v,\s*\(list,\s*tuple\)\)", cr):
+        return _r(False, "未处理 list 型环节：会把整个列表误判成没有 status")
+
+    # 3) 取值：允许范围必须真做比较，且比较结果要汇进 violations
+    cv = _block(t, "def check_values(", "\ndef ")
+    if not re.search(r"if\s+nums\s+and\s+lo\s+is\s+not\s+None:", cv):
+        return _r(False, "缺少下限比较分支：越界值（如设备哨兵值 -9999）进不了契约检查")
+    if not re.search(r"if\s+nums\s+and\s+hi\s+is\s+not\s+None:", cv):
+        return _r(False, "缺少上限比较分支：单位没换算导致的 1000 倍偏差漏得掉")
+    if not re.search(r'out\[.violations.\]\.append', cv):
+        return _r(False, "体检结果没有汇总进 violations：查得出来但没人告诉使用者")
+    # 必填整列缺失是最容易被静默放过的一类
+    if not re.search(r"整列缺失", cv):
+        return _r(False, "缺：必填列整列缺失没有被点名")
+
+    # 4) 接进流水线才算数，光有模块等于没做
+    tpl = _read(PIPELINE_FILE) or ""
+    if 'contract as CT' not in tpl:
+        return _r(False, "pipeline 未导入 contract：模块写好了但没接进流程")
+    if "CT.check_input(" not in tpl:
+        return _r(False, "pipeline 未对输入做契约检查")
+    if "CT.check_result(" not in tpl:
+        return _r(False, "pipeline 未对结果做契约检查")
+
+    return _r(True, "", {"compat": True, "result": True, "values": True})
+
+
 AUDIT_RULES = [
     Rule("LICENSE 为 Elastic 2.0 官方纯文本", rule_license,
          "LICENSE 首行必须是裸文本 'Elastic License 2.0'（前面有 # 或 ## 即判不过）",
@@ -2056,6 +2114,33 @@ AUDIT_RULES = [
                   _re_sub(r"^[ \t]+if not is_inside\(r, base\):",
                           "    if False:",
                           flags=re.M), TENANCY_FILE)]),
+    Rule("数据契约必须真的执行：版本不兼容要阻断、未知列要点名、越界值要报",
+         rule_contract_enforced,
+         "P1-4。契约的分工是：compatible 按主版本判定不兼容并 block；"
+         "check_result 给有输出却没 status 的环节逐条记账；"
+         "check_values 真做上下限比较并把结果汇进 violations；"
+         "且以上三条都必须出现在 lib/pipeline.py 的调用链里。"
+         "为什么这四条缺一不可：只写模块不接 pipeline，等于功能没做——"
+         "本项目已经因为『同一份数据两套键名』出过一次报告渲染 KeyError，"
+         "而它是在给客户出报告时才炸的，不是跑不出数。"
+         "另外，空 list 必须跳过而不是记违规，否则会诱发到处补假 status。",
+         CONTRACT_FILE,
+         [_mutant("版本门禁失效：不再比较主版本号",
+                  _re_sub(r"^[ \t]+if a\[0\] != b\[0\]:",
+                          "    if False:",
+                          flags=re.M), CONTRACT_FILE),
+          _mutant("不再给缺 status 的环节记账",
+                  _re_sub(r"^[ \t]+out\[\"missing_status\"\]\.append\(n\)",
+                          "    n = n",
+                          flags=re.M), CONTRACT_FILE),
+          _mutant("取值体检不再比较下限（哨兵值漏检）",
+                  _re_sub(r"^[ \t]+if nums and lo is not None:",
+                          "    if False:",
+                          flags=re.M), CONTRACT_FILE),
+          _mutant("契约写好了但没接进流水线",
+                  _re_sub(r"^[ \t]+_ci = CT\.check_input\(work",
+                          "        _ci = None  # 变异：契约未接入\n        if _ci is None: _ci = {}",
+                          flags=re.M), PIPELINE_FILE)]),
 ]
 
 

@@ -2458,6 +2458,93 @@ def test_concurrent_write_integrity():
     shutil.rmtree(d, ignore_errors=True)
 
 
+def test_contract_schema():
+    """P1-4 数据契约：版本要兼容、字段要说清、未知列要点名、取值要体检。
+
+    为什么必须有这一组测试：provenance 把输入摘要的字节数字段
+    从 size 改成 bytes 时，报告渲染那一处当场 KeyError。
+    同一份数据两套键名，就是"各环节标准不统一"的真实代价，
+    而且它是在出报告时才炸的，不是跑不出数。
+
+    这里的每条断言都回答同一个问题：把那句防御代码删掉，它会不会变红。
+    """
+    from lib import contract as C
+    from lib import table as T
+
+    # ---- 1. 版本兼容：主版本不同必须阻断，不能糊过去
+    ok60, lv60, _ = C.compatible("1.0")
+    check("契约：同版本兼容", ok60 and lv60 == "ok", str(lv60))
+    ok61, lv61, _ = C.compatible("1.1")
+    check("契约：次版本更高只提醒不阻断", ok61 and lv61 == "warn", str(lv61))
+    ok20, lv20, _ = C.compatible("2.0")
+    check("契约：主版本不同必须阻断", (not ok20) and lv20 == "block", str(lv20))
+    okx, lvx, _ = C.compatible("看不懂的版本号")
+    check("契约：无法解析的版本号按阻断处理", (not okx) and lvx == "block", str(lvx))
+
+    # ---- 2. 未知列必须点名隔离，而不是悄悄混进结论
+    tb = T.Table(["批次号", "设备号", "从没登记过的X列", "涂布面密度"],
+                 [[ "A", "M1", 1.0, 10.0]] * 3)
+    ci = C.check_input(tb, known_columns=["涂布面密度"])
+    check("契约：未登记的列要被点名", "从没登记过的X列" in ci["unknown"],
+          str(ci["unknown"]))
+    check("契约：角色列不得算成未知", "批次号" in ci["roles"] and "设备号" in ci["roles"],
+          str(ci["roles"]))
+    q = C.quarantine(ci["unknown"])
+    check("契约：隔离包要保留列数与原因", q["n"] == 1 and bool(q["reason"]), str(q))
+
+    # ---- 3. 取值体检：脏数据要能在进分析前被拦下
+    rows = [["A%d" % i, 10.0 + 0.1 * i, None if i == 5 else 5.0,
+             -9999.0 if i == 9 else 1.0] for i in range(12)]
+    rows[3][1] = "NG"                       # 单元格里混进非数值
+    dirty = T.Table(["批次号", "厚度(mm)", "必填量", "温度(℃)"], rows)
+    fields = [
+        C.field("厚度(mm)", type_="number", unit="mm", min_value=0, max_value=100),
+        C.field("必填量", type_="number", required=True, nullable=False),
+        C.field("温度(℃)", type_="number", unit="℃", min_value=-40, max_value=300),
+        C.field("整列没有的列", type_="number", required=True),
+    ]
+    cv = C.check_values(dirty, fields)
+    blob = "\n".join(cv["violations"])
+    check("契约：非数值混入要报", "非数值" in blob, str(cv["violations"])[:70])
+    check("契约：必填列出现空值要报", "必填量" in blob and "空值" in blob, str(blob)[:70])
+    check("契约：越界哨兵值要报", "低于下限" in blob, str(blob)[:70])
+    check("契约：必填列整列缺失要报", "整列缺失" in blob, str(blob)[:70])
+    clean = T.Table(["厚度(mm)", "必填量", "温度(℃)"],
+                    [[10.0 + 0.1 * i, 5.0, 25.0] for i in range(12)])
+    check("契约：合规数据不得误报",
+          C.check_values(clean, fields[:3])["ok"] is True,
+          str(C.check_values(clean, fields[:3])["violations"])[:70])
+
+    # ---- 4. 结果契约：有输出却没 status 的环节必须被追责
+    bad = {"analyzer_version": "2.6.0", "process": "battery_coating",
+           "spc": [{"column": "x"}], "rootcause": {"defect": "y"}}
+    rb = C.check_result(bad)
+    check("契约：环节有输出却没 status 必须判失败", rb["ok"] is False, str(rb)[:70])
+    check("契约：要能指名是哪些环节",
+          set(rb["missing_status"]) >= {"spc", "rootcause"}, str(rb["missing_status"]))
+    good = {"analyzer_version": "2.6.0", "process": "battery_coating",
+            "target": "t", "shape": (10, 3),
+            "spc": [{"column": "x", "status": "NO_FINDING"},
+                    {"column": "z", "status": "SUCCESS"}],
+            "rootcause": {"defect": "y", "status": "SUCCESS"}}
+    rg = C.check_result(good)
+    check("契约：合规结果不得误报",
+          rg["ok"] is True and not rg["missing_status"], str(rg["violations"])[:70])
+    check("契约：空 list 属\"没产出\"，不算违规",
+          C.check_result({"analyzer_version": "v", "spc": []})["violations"] == [],
+          str(C.check_result({"analyzer_version": "v", "spc": []})["violations"])[:70])
+    check("契约：缺必填字段（analyzer_version）必须判失败",
+          C.check_result({"process": "p"})["ok"] is False)
+    check("契约：结果不是 dict 必须判失败", C.check_result([1, 2, 3])["ok"] is False)
+
+    # ---- 5. 自定义契约加载：报错要指向真实原因
+    r0 = C.load_custom_schema(None)
+    check("契约加载：未给路径要说清楚", (not r0["ok"]) and "未提供" in r0["error"], str(r0))
+    r1 = C.load_custom_schema("__不存在的契约__.json")
+    check("契约加载：文件不存在要单独说清（不能混成加载失败）",
+          (not r1["ok"]) and "不存在" in r1["error"], str(r1))
+
+
 def test_parameter_contracts():
     """入口契约：非法参数必须报错/降级，不得静默产出结论。
 
@@ -2734,6 +2821,7 @@ if __name__ == "__main__":
     test_confound_and_evidence()
     test_doe_safety_boundary()
     test_parameter_contracts()
+    test_contract_schema()
     test_concurrent_write_integrity()
     test_tenant_path_guard()
     print("\n" + "=" * 56)

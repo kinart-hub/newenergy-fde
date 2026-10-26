@@ -215,6 +215,7 @@
     "lib/adapt.py",
     "lib/charts.py",
     "lib/confound.py",
+    "lib/contract.py",
     "lib/correlation.py",
     "lib/crossprocess.py",
     "lib/degrade.py",
@@ -244,6 +245,7 @@
     "scripts/fde_run.py",
     "scripts/gen_blind_data.py",
     "scripts/gen_enterprise_data.py",
+    "scripts/gen_manifest.py",
     "scripts/kb_manage.py",
     "scripts/make_crossprocess_demo.py",
     "scripts/make_demo_data.py",
@@ -286,6 +288,7 @@
       "lib/adapt.py",
       "lib/charts.py",
       "lib/confound.py",
+      "lib/contract.py",
       "lib/correlation.py",
       "lib/crossprocess.py",
       "lib/degrade.py",
@@ -315,6 +318,7 @@
       "scripts/fde_run.py",
       "scripts/gen_blind_data.py",
       "scripts/gen_enterprise_data.py",
+      "scripts/gen_manifest.py",
       "scripts/kb_manage.py",
       "scripts/make_crossprocess_demo.py",
       "scripts/make_demo_data.py",
@@ -352,7 +356,7 @@
       ".bak",
       ".pyo"
     ],
-    "note": "required 为离线部署最小集：按它打包即可在只装 Python 标准库的环境完成一次 analyze。optional 为运行期按需生成的文件，首次部署允许缺失。extra 为示例与社区物料，缺了不影响运行。本清单由 scripts/prepublish_audit.py 的 check_manifest_coverage 每次发布前核对，不要手工维护。",
-    "extra_note": "附加物料按目录登记：示例/社区/推广物料不参与离线部署，逐文件罗列会让清单随它们增删不断漂移。"
+    "extra_note": "附加物料按目录登记：示例/社区/推广物料不参与离线部署，逐文件罗列会让清单随它们增删不断漂移。",
+    "note": "required 为离线部署最小集：按它打包即可在只装 Python 标准库的环境完成一次 analyze。optional 为运行期按需生成的文件，首次部署允许缺失。extra 为示例与社区物料，缺了不影响运行。本清单由 scripts/gen_manifest.py 从版本控制实况生成，并由 scripts/prepublish_audit.py 的 check_manifest_coverage 每次发布前核对。"
   }
 }
