@@ -131,9 +131,11 @@ python scripts/fde_run.py analyze --input <数据文件> --outdir <输出目录>
 - `--no-xlsx` 不导出 Excel 结果表（默认导出）
 - `--spc-exclusion-mode auto|suggest|review` SPC 剔除模式。默认 `auto`（命中即剔除）；
   `suggest` 只标记可疑点不剔除、交人复核；`review` 按复核结论剔除（逐点带规则身份与审核人）
-- `--boundary-policy warn|block` 推断边界（缺受控出处）的处置政策。默认 `warn`
-  （出方案 + 警告 + 要求工艺工程师书面确认）；`block` 直接不出方案，逼出那份受控规格文件。
-  **企业侧已有受控规格时应收紧为 block**
+- `--boundary-policy warn|block` 推断边界（缺受控出处）的处置政策。**日常不必指定**——
+  它由受控规格证据自动推导（见下节）；本参数只在你要临时推翻证据结论时才用
+- `--controlled-spec 登记.json` 受控规格登记（企业已有的受控文件清单直接指过去）。
+  登了受控生效文件 → 边界政策自动收紧为 `block`（缺出处不出方案）；没登记 → `warn`。
+  `warn` 出方案 + 警告 + 要求工艺工程师书面确认；`block` 直接不出方案，逼出那份受控规格文件
 - `--doe-replicates N` DOE 每号重复次数（默认 1）。不重复就没有纯误差估计，显著性结论站不住
 - `--doe-blocks N` DOE 区组数（默认 1），用于隔离班次/机台/原料批等已知噪声
 - `--doe-seed N` DOE 运行顺序随机化种子（默认 0，保证顺序可复现）
@@ -155,6 +157,23 @@ python scripts/fde_run.py analyze --input <数据文件> --outdir <输出目录>
 
 优先级：**你显式指定的 > 角色视角 > 产品档 > 基线**。
 需要人拍板的参数不会出现在结果里，而是进 `needs_decision` 并列出各来源给了什么。
+
+### 边界政策：由受控规格证据推导，不留给使用者拍板
+
+`--boundary-policy` 这类"要不要收紧"的判断，不该让非专业的使用者去猜——
+他不知道自家算不算有受控规格，于是一直不收紧（报告已出去）或开局全收紧（探索也被拦）。
+所以这里固化的是**推导逻辑**，需要人做的只有**登记事实**：
+
+| 登记内容 | 推导出的政策 | 说明 |
+|---|---|---|
+| `status=active` 且填了 `doc_id` | `block` | 受控规格已生效，缺出处的边界一律不出方案 |
+| 只有 `status=active`、没填 `doc_id` | `warn` + 点名补登记 | 说不出文件编号的"受控"不算受控 |
+| `status=draft`（有文件未生效） | `warn` | 不得冒充受控 |
+| 未登记 / 登记的规格不覆盖本产品 | `warn` | 无出处，仅警告并要求书面确认 |
+| 受控文件已过 `review_by` | `block` + 提醒先复核 | 政策不放松，但结论出具前需复核 |
+
+登记写在产品档 `controlled_specs` 段，或用 `--controlled-spec` 指向企业自己的受控清单；
+登记读不出来时会**出声**（不会被当成"企业没给"而悄悄放松）。
 
 ```
 python scripts/fde_run.py config --products battery pv --role quality  # 看这套配置怎么来的

@@ -2098,6 +2098,53 @@ def rule_product_profile_merge():
     return _r(True, "多产品配置按语义合并、冲突交人、显式优先、交叉表与角色视角可达")
 
 
+def rule_boundary_policy_evidence():
+    """边界政策由受控规格证据推导，不是留给使用人拍的旋钮。
+
+    这条规则要防的退化很隐蔽：**政策旋钮还在、也能转，但转的人不该是他**。
+    「企业侧有受控规格就该收紧成 block」——这句话里需要人做的只有登记那份文件，
+    政策是登记的推论。把推论交回给使用者，等于让非专业的人判断
+    "我这算不算有受控规格"：他判断不了，于是要么一直不收紧（报告已出去），
+    要么开局就全收紧（连探索都被拦）。
+    """
+    t = _read(PROFILE_FILE) or ""
+    if not t:
+        return _r(False, "读不到 lib/profile.py：受控规格推导不存在")
+    if "def derive_boundary_policy(" not in t:
+        return _r(False, "缺 derive_boundary_policy：边界政策没有推导入口，只能靠人指定")
+    if "def collect_controlled_specs(" not in t:
+        return _r(False, "缺 collect_controlled_specs：受控登记无处汇总")
+
+    # 1) 证据结论必须真的进候选集参与合并，不是算出来摆着看。
+    #    判据落在"注入动作本身"，并且受"仅在能收紧时"这个条件约束——
+    #    只查 _add 存在的话，把条件删成无条件注入也照样判过。
+    if not re.search(r'if _pol == "block":\s*\n\s*_add\("boundary_policy", '
+                     r'"受控规格证据", _pol\)', t):
+        return _r(False, "证据结论未注入候选（或注入不受条件约束）："
+                         "算出来不参与合并，等于没算；无条件注入则让「没登记」"
+                         "也变成一项配置，工具凭空替人选了政策")
+
+    # 2) 受控判定必须防伪造：只把 status 改成 active 却说不出文件编号的不算受控。
+    #    否则"我说是受控的就是受控的"，正是这条规则本来要防的事。
+    _m = re.search(r"def _spec_usable\(spec\):(.*?)\n\S", t, re.S)
+    if not _m or 'get("doc_id")' not in _m.group(1) \
+            or 'get("status")' not in _m.group(1):
+        return _r(False, "受控判定缺 doc_id 校验：把状态改成 active 就能冒充受控")
+
+    # 3) 产品档模板必须留出受控规格登记位：无处登记就只好回命令行拍板
+    if '"controlled_specs": [{' not in t:
+        return _r(False, "产品档模板无受控规格登记段：企业给了受控文件也无处登记")
+
+    # 4) 能力可达：pipeline 要读登记，CLI 要能指到企业自己的受控清单
+    tp = _read(PIPELINE_FILE) or ""
+    if "PF.load_controlled_spec(" not in tp:
+        return _r(False, "pipeline 未调用 load_controlled_spec：受控登记是库里的死代码")
+    if not re.search(r'^\s*ap\.add_argument\("--controlled-spec"', tp, re.M):
+        return _r(False, "CLI 未暴露 --controlled-spec：企业已有一份受控清单也指不过去")
+    return _r(True, "边界政策由受控规格证据推导：登记受控生效文件即收紧 block、"
+                    "未登记则 warn、无编号/过期的登记被点名，且使用人可指到自家受控清单")
+
+
 AUDIT_RULES = [
     Rule("LICENSE 为 Elastic 2.0 官方纯文本", rule_license,
          "LICENSE 首行必须是裸文本 'Elastic License 2.0'（前面有 # 或 ## 即判不过）",
@@ -2765,6 +2812,26 @@ AUDIT_RULES = [
           _mutant("取严退化成取最后一个（顺序又决定结果）",
                   _re_sub(r'best = max\(known, key=lambda x: rank\[x\[1\]\]\) if pick == "max"',
                           'best = known[-1] if pick == "max"',
+                          flags=re.M), PROFILE_FILE)]),
+    Rule("边界政策由受控规格证据推导（不是留给使用人拍的旋钮）",
+         rule_boundary_policy_evidence,
+         "derive_boundary_policy 依据登记推导政策；证据结论在 _pol==block 时"
+         "才注入候选参与合并；_spec_usable 同时校验 status 与 doc_id（防伪造受控）；"
+         "产品档模板含 controlled_specs 登记段；pipeline 调用 load_controlled_spec "
+         "且 CLI 暴露 --controlled-spec。",
+         PROFILE_FILE,
+         [_mutant("有受控也不收紧（证据算出来不参与合并）",
+                  _re_sub(r'if _pol == "block":', "if False:",
+                          flags=re.M), PROFILE_FILE),
+          _mutant("无受控也收紧（未登记凭空变成一项配置）",
+                  _re_sub(r'if _pol == "block":', "if _pol:",
+                          flags=re.M), PROFILE_FILE),
+          _mutant("受控判定不校验文件编号（改个状态就能冒充受控）",
+                  _re_sub(r'if not str\(spec\.get\("doc_id"\) or ""\)\.strip\(\):\n'
+                          r'\s*return False', "if False:\n        return False",
+                          flags=re.M), PROFILE_FILE),
+          _mutant("产品档模板无受控登记段（企业给了文件也无处登记）",
+                  _re_sub(r'"controlled_specs": \[\{', '"specs": [{',
                           flags=re.M), PROFILE_FILE)]),
 ]
 

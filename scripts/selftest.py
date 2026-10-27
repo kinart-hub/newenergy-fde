@@ -29,6 +29,7 @@ except Exception:
     # scan:keep stdout 编码兜底在模块加载期执行，degrade 尚未导入；且非 Windows 环境没有 reconfigure 属正常分支，不是降级。
 import io
 import math
+import re
 import glob
 import shutil
 import threading
@@ -3615,6 +3616,155 @@ def test_product_profile_resolve():
           "n=%d" % len(PF.MERGE_SEMANTICS))
 
 
+def test_boundary_policy_evidence():
+    """边界政策必须由受控规格证据推导，不能留给使用人拍板。
+
+    为什么这是硬要求：把政策做成旋钮，等于让非专业使用者去判断
+    "我这算不算有受控规格"——他判断不了，于是要么一直不收紧（报告已经出去了），
+    要么一上来就全收紧（连探索都被拦）。工具手里握着那份登记，本该自己算。
+    """
+    print("\n[边界政策：由受控规格证据推导]")
+
+    def _pr(specs, defaults=None):
+        return {"products": {"battery": {
+            "name": "battery", "controlled_specs": specs,
+            "defaults": defaults or {}}}}
+
+    _base = {"boundary_policy": "warn"}
+    _act = [{"doc_id": "SPEC-001", "version": "A/0", "status": "active",
+             "scope": "battery"}]
+
+    ra = PF.resolve_config(["battery"], baseline=_base, profiles=_pr(_act))
+    check("受控规格生效 → 自动收紧为 block（不必等人拍板）",
+          ra["config"].get("boundary_policy") == "block"
+          and ra["boundary_evidence"].get("policy") == "block",
+          "policy=%s" % ra["config"].get("boundary_policy"))
+
+    # 只把状态改成 active 却说不出文件编号：登记得不成立，不是"没登记"
+    rb = PF.resolve_config(["battery"], baseline=_base,
+                           profiles=_pr([{"doc_id": None, "status": "active",
+                                          "scope": "battery"}]))
+    check("状态 active 但无 doc_id → 不按受控计，且点名要补登记",
+          rb["config"].get("boundary_policy") == "warn"
+          and any(c.get("param") == "boundary_policy" for c in rb["conflicts"])
+          and "doc_id" in "".join(c.get("reason") or "" for c in rb["conflicts"]),
+          "policy=%s conflicts=%d" % (rb["config"].get("boundary_policy"),
+                                      len(rb["conflicts"])))
+
+    rc = PF.resolve_config(["battery"], baseline=_base,
+                           profiles=_pr([{"doc_id": "SPEC-X", "status": "draft",
+                                          "scope": "battery"}]))
+    check("有文件未生效（draft）→ 不冒充受控，仍 warn",
+          rc["config"].get("boundary_policy") == "warn"
+          and "draft" in (rc["boundary_evidence"].get("reason") or ""),
+          "policy=%s" % rc["config"].get("boundary_policy"))
+
+    rd = PF.resolve_config(["battery"], baseline=_base, profiles=_pr([]))
+    check("未登记受控规格 → warn，且理由写明是「未登记」不是「未收紧」",
+          rd["config"].get("boundary_policy") == "warn"
+          and "未登记" in (rd["boundary_evidence"].get("reason") or ""),
+          "policy=%s" % rd["config"].get("boundary_policy"))
+
+    re_ = PF.resolve_config(
+        ["battery"], baseline=_base,
+        profiles=_pr([{"doc_id": "SPEC-OLD", "status": "active", "scope": "battery",
+                       "review_by": "2020-01-01"}]))
+    check("受控文件已过复核期 → 仍按最严 block，但必须提醒先复核",
+          re_["config"].get("boundary_policy") == "block"
+          and any("已过复核期" in (c.get("reason") or "") for c in re_["conflicts"]),
+          "policy=%s conflicts=%d" % (re_["config"].get("boundary_policy"),
+                                      len(re_["conflicts"])))
+
+    # 锂电的受控规格管不到光伏：登记带 scope，跨产品不得借来收紧
+    rf = PF.resolve_config(["pv"], baseline=_base, profiles=_pr(_act))
+    check("登记的受控规格不覆盖本产品 → 不得借来收紧",
+          rf["config"].get("boundary_policy") == "warn",
+          "policy=%s" % rf["config"].get("boundary_policy"))
+
+    # 产品档里手写 warn，压不过证据：证据是事实，产品默认值只是上次的人为选择
+    rg = PF.resolve_config(["battery"], baseline=_base,
+                           profiles=_pr(_act, defaults={"boundary_policy": "warn"}))
+    check("产品档写 warn 也压不过受控证据（取严）",
+          rg["config"].get("boundary_policy") == "block",
+          "policy=%s" % rg["config"].get("boundary_policy"))
+
+    # 显式指定保留最高优先级：使用人明确要临时推翻证据时，工具不拦
+    rh = PF.resolve_config(["battery"], baseline=_base, profiles=_pr(_act),
+                           explicit={"boundary_policy": "warn"})
+    check("显式指定仍可临时推翻证据结论（探索期放行）",
+          rh["config"].get("boundary_policy") == "warn",
+          "policy=%s" % rh["config"].get("boundary_policy"))
+
+    # 依据必须能被看见：政策是算出来的，使用人有权知道凭什么
+    _tr = [t for t in ra["trace"] if t["param"] == "boundary_policy"]
+    check("trace 写明证据依据（政策可追溯，不是黑箱）",
+          bool(_tr) and "证据依据" in (_tr[0].get("reason") or ""),
+          str(_tr)[:80])
+
+    # 登记读不出来 ≠ 没给：必须出声，否则政策会悄悄松掉
+    check("受控登记读不出来时返回 None（不是空列表，避免被当成「企业没给」）",
+          PF.load_controlled_spec("__不存在__.json") is None,
+          "load_controlled_spec 未对坏路径返回 None")
+    check("受控登记：支持 list / 单份 dict / 带 controlled_specs 键的包装",
+          len(PF.load_controlled_spec([{"doc_id": "A", "status": "active"}])) == 1
+          and len(PF.load_controlled_spec({"doc_id": "B", "status": "active"})) == 1
+          and len(PF.load_controlled_spec(
+              {"controlled_specs": [{"doc_id": "C", "status": "active"}]})) == 1,
+          "三种登记形态都要能读")
+    ri = PF.resolve_config(["battery"], baseline=_base, profiles=_pr([]),
+                           controlled_specs=[{"doc_id": "TMP-1", "status": "active"}])
+    check("临时传入的受控登记同样生效（不必先改产品档）",
+          ri["config"].get("boundary_policy") == "block",
+          "policy=%s" % ri["config"].get("boundary_policy"))
+
+
+def test_decision_records_uniform():
+    """决策记录必须形态统一，且渲染端不假设元素一定是字符串。
+
+    实测踩过：decisions 里混进一条结构化记录，报告第 17 节整节崩溃
+    （unhashable type: 'dict'）——而那一节正是"别人拿到同一份文件也复现不出结论"
+    要用的地方。宁可少一条决策，也不能让整节渲染失败。
+    """
+    print("\n[决策记录：形态统一且渲染兼容]")
+    _src = io.open(os.path.join(ROOT, "lib", "pipeline.py"), encoding="utf-8").read()
+
+    # 1) 生产端：不许再直接往 decisions 里 append 字符串
+    _str_appends = re.findall(r'decisions", \[\]\)\.append\(\s*"', _src) \
+        + re.findall(r'decisions"\]\.append\(\s*"', _src)
+    check("决策记录一律结构化写入（不再直接 append 字符串）",
+          not _str_appends, "仍有 %d 处写字符串" % len(_str_appends))
+
+    check("决策记录逐条带 kind（可被机器按类型筛选，如筛出所有政策收紧）",
+          len(re.findall(r'"kind": "', _src)) >= 6,
+          "kind 条目 %d 条" % len(re.findall(r'"kind": "', _src)))
+
+    # 2) 渲染端：经归一化，不假设元素类型
+    check("渲染端经 _decision_text 归一化（历史字符串结果也能吃进来）",
+          "def _decision_text(" in _src
+          and "_decision_text(_d)" in _src,
+          "渲染端仍直接把元素塞进 set()")
+
+    _mix = [{"kind": "k1", "detail": "甲"}, "乙", {"kind": "k2"}, "", None, {}]
+    _out = [PL._decision_text(x) for x in _mix]
+    check("两种形态都渲染得出文本，空值不产出空条目",
+          _out[0] == "k1：甲" and _out[1] == "乙" and _out[2] == "k2："
+          and all(x == "" for x in _out[3:]),
+          str(_out))
+    # 去重用的必须是归一化后的文本：原对象是 dict 时进 set 会直接崩
+    try:
+        _uniq = []
+        _seen = set()
+        for _x in _mix:
+            _t = PL._decision_text(_x)
+            if _t and _t not in _seen:
+                _seen.add(_t)
+                _uniq.append(_t)
+        check("混入 dict 也能完成去重（原实现在这里 TypeError）",
+              len(_uniq) == 3, "uniq=%d" % len(_uniq))
+    except Exception as _ex:
+        check("混入 dict 也能完成去重（原实现在这里 TypeError）", False, repr(_ex))
+
+
 if __name__ == "__main__":
     print("newenergy-fde 自检开始")
     test_table()
@@ -3653,6 +3803,8 @@ if __name__ == "__main__":
     test_p2_observability()
     test_boundary_policy_knob()
     test_product_profile_resolve()
+    test_boundary_policy_evidence()
+    test_decision_records_uniform()
     print("\n" + "=" * 56)
     print("通过 %d 项，失败 %d 项" % (len(PASS), len(FAIL)))
     if FAIL:

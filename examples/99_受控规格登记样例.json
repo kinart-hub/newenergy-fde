@@ -1,0 +1,16 @@
+{
+  "meta": {
+    "note": "受控规格登记样例：企业把受控文件清单指给工具，边界政策即据此自动收紧。doc_id 必须填，只写 status=active 而不写编号的不按受控计。本文件只是演示登记长什么样，里面的编号是占位，不是真实受控文件。"
+  },
+  "controlled_specs": [
+    {
+      "doc_id": "SPEC-DEMO-001",
+      "version": "A/0",
+      "status": "active",
+      "verified_at": "2026-01-15",
+      "review_by": "2027-01-15",
+      "scope": "battery",
+      "note": "演示用受控规格登记条目"
+    }
+  ]
+}

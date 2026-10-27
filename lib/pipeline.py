@@ -353,7 +353,7 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
             auto_adapt=False, tenant=None, industry=None, rules=None,
             spc_exclusion_mode=None,
             doe_replicates=None, doe_blocks=None, doe_seed=None, boundary_policy=None,
-            role=None,
+            role=None, controlled_spec=None,
             export_xlsx=True, d2_card=None, emit_d2_card=True, verbose=False,
             views=None):
     """
@@ -445,15 +445,32 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
             _explicit[_k] = _v
     _cfg = {}
     _cfg_needs, _cfg_trace = [], []
+    _ev = None
     if PF is not None:
         try:
+            # 受控规格登记：企业给了受控文件就登记进来，边界政策由它推导，
+            # 不需要使用人在命令行上猜什么时候该收紧。
+            _specs_in = PF.load_controlled_spec(controlled_spec)
+            if _specs_in is None:
+                # 读不出来≠没给：让它出声，否则政策会悄悄松掉还无人知晓
+                _specs_in = None
+                result["decisions"].append({
+                    "kind": "controlled_spec_unreadable",
+                    "detail": "受控规格登记 %r 无法解析：本次不接受该登记，"
+                              "边界政策按产品档内登记推导（可能比实际松）" % (controlled_spec,),
+                })
+                (result.setdefault("warnings", [])).append(
+                    "受控规格登记 %r 无法解析，未纳入本次边界判定："
+                    "请核对路径与 JSON 格式，否则政策会按「未登记」处理" % (controlled_spec,))
             _res = PF.resolve_config(
                 products=_prods, role=role, explicit=_explicit,
                 baseline={"spc_exclusion_mode": "auto", "boundary_policy": "warn",
-                          "doe_replicates": 1, "doe_blocks": 1, "doe_seed": 0})
+                          "doe_replicates": 1, "doe_blocks": 1, "doe_seed": 0},
+                controlled_specs=_specs_in)
             _cfg = _res.get("config") or {}
             _cfg_needs = _res.get("needs_decision") or []
             _cfg_trace = _res.get("trace") or []
+            _ev = _res.get("boundary_evidence") or None
         except Exception as _cfg_e:
             # 配不出来不能静默：静默的后果是"以为按产品配好了，其实全回落基线"，
             # 而回落基线比报错更危险——报告照样出，只是判严尺度悄悄松了。
@@ -492,9 +509,16 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
             "trace": [{"param": t.get("param"), "value": t.get("value"),
                        "semantics": t.get("semantics"), "from": t.get("from")}
                       for t in _cfg_trace],
+            "boundary_evidence": _ev,
             "note": "配置按参数语义合并（取严/取并集/取大），与产品书写顺序无关；"
-                    "使用人显式指定的值优先级最高，角色视角不覆盖它",
+                    "使用人显式指定的值优先级最高，角色视角不覆盖它；"
+                    "边界政策不在此列——它由受控规格证据推导，不是选项",
         }
+    if _ev and _ev.get("policy") == "block" and "boundary_policy" not in _explicit:
+        result["decisions"].append({
+            "kind": "boundary_policy_escalated",
+            "detail": "边界政策已按受控规格证据自动收紧为 block：%s" % _ev.get("reason"),
+        })
     for _n in _cfg_needs:
         result["decisions"].append({
             "kind": "config_needs_decision",
@@ -682,7 +706,9 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
                 # 而它和目标本来就是同一件事（这和此前判定列泄漏是同一类错误）。
                 result["derived_cols"] = ["缺陷总数"]
                 result.setdefault("warnings", []).append(_ev["note"])
-                result.setdefault("decisions", []).append("事件表按实体汇总：%s" % _ev["note"])
+                result.setdefault("decisions", []).append(
+                    {"kind": "event_table_collapse",
+                     "detail": "事件表按实体汇总：%s" % _ev["note"]})
                 _clusters = []
                 _tc = _ev.get("type_col")
                 for _t in (_ev.get("types") or [None]):
@@ -710,7 +736,8 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
     main, _lf_note = QG.collapse_longform(main)
     if _lf_note:
         result.setdefault("warnings", []).append(_lf_note)
-        result.setdefault("decisions", []).append("长表汇总：%s" % _lf_note)
+        result.setdefault("decisions", []).append(
+            {"kind": "longform_collapse", "detail": "长表汇总：%s" % _lf_note})
     _main_dev = device_reports[_mi] if _mi < len(device_reports) else {}
     result["devices"] = device_reports
     result["device"] = _main_dev.get("device")
@@ -856,7 +883,8 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
         target = _stc_target
         result["stc_replaced_cols"] = _stc_raw   # 原始 Pmax 列不得作为根因候选
         result["stc_applied"] = True
-        result.setdefault("decisions", []).append("STC 归一化：%s" % (_stc_note or ""))
+        result.setdefault("decisions", []).append(
+            {"kind": "stc_normalize", "detail": "STC 归一化：%s" % (_stc_note or "")})
 
     _v("[3/6] 清洗：%s -> %s 行（剔除 %s 行，逐行明细见报告「清洗记录」）" % (
         clean_rep.get("rows_in"), clean_rep.get("rows_out"),
@@ -868,9 +896,10 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
     result["target"] = y_col
     if not target and y_col:
         result.setdefault("decisions", []).append(
-            "自动选择分析目标＝「%s」。理由：优先取该工序的**结果型**质量特性，"
-            "并要求它在数据里确实存在可被其它变量解释的变异；"
-            "编号/时间/坐标、分档标签与派生合计列均不作为目标。" % y_col)
+            {"kind": "target_selection",
+             "detail": "自动选择分析目标＝「%s」。理由：优先取该工序的**结果型**质量特性，"
+                       "并要求它在数据里确实存在可被其它变量解释的变异；"
+                       "编号/时间/坐标、分档标签与派生合计列均不作为目标。" % y_col})
     groups = pick_groups(work)
     result["groups"] = groups
     # 列名几乎全对不上时，工序判定和根因都是猜的，必须明说——
@@ -2608,6 +2637,23 @@ def build_report(res, work, spc_res, corr, assoc, pare, root, gaps, conf,
     return rep
 
 
+def _decision_text(d):
+    """决策记录 -> 可展示文本。
+
+    决策记录以前有两种形态：各处直接 append 字符串，后来按 kind/detail 结构化。
+    混用时期，消费方只要拿到一条结构化记录就崩（unhashable type: 'dict'），
+    而崩的那一节正是"别人拿到同一份文件也复现不出结论"要用的地方——
+    宁可少一条决策，也不能整节渲染失败。
+    生产端已统一为结构化 dict，这里保留兼容是为了吃进来历史 JSON 结果。
+    """
+    if isinstance(d, dict):
+        _k, _v = d.get("kind"), (d.get("detail") or d.get("reason") or "")
+        if not _k and not _v:
+            return ""       # 空记录不产出空条目：报告里一行光秃秃的"决策："没有意义
+        return "%s：%s" % (_k or "决策", _v)
+    return str(d) if d else ""
+
+
 def _render_disclaimer(rep, res):
     """结论的边界、规则版本与责任声明。"""
     s17 = rep.section("17. 使用边界与责任声明")
@@ -2635,9 +2681,10 @@ def _render_disclaimer(rep, res):
     if _man.get("decisions"):
         _seen, _uniq = set(), []
         for _d in _man["decisions"]:
-            if _d and _d not in _seen:
-                _seen.add(_d)
-                _uniq.append(_d)
+            _t = _decision_text(_d)
+            if _t and _t not in _seen:
+                _seen.add(_t)
+                _uniq.append(_t)
         rep.text(s17, "**本次分析自动做出的决策**（没有这些记录，别人拿到同一份文件也复现不出结论）：")
         rep.bullets(s17, _uniq)
     rep.text(s17, "**本报告结论按可信度分三类，请勿混用：**")
@@ -2904,8 +2951,16 @@ def main():
                     choices=["warn", "block"],
                     help="推断边界（缺受控出处）的处置政策：warn=出方案+警告+要求"
                          "工艺工程师书面确认（基线默认）；block=直接不出方案，"
-                         "逼出那份受控规格文件。不指定时按产品档与角色自动定"
-                         "（多产品取严：只要有一个产品要求阻断就阻断）")
+                         "逼出那份受控规格文件。不指定时按受控规格证据自动定："
+                         "登记了受控生效文件就收紧为 block，未登记才 warn。"
+                         "即本参数只在你要**临时推翻**证据结论时才需要，"
+                         "日常不必指定")
+    ap.add_argument("--controlled-spec", dest="controlled_spec", default=None,
+                    help="受控规格登记（JSON 路径）：企业给了受控规格文件就把"
+                         " doc_id/版本/status=active 登进去，边界政策据此自动收紧为 block，"
+                         "无需手动指定 --boundary-policy。"
+                         "内容与产品档 knowledge/product_profiles.json 的 controlled_specs 段一致，"
+                         "适合企业已有受控文件清单时直接指过去")
     ap.add_argument("--no-xlsx", action="store_true",
                     help="不导出 Excel 结果表")
     ap.add_argument("--d2-card", default=None,
@@ -2937,7 +2992,7 @@ def main():
                   spc_exclusion_mode=args.spc_exclusion_mode,
                   doe_replicates=args.doe_replicates, doe_blocks=args.doe_blocks,
                   doe_seed=args.doe_seed, boundary_policy=args.boundary_policy,
-                  role=args.role,
+                  role=args.role, controlled_spec=args.controlled_spec,
                   export_xlsx=not args.no_xlsx, d2_card=args.d2_card,
                   emit_d2_card=not args.no_d2_card,
                   verbose=args.verbose, views=args.view)

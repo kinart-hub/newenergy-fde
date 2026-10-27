@@ -32,6 +32,7 @@
 由企业侧按受控口径填写；没填就回落基线，不在这里替他编。
 """
 
+import datetime
 import io
 import json
 import os
@@ -181,6 +182,173 @@ ROLE_PROFILES = {
 }
 
 ROLE_KEYS = tuple(sorted(set(list(ROLE_LABEL.keys()))))
+
+
+# ------------------------------------------------------------------ 受控规格证据
+#
+# 边界政策为什么不该留给使用者拍板
+# --------------------------------
+# 「企业侧一旦给了受控规格文件，就该收紧成 block」——这句话里真正需要人做的
+# 只有一件事：**登记那份文件**（编号 / 版本 / 生效日）。政策是登记的推论，
+# 不是他的选项。把政策做成旋钮交给他转，是把技术判断抛回给非专业的使用者：
+# 他不知道什么时候该转，转晚了报告已经出去了，转早了连正常探索都被拦下，
+# 而工具全程看着那份受控文件躺在目录里、知道自己本该收紧。
+#
+# 所以本模块固化的是**推导逻辑**（有受控生效证据 → block），
+# 不固化任何产品的文件编号——那些是企业侧录入的客观事实，一律来自外部登记。
+#
+# 反向同样重要：只把状态改成 active 却说不出文件编号，不算受控。
+# 否则"我说是受控的就是受控的"，正是政策旋钮本来要防的事。
+CONTROLLED_SPEC_STATUS = ("absent", "draft", "active")
+
+
+def _spec_usable(spec):
+    """一份登记算不算"受控生效"：状态为 active **且** 说得出文件编号。"""
+    if not isinstance(spec, dict):
+        return False
+    if spec.get("status") != "active":
+        return False
+    if not str(spec.get("doc_id") or "").strip():
+        return False
+    return True
+
+
+def _spec_in_scope(spec, products):
+    """这份登记是否管辖本次涉及的产品。scope 为空或 * 表示全域适用。"""
+    sc = str(spec.get("scope") or "").strip()
+    if not sc or sc in ("*", "all"):
+        return True
+    if not products:
+        return True
+    return sc in [str(p) for p in products]
+
+
+def _spec_expired(spec, today=None):
+    """过了复核期的受控文件：仍按最严处置，但必须提醒——否则它会被无限期沿用。"""
+    rb = str(spec.get("review_by") or "").strip()
+    if not rb:
+        return False
+    try:
+        d = datetime.date.fromisoformat(rb[:10])
+    except Exception:
+        return False
+    return d < (today or datetime.date.today())
+
+
+def collect_controlled_specs(products=(), profiles=None, extra=(), root=None):
+    """汇总本次适用的受控规格登记：产品档内的 + 使用人临时传入的。"""
+    pr = profiles if profiles is not None else load_profiles(root)
+    out = []
+    for p in (products or []):
+        e = (pr.get("products") or {}).get(p)
+        if not isinstance(e, dict):
+            continue
+        cs = e.get("controlled_specs")
+        if cs is None:
+            one = e.get("controlled_spec")
+            cs = [one] if isinstance(one, dict) else []
+        for s in (cs or []):
+            if isinstance(s, dict):
+                d = dict(s)
+                d.setdefault("scope", p)
+                out.append(d)
+    for s in (extra or []):
+        if isinstance(s, dict):
+            out.append(s)
+    return out
+
+
+def load_controlled_spec(src):
+    """把使用人给的受控规格登记归一化成列表。
+
+    接受：list[dict] / 单份 dict / {"controlled_specs": [...]} / JSON 文件路径。
+
+    **读不出来时返回 None，不返回 []**：这两者后果完全不同。
+    "企业没给受控文件" → 政策 warn，是事实；
+    "企业给了但文件读不出来" → 也变 warn，是事故——
+    使用人看着松掉的政策，只会以为自家规格还没纳入，
+    不会想到是路径写错了。返回 None 让调用方必须出声。
+    """
+    if src is None:
+        return []
+    if isinstance(src, (list, tuple)):
+        return [s for s in src if isinstance(s, dict)]
+    if isinstance(src, dict):
+        ls = src.get("controlled_specs")
+        if isinstance(ls, list):
+            return [s for s in ls if isinstance(s, dict)]
+        return [src] if (src.get("doc_id") or src.get("status")) else []
+    if isinstance(src, str):
+        try:
+            with io.open(src, encoding="utf-8") as f:
+                obj = json.load(f)
+        except Exception as _e:
+            _note("profile.load_controlled_spec", _e)
+            return None
+        if isinstance(obj, list):
+            return [s for s in obj if isinstance(s, dict)]
+        if isinstance(obj, dict):
+            ls = obj.get("controlled_specs")
+            if isinstance(ls, list):
+                return [s for s in ls if isinstance(s, dict)]
+            return [obj]
+        return None
+    return None
+
+
+def derive_boundary_policy(specs, products=(), today=None):
+    """从受控规格证据推边界政策 -> (policy, 理由, 已过复核期的文件编号列表)
+
+    三条推论，全部基于登记事实，不含价值判断：
+      active 且说得出编号 -> block（缺受控出处的边界一律阻断）
+      只有 draft          -> warn（有文件但未生效，按无受控计，不得冒充受控）
+      未登记 / 全 absent  -> warn（无出处，警告并要求书面确认）
+
+    多产品并存时取严：只要其中一个产品有受控生效规格，整批按 block。
+    与 MERGE_SEMANTICS 里 boundary_policy 的"取严"语义一致——
+    这里只是把"取严"的判据从"产品写了什么"换成"证据支持什么"。
+    """
+    items = [s for s in (specs or []) if isinstance(s, dict)]
+    ins = [s for s in items if _spec_in_scope(s, products)]
+    usable, drafts, nameless, issues = [], [], [], []
+    for s in ins:
+        _sid = str(s.get("doc_id") or "").strip() or "(未编号)"
+        if _spec_usable(s):
+            usable.append(s)
+            if _spec_expired(s, today):
+                issues.append({"doc_id": _sid, "kind": "expired",
+                               "text": "受控规格 %s 已过复核期（review_by 早于今天）："
+                                       "政策仍按最严处置，但结论出具前需先复核" % _sid})
+            continue
+        _st = str(s.get("status") or "absent")
+        if _st == "active":
+            # 状态改成 active 却说不出编号：这不是"没登记"，是"登记得不成立"。
+            # 两者都导致 warn，但混为一谈就等于给了伪造受控一条通路：
+            # 把状态一改就"受控"了，还说不清凭什么。
+            nameless.append(s)
+            issues.append({"doc_id": _sid, "kind": "no_doc_id",
+                           "text": "受控规格登记状态为 active 但未填 doc_id，不按受控计"
+                                   "（说不出文件编号的「受控」不算受控）：请先补登记文件编号"})
+        elif _st == "draft":
+            drafts.append(s)
+    if usable:
+        why = ("受控规格已生效（%s）：缺受控出处的边界一律阻断，不出方案"
+               % "、".join(str(s.get("doc_id") or "(未编号)") for s in usable))
+        _exp = [i["doc_id"] for i in issues if i.get("kind") == "expired"]
+        if _exp:
+            why += ("；⚠ 其中 %s 已过复核期，政策仍按最严处置，但结论出具前需先复核"
+                    % "、".join(_exp))
+        return ("block", why, issues)
+    if nameless:
+        return ("warn", "登记了 %d 份受控规格但都未填文件编号，不按受控计："
+                        "仅警告并要求书面确认，请先补登记 doc_id" % len(nameless), issues)
+    if drafts:
+        return ("warn",
+                "已登记规格文件（%s）但状态为 draft/未生效，不按受控计："
+                "仅警告并要求书面确认"
+                % "、".join(str(s.get("doc_id") or "(未编号)") for s in drafts),
+                issues)
+    return ("warn", "未登记受控规格：边界缺出处时仅警告并要求书面确认", issues)
 
 
 # ------------------------------------------------------------------ 产品档读写
@@ -365,7 +533,7 @@ def _merge_candidates(param, cands):
 # ------------------------------------------------------------------ 解析入口
 
 def resolve_config(products=(), role=None, explicit=None, baseline=None,
-                   profiles=None, root=None):
+                   profiles=None, root=None, controlled_specs=None):
     """把"多个产品 + 一个角色 + 使用人显式指定"解析成一套配置。
 
     products  产品（行业域）标识列表，如 ("battery", "pv")
@@ -403,6 +571,29 @@ def resolve_config(products=(), role=None, explicit=None, baseline=None,
     for p in products:
         for k, v in (defaults_of(p, pr) or {}).items():
             _add(k, "产品 %s" % p, v)
+
+    # 受控规格证据：政策由登记事实推导，不让人拍板。
+    # 没有登记时也要给结论（derive 回落 warn），否则"未登记"和"登记失败"
+    # 在结果里长得一模一样——都只是没有 block，看不出是没配还是配了没生效。
+    _ev_reason, _ev_issues = {}, []
+    _pol, _ev_why = None, ""
+    # 连产品都没指定时不推导：那时候既没有登记可查，"按 warn 处理"也是句空话，
+    # 凭空往配置里塞一项只会让"没配"和"配了"看起来一样。
+    if products or controlled_specs:
+        if controlled_specs is None:
+            _specs = collect_controlled_specs(products, pr)
+        else:
+            # 临时传入的与产品档登记的一并作为证据：多一份受控文件只会更严，不会更松
+            _specs = ([s for s in (controlled_specs or []) if isinstance(s, dict)]
+                      + collect_controlled_specs(products, pr))
+        _pol, _ev_why, _ev_issues = derive_boundary_policy(_specs, products)
+        _ev_reason["boundary_policy"] = _ev_why
+        # 证据只在**能收紧**时才发声。无受控登记时它也推出 warn，
+        # 但把那个 warn 塞进候选是多余的（基线本就是 warn）——
+        # 副作用是"没配"和"配了"在结果里长得一样，工具凭空替人选了政策。
+        if _pol == "block":
+            _add("boundary_policy", "受控规格证据", _pol)
+
     if role:
         for k, spec in (ROLE_PROFILES.get(role) or {}).items():
             if isinstance(spec, dict) and "value" in spec:
@@ -433,6 +624,9 @@ def resolve_config(products=(), role=None, explicit=None, baseline=None,
             spec = (ROLE_PROFILES.get(role) or {}).get(param)
             if isinstance(spec, dict) and spec.get("reason"):
                 reason = "%s。角色理由：%s" % (why, spec["reason"])
+        if any(s == "受控规格证据" for s, _ in srcs) and _ev_reason.get(param):
+            # 证据依据必须能被看见：政策是算出来的，使用人有权知道凭什么收紧
+            reason = "%s。证据依据：%s" % (reason, _ev_reason[param])
         trace.append({"param": param, "value": val, "semantics": kind,
                       "from": "、".join(s for s, _ in srcs),
                       "candidates": {s: v for s, v in srcs},
@@ -456,6 +650,14 @@ def resolve_config(products=(), role=None, explicit=None, baseline=None,
         notes.append(
             "%d 个参数合并时出现可疑取值（不在严度表内 / 不是数值 / 规则串无法解析），"
             "已按可判定的部分合并，但需人工复核" % len(conflicts))
+    _ev_note = _ev_reason.get("boundary_policy") or ""
+    if _ev_note:
+        notes.append(
+            "边界政策由受控规格证据推导，无需使用人指定：%s。"
+            "要换政策就改登记（文件编号/状态），不要在结果上事后推翻" % _ev_note)
+    for _iss in _ev_issues:
+        conflicts.append({"param": "boundary_policy", "value": _pol,
+                          "reason": _iss.get("text") or ""})
     if role:
         notes.append(
             "已按「%s」视角施加判严尺度：角色只补使用人没指定的部分，"
@@ -465,7 +667,11 @@ def resolve_config(products=(), role=None, explicit=None, baseline=None,
 
     return {"config": config, "trace": trace, "needs_decision": needs,
             "conflicts": conflicts, "notes": notes,
-            "products": list(products), "role": role}
+            "products": list(products), "role": role,
+            "boundary_evidence": {"policy": _pol,
+                                  "reason": _ev_why or "未指定产品，未做受控规格判定",
+                                  "issues": list(_ev_issues),
+                                  "n_specs": len(_specs) if _pol else 0}}
 
 
 # ------------------------------------------------------------------ 交叉搭配映射表
@@ -535,6 +741,20 @@ def init_template(products, root=None):
             d[k] = None
         tpl["products"][p] = {
             "name": p,
+            # 受控规格登记：边界政策从这里推导，不让人在命令行上拍板。
+            # 企业给了受控规格文件，就把编号/版本/生效日填进来并把 status 改 active；
+            # 工具据此自动收紧为 block。没给就保持 absent——那是事实，不是遗漏。
+            "controlled_specs": [{
+                "doc_id": None,
+                "version": None,
+                "status": "absent",
+                "verified_at": None,
+                "review_by": None,
+                "scope": p,
+                "note": "受控规格文件登记。doc_id 为空时即使 status=active 也不按受控计——"
+                        "说不出文件编号的「受控」不算受控。status 取自 "
+                        "absent(未登记)/draft(有文件未生效)/active(受控生效)",
+            }],
             "defaults": d,
             "field_help": {k: desc for k, desc in _TEMPLATE_FIELDS},
             "lifecycle": {

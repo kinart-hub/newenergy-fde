@@ -6,6 +6,17 @@
   "products": {
     "battery": {
       "name": "battery",
+      "controlled_specs": [
+        {
+          "doc_id": null,
+          "version": null,
+          "status": "absent",
+          "verified_at": null,
+          "review_by": null,
+          "scope": "battery",
+          "note": "受控规格文件登记。doc_id 为空时即使 status=active 也不按受控计——说不出文件编号的「受控」不算受控。status 取自 absent(未登记)/draft(有文件未生效)/active(受控生效)"
+        }
+      ],
       "defaults": {
         "rules": null,
         "spc_exclusion_mode": null,
@@ -33,6 +44,17 @@
     },
     "pv": {
       "name": "pv",
+      "controlled_specs": [
+        {
+          "doc_id": null,
+          "version": null,
+          "status": "absent",
+          "verified_at": null,
+          "review_by": null,
+          "scope": "pv",
+          "note": "受控规格文件登记。doc_id 为空时即使 status=active 也不按受控计——说不出文件编号的「受控」不算受控。status 取自 absent(未登记)/draft(有文件未生效)/active(受控生效)"
+        }
+      ],
       "defaults": {
         "rules": null,
         "spc_exclusion_mode": null,
