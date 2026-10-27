@@ -1027,6 +1027,7 @@ STATUS_FILE = os.path.join("lib", "status.py")
 PROVENANCE_FILE = os.path.join("lib", "provenance.py")
 CONFOUND_FILE = os.path.join("lib", "confound.py")
 DOE_FILE = os.path.join("lib", "doe.py")
+KBSTORE_FILE = os.path.join("lib", "kbstore.py")
 TENANCY_FILE = os.path.join("lib", "tenancy.py")
 EIGHTD_FILE = os.path.join("lib", "eightd.py")
 PIPELINE_FILE = os.path.join("lib", "pipeline.py")
@@ -1864,6 +1865,68 @@ def rule_p1_doe_structure():
     return _r(True, "", {"doe_structure": True})
 
 
+def rule_p2_knowledge_lifecycle():
+    """P2-2：知识必须有生命周期 schema、状态机与出处覆盖率审计。
+
+    审计原话：无适用工序/设备/材料/前提/样本量/证据等级/验证时间/失效条件/所有者/状态机；
+    params 里带出处的条目仍是 0（含 typical_range 与控制阈值）。
+
+    判据走文本而不是 import：变异打在临时副本上，动态 import 会读到真实库，
+    变异就抓不到——那不是 FAIL，是静默 SKIP。
+    """
+    t = _read(KBSTORE_FILE) or ""
+    if not t:
+        return _r(False, "读不到 " + KBSTORE_FILE)
+    # 1) schema：台账点名的字段必须真的进了 schema，不是写在注释里
+    _blk = _block(t, "LIFECYCLE_FIELDS = {", "\n}", maxlen=2000) or ""
+    if not _blk:
+        return _r(False, "缺少 LIFECYCLE_FIELDS：知识生命周期 schema 未定义")
+    for f in ("applicable_processes", "device_models", "materials", "preconditions",
+              "sample_size", "evidence_level", "verified_at", "invalidates_if",
+              "owner", "status"):
+        if '"%s"' % f not in _blk:
+            return _r(False, "生命周期 schema 缺字段 %s" % f)
+    # 2) 最小必填集不能为空，否则"覆盖率"永远是 100% 的假象
+    if not re.search(r'LIFECYCLE_MINIMUM\s*=\s*\(\s*"', t):
+        return _r(False, "LIFECYCLE_MINIMUM 为空：无法判断条目现在还能不能用")
+    # 3) 状态机：draft 可进 active；active 不可退回 draft；deprecated 是终态
+    if "LIFECYCLE_TRANSITIONS" not in t:
+        return _r(False, "缺少 LIFECYCLE_TRANSITIONS：状态流转无约束")
+    _tb = _block(t, "LIFECYCLE_TRANSITIONS = {", "\n}", maxlen=400) or ""
+    # 必须按行首键名取，不能取"第一个含 active 的行"——
+    # 那一行其实是 draft 的定义（它把 active 列为可流转目标），会自己把自己判死。
+    _act = [ln for ln in _tb.splitlines() if re.match(r'^\s*"active"\s*:', ln)]
+    if not _act:
+        return _r(False, "状态机缺 active 的流转定义")
+    if '"draft"' in _act[0]:
+        return _r(False, "active 可退回 draft：能把已生效的知识悄悄绕过复核")
+    if not re.search(r'"deprecated":\s*\(\s*\)', _tb):
+        return _r(False, "deprecated 不是终态：废弃知识可被复活")
+    if "def check_transition(" not in t:
+        return _r(False, "缺 check_transition：状态机只定义不执行")
+    # 4) 出处覆盖率审计必须真的扫全库（默认不指向 LIFECYCLE_TARGETS 就是空跑）
+    if "def audit_lifecycle(" not in t:
+        return _r(False, "缺 audit_lifecycle：出处覆盖率无从度量")
+    if not re.search(r"or\s+LIFECYCLE_TARGETS", t):
+        return _r(False, "audit_lifecycle 未以 LIFECYCLE_TARGETS 为默认范围：审计会空跑")
+    if '"source_coverage"' not in t:
+        return _r(False, "审计未输出 source_coverage：出处缺口没有数字")
+    # 5) 取值合法性必须逐条报，且不能拿 cases 的 A/B/C 等级造假阳性
+    if "def lifecycle_issues(" not in t:
+        return _r(False, "缺 lifecycle_issues：非法取值无人检查")
+    if '"lifecycle": False' not in t:
+        return _r(False, "cases 段未排除生命周期词表：A/B/C 证据等级会被误判成缺陷")
+    # 6) 能力必须可达：编排器要能真的跑出这份读数。
+    #    注意：本规则就在 fde_run.py 里，判据若写裸子串会先命中自身描述文字
+    #    （"def flow_kb(" 这几个字在本文件里也出现），所以一律用行首锚定隔离。
+    tf = _read(os.path.join("scripts", "fde_run.py")) or ""
+    if not re.search(r"^def\s+flow_kb\s*\(", tf, re.M):
+        return _r(False, "编排器未实现 flow_kb：生命周期审计是库里的死代码")
+    if not re.search(r'^\s*if\s+args\.flow\s*==\s*"kb":', tf, re.M):
+        return _r(False, "编排器未把 kb 接进命令分发：流程存在但调不到")
+    return _r(True, "", {"knowledge_lifecycle": True})
+
+
 AUDIT_RULES = [
     Rule("LICENSE 为 Elastic 2.0 官方纯文本", rule_license,
          "LICENSE 首行必须是裸文本 'Elastic License 2.0'（前面有 # 或 ## 即判不过）",
@@ -2459,6 +2522,26 @@ AUDIT_RULES = [
           _mutant("可检出效应写死为 1.0（功效数字变成装饰）",
                   _re_sub(r"d_detect = \(z_a \+ z_b\) \* se", "d_detect = 1.0",
                           flags=re.M), DOE_FILE)]),
+    Rule("知识必须有生命周期 schema、状态机与出处覆盖率审计",
+         rule_p2_knowledge_lifecycle,
+         "P2-2。kbstore 必须定义 LIFECYCLE_FIELDS（适用工序/设备/材料/前提/样本量/"
+         "证据等级/验证时间/失效条件/所有者/状态）与非空的 LIFECYCLE_MINIMUM；"
+         "状态机必须允许 draft→active、禁止 active→draft、deprecated 为终态，"
+         "并有 check_transition 真正执行；audit_lifecycle 必须以 LIFECYCLE_TARGETS "
+         "为默认范围并输出 source_coverage；lifecycle_issues 必须存在且 cases 段"
+         "排除生命周期词表（避免 A/B/C 被误判）；编排器必须实现并分发 kb 流程。",
+         KBSTORE_FILE,
+         [_mutant("状态机放行 active→draft（可悄悄绕过复核）",
+                  _re_sub(r'"active": \("deprecated",\),',
+                          '"active": ("deprecated", "draft"),', flags=re.M),
+                  KBSTORE_FILE),
+          _mutant("审计范围被掏空（覆盖率永远 0 条，等于没审计）",
+                  _re_sub(r"targets = targets or LIFECYCLE_TARGETS",
+                          "targets = []", flags=re.M), KBSTORE_FILE),
+          _mutant("最小必填集清空（覆盖率变成 100% 的假象）",
+                  _re_sub(r'LIFECYCLE_MINIMUM = \("evidence_level", "verified_at", '
+                          r'"invalidates_if", "status"\)',
+                          "LIFECYCLE_MINIMUM = ()", flags=re.M), KBSTORE_FILE)]),
 ]
 
 
@@ -2620,6 +2703,57 @@ def rule_selftest_steps():
 
 
 # --------------------------------------------------------------- 流程定义
+
+def flow_kb(args):
+    """知识生命周期与出处覆盖率审计（P2-2）。
+
+    把"这个知识库有多少是可信的"变成可查的数字：出处覆盖率、生命周期必填覆盖率、
+    取值真错的条目、超期未复核的条目。不修知识库，只出读数与待办清单。
+    """
+    sys.path.insert(0, ROOT)
+    from lib import kbstore as KBS
+    rep = KBS.audit_lifecycle()
+    ov = rep.get("overall") or {}
+    print("=" * 68)
+    print("知识生命周期与出处覆盖率审计（P2-2）")
+    print("=" * 68)
+    print("合计条目 %d 条；带出处 %d 条（%.1f%%）；生命周期必填齐全 %d 条（%.1f%%）"
+          % (ov.get("total") or 0, ov.get("with_source") or 0,
+             (ov.get("source_coverage") or 0) * 100,
+             (ov.get("total") or 0) - (ov.get("missing_minimum") or 0),
+             (ov.get("minimum_coverage") or 0) * 100))
+    print("-" * 68)
+    for name, s in (rep.get("sections") or {}).items():
+        cov = s.get("source_coverage")
+        mcov = s.get("minimum_coverage")
+        print("%-24s 共 %3d 条｜出处 %s｜生命周期必填 %s｜状态 %s"
+              % (name, s.get("total") or 0,
+                 ("%.0f%%" % (cov * 100)) if cov is not None else "—",
+                 ("%.0f%%" % (mcov * 100)) if mcov is not None else "（不适用）",
+                 s.get("status_counts") or "{}"))
+        for k in (s.get("missing_source_sample") or [])[:5]:
+            print("      · 缺出处：%s" % k)
+    print("-" * 68)
+    for n in (rep.get("notes") or []):
+        print("※ %s" % n)
+    if rep.get("invalid"):
+        print("-" * 68)
+        print("取值不合法（真缺陷，需逐条修）：")
+        for it in rep["invalid"][:10]:
+            print("      · %s / %s：%s" % (it.get("section"), it.get("key"),
+                                           "；".join(it.get("issues") or [])))
+    if rep.get("stale"):
+        print("-" * 68)
+        print("超期未复核（只标待复核，不自动作废）：")
+        for it in rep["stale"][:10]:
+            print("      · %s / %s：%s（%d 天）"
+                  % (it.get("section"), it.get("key"), it.get("verified_at"),
+                     it.get("age_days") or 0))
+    print("=" * 68)
+    if getattr(args, "json", False):
+        print(json.dumps(rep, ensure_ascii=False, indent=2))
+    return 0
+
 
 def flow_audit(args):
     started = time.time()
@@ -3120,10 +3254,11 @@ def main(argv=None):
     ap = argparse.ArgumentParser(
         description="newenergy-fde 唯一入口编排器（流程代码化 + 证据落盘）")
     ap.add_argument("flow",
-                    choices=["audit", "verify", "analyze", "release", "config"],
+                    choices=["audit", "verify", "analyze", "release", "config", "kb"],
                     help="audit=约定落地核查  verify=质量闸门  "
                          "analyze=交付主流程  release=发布  "
-                         "config=可调参数清单与企业规格模板")
+                         "config=可调参数清单与企业规格模板  "
+                         "kb=知识生命周期与出处覆盖率审计")
     ap.add_argument("--input", "-i", nargs="+", help="analyze：数据文件")
     ap.add_argument("--outdir", "-o", default="output", help="analyze：输出目录")
     ap.add_argument("--target", help="analyze：目标指标列")
@@ -3183,6 +3318,8 @@ def main(argv=None):
 
     if args.flow == "config":
         return flow_config(args)
+    if args.flow == "kb":
+        return flow_kb(args)
     if args.flow == "audit":
         return flow_audit(args)
     if args.flow == "verify":

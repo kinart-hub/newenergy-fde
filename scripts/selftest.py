@@ -39,6 +39,7 @@ sys.path.insert(0, ROOT)
 
 from lib import table as T, stats as S, spc as SPC, doe as DOE, \
     preprocess as PP, rootcause as RC, charts as CH, pipeline as PL, report as RPT
+from lib import kbstore as KBS
 
 PASS, FAIL = [], []
 
@@ -3142,6 +3143,116 @@ def test_p1_doe_structure():
     check("P1-7 非法功效输入返回 None", DOE.power_analysis(0) is None)
 
 
+def test_p2_knowledge_lifecycle():
+    """P2-2：知识生命周期 schema + 状态机 + 出处覆盖率审计。
+
+    审计原话：无适用工序/设备/材料/前提/样本量/证据等级/验证时间/失效条件/所有者/状态机；
+    params 里带出处的条目仍是 0（含 typical_range 与控制阈值）。
+
+    这里测三件事：
+      ① schema 十项齐全且状态机真的拒绝非法流转（不是只定义不执行）；
+      ② 覆盖率审计算得出真实数字，且随补录而上升（不是恒 0 的装饰）；
+      ③ cases 用 A/B/C 另一套证据等级，不得被生命周期词表误判成缺陷——
+         造一批假阳性比不检查更伤，因为人会连真的缺陷一起忽略。
+    """
+    # ① schema 十项
+    _need = ("applicable_processes", "device_models", "materials", "preconditions",
+             "sample_size", "evidence_level", "verified_at", "invalidates_if",
+             "owner", "status")
+    _miss = [f for f in _need if f not in KBS.LIFECYCLE_FIELDS]
+    check("P2-2 生命周期 schema 覆盖台账点名的十项", not _miss, "缺=%r" % _miss)
+    check("P2-2 最小必填集已定义且是 schema 的子集",
+          bool(KBS.LIFECYCLE_MINIMUM)
+          and all(f in KBS.LIFECYCLE_FIELDS for f in KBS.LIFECYCLE_MINIMUM),
+          "minimum=%r" % (KBS.LIFECYCLE_MINIMUM,))
+
+    # ② 状态机：允许的放行、不允许的拒绝
+    check("P2-2 draft→active 允许", KBS.check_transition("draft", "active")[0] is True)
+    check("P2-2 active→deprecated 允许", KBS.check_transition("active", "deprecated")[0] is True)
+    check("P2-2 active→draft 被拒（不许悄悄退回草稿绕过复核）",
+          KBS.check_transition("active", "draft")[0] is False,
+          "reason=%r" % (KBS.check_transition("active", "draft")[1],))
+    check("P2-2 deprecated→active 被拒（终态不可复活）",
+          KBS.check_transition("deprecated", "active")[0] is False)
+    check("P2-2 状态机外的目标值被拒",
+          KBS.check_transition("draft", "archived")[0] is False)
+
+    # ③ 取值合法性 vs 缺字段：两类问题分开报
+    _bad = {"status": "unknown_state", "evidence_level": "ABC", "verified_at": "上周五"}
+    _iss = KBS.lifecycle_issues(_bad, minimum=())
+    check("P2-2 非法取值逐条报出（状态/证据等级/日期格式）", len(_iss) == 3, "issues=%r" % _iss)
+    check("P2-2 最小必填缺项可单独统计",
+          len(KBS.lifecycle_issues({}, minimum=KBS.LIFECYCLE_MINIMUM)) == len(KBS.LIFECYCLE_MINIMUM)
+          and KBS.lifecycle_issues({"status": "active"}, minimum=()) == [],
+          "空条目应缺 %d 项；合法 active 不应报取值错" % len(KBS.LIFECYCLE_MINIMUM))
+
+    # ④ 隔离库里真跑一次状态流转与留痕
+    _tmp = tempfile.mkdtemp(prefix="fde_kb_")
+    _old_root = KBS.KB_DIR
+    try:
+        os.makedirs(os.path.join(_tmp, "knowledge"), exist_ok=True)
+        _spec = {"meta": {"name": "t", "version": "0"},
+                 "params": {
+                     "p_bare": {"name": "裸条目", "process": "x"},
+                     "p_full": {"name": "完整条目", "process": "x",
+                                "source": "企业受控规格 SPEC-001",
+                                "status": "draft", "evidence_level": "lab",
+                                "verified_at": "2024-01-01",   # 故意超出复核窗口
+                                "invalidates_if": "换材料体系或换机型后",
+                                "owner": "工艺组-张三"}}}
+        with io.open(os.path.join(_tmp, "knowledge", "process_specs.json"),
+                     "w", encoding="utf-8") as _f:
+            json.dump(_spec, _f, ensure_ascii=False)
+        KBS.set_root(_tmp)
+        _r1 = KBS.set_lifecycle_status("specs", "params", "p_full", "active",
+                                       actor="李四", reason="小批验证通过")
+        check("P2-2 合法流转成功并留痕",
+              _r1.get("ok") and _r1.get("from") == "draft" and _r1.get("to") == "active"
+              and _r1.get("history_len") == 1, "ret=%r" % _r1)
+        _after = KBS.load("specs")["params"]["p_full"]
+        check("P2-2 留痕含操作人与原因",
+              (_after.get("lifecycle_history") or [{}])[0].get("by") == "李四"
+              and bool((_after.get("lifecycle_history") or [{}])[0].get("reason")),
+              "hist=%r" % _after.get("lifecycle_history"))
+        _r2 = KBS.set_lifecycle_status("specs", "params", "p_full", "draft")
+        check("P2-2 非法流转被拒且不改写数据",
+              _r2.get("ok") is False
+              and KBS.load("specs")["params"]["p_full"].get("status") == "active",
+              "ret=%r" % _r2)
+
+        # ⑤ 覆盖率随补录上升：不是恒 0 的装饰
+        _a = KBS.audit_lifecycle(targets=[
+            {"file": "specs", "section": "params", "lifecycle": True}])
+        check("P2-2 出处覆盖率按实际算（1/2）",
+              abs((_a["overall"]["source_coverage"] or 0) - 0.5) < 1e-9,
+              "cov=%r" % _a["overall"]["source_coverage"])
+        check("P2-2 最小必填覆盖率按实际算（1/2）",
+              abs((_a["overall"]["minimum_coverage"] or 0) - 0.5) < 1e-9,
+              "cov=%r" % _a["overall"]["minimum_coverage"])
+        check("P2-2 缺出处条目被点名（可定位到 key）",
+              "p_bare" in (_a["sections"]["specs/params"]["missing_source_sample"] or []),
+              "sample=%r" % _a["sections"]["specs/params"]["missing_source_sample"])
+        check("P2-2 超期未复核会被标出（不自动作废）",
+              any(s["key"] == "p_full" for s in (_a.get("stale") or []))
+              and _a["overall"]["stale"] >= 1,
+              "stale=%r" % _a.get("stale"))
+    finally:
+        KBS.set_root(None)
+        shutil.rmtree(_tmp, ignore_errors=True)
+    check("P2-2 隔离根已还原（不污染正库）", KBS.KB_DIR == _old_root,
+          "now=%r" % KBS.KB_DIR)
+
+    # ⑥ cases 用 A/B/C 证据等级，不得被生命周期词表误判
+    _real = KBS.audit_lifecycle()
+    _case_bad = [i for i in (_real.get("invalid") or []) if "cases" in i.get("section", "")]
+    check("P2-2 cases 的 A/B/C 等级未被误判成非法取值", not _case_bad,
+          "误报=%r" % _case_bad)
+    check("P2-2 正库审计给出合计覆盖率（可对外报的真实数字）",
+          _real["overall"]["total"] > 0
+          and _real["overall"]["source_coverage"] is not None,
+          "overall=%r" % _real["overall"])
+
+
 if __name__ == "__main__":
     print("newenergy-fde 自检开始")
     test_table()
@@ -3176,6 +3287,7 @@ if __name__ == "__main__":
     test_p1_field_mapping_confidence()
     test_p1_spc_exclusion_review()
     test_p1_doe_structure()
+    test_p2_knowledge_lifecycle()
     print("\n" + "=" * 56)
     print("通过 %d 项，失败 %d 项" % (len(PASS), len(FAIL)))
     if FAIL:

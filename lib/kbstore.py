@@ -1364,3 +1364,237 @@ def recommend_prior(defect, param_key):
     top = cs[0]
     bonus = {"A": 0.12, "B": 0.06}.get(top.get("evidence_level"), 0.0)
     return bonus, top
+
+
+# ------------------------------------------------------------------ 知识生命周期（P2-2）
+#
+# 一条知识"写了就算数"，等于没有生命周期：不知道它适用哪道工序/哪台设备/哪种材料、
+# 在什么前提下成立、拿多少样本验的、证据等级是什么、什么时候验的、
+# 出现什么情况就该作废、谁负责复核、现在处于什么状态。
+# 这些不写进 schema，知识库就只能"只增不修"，越用越不可信；
+# 而一个越用越不可信的库，使用者最后会整体绕过它——那才是最坏的结果。
+
+LIFECYCLE_FIELDS = {
+    "applicable_processes": "适用工序（工序 key 列表）：跨工序借用必须显式声明，否则机理串台",
+    "device_models": "适用设备/机型：换机型后量程与噪声水平都变，阈值未必成立",
+    "materials": "适用材料体系（如 LFP / NCM / 石墨）：换体系后典型区间不同",
+    "preconditions": "成立前提（班次 / 温湿度 / 量程 / 配方版本 / 静置时间）",
+    "sample_size": "验证所用样本量：没有样本量的阈值等于个人经验，不能当判据",
+    "evidence_level": "证据等级：field_verified / lab / literature / expert_opinion / unknown",
+    "verified_at": "验证日期 YYYY-MM-DD：没有日期就无法判断它是否已经过期",
+    "invalidates_if": "失效条件：出现什么情况该条目即失效",
+    "owner": "所有者：谁负责复核、对它负责",
+    "status": "状态机：draft / active / deprecated",
+}
+
+# 最小必填：少了这四条，无法判断这条知识"现在还能不能用"
+LIFECYCLE_MINIMUM = ("evidence_level", "verified_at", "invalidates_if", "status")
+
+LIFECYCLE_STATUS = ("draft", "active", "deprecated")
+
+# 状态机：draft 只能进 active 或废弃；active 只能废弃；deprecated 是终点，不可复活。
+# 不允许 active → draft：把已生效的知识悄悄退回草稿等于绕过复核。
+LIFECYCLE_TRANSITIONS = {
+    "draft": ("active", "deprecated"),
+    "active": ("deprecated",),
+    "deprecated": (),
+}
+
+EVIDENCE_LEVELS = ("field_verified", "lab", "literature", "expert_opinion", "unknown")
+
+# 超过这个天数没复核的条目标"待复核"——只提醒，不自动作废：自动作废是越权
+LIFECYCLE_REVIEW_DAYS = 365
+
+
+def _parse_date(s):
+    """YYYY-MM-DD -> date；解析不了返回 None（日期格式错了要报，不是当成没有）"""
+    if not isinstance(s, str) or not s:
+        return None
+    try:
+        return datetime.datetime.strptime(s.strip()[:10], "%Y-%m-%d").date()
+    except Exception:
+        return None
+
+
+def lifecycle_issues(entry, minimum=()):
+    """校验单条知识的生命周期字段。
+
+    minimum 为空时只查**取值是否合法**（status 在状态机内、evidence_level 在词表内、
+    verified_at 是日期）；传入 LIFECYCLE_MINIMUM 才额外查"必填项有没有"。
+    两者分开是因为：取值错是真缺陷，缺字段是覆盖度问题，混在一起会让缺陷数被淹掉。
+    """
+    if not isinstance(entry, dict):
+        return ["条目不是对象：%r" % type(entry).__name__]
+    issues = []
+    st = entry.get("status")
+    if st is not None and st not in LIFECYCLE_STATUS:
+        issues.append("status=%r 不在状态机 %s 内" % (st, "/".join(LIFECYCLE_STATUS)))
+    ev = entry.get("evidence_level")
+    if ev is not None and ev not in EVIDENCE_LEVELS:
+        issues.append("evidence_level=%r 不在词表 %s 内" % (ev, "/".join(EVIDENCE_LEVELS)))
+    va = entry.get("verified_at")
+    if va and _parse_date(va) is None:
+        issues.append("verified_at=%r 不是 YYYY-MM-DD" % va)
+    for f in minimum:
+        if not entry.get(f):
+            issues.append("缺 %s（%s）" % (f, LIFECYCLE_FIELDS.get(f, f)))
+    return issues
+
+
+def check_transition(old, new):
+    """状态机校验，返回 (ok, reason)。旧状态缺失按 draft 处理。"""
+    old = old if old in LIFECYCLE_STATUS else "draft"
+    if new not in LIFECYCLE_STATUS:
+        return (False, "目标状态 %r 不在状态机 %s 内" % (new, "/".join(LIFECYCLE_STATUS)))
+    if old == new:
+        return (True, "状态未变")
+    allowed = LIFECYCLE_TRANSITIONS.get(old, ())
+    if new not in allowed:
+        return (False, "不允许 %s → %s（该状态只能流转到：%s）"
+                % (old, new, "、".join(allowed) if allowed else "无（终态）"))
+    return (True, "")
+
+
+def set_lifecycle_status(file_key, section, key, new_status,
+                         actor=None, reason=None):
+    """按状态机改写条目状态并留痕。非法流转直接拒绝，不做静默纠正。
+
+    留痕写进条目自身的 lifecycle_history：谁在什么时候因为什么把它从哪改到哪。
+    """
+    data = load(file_key) or {}
+    sec = data.get(section)
+    if not isinstance(sec, dict) or key not in sec:
+        return {"ok": False, "error": "找不到条目 %s/%s" % (section, key)}
+    entry = sec[key]
+    if not isinstance(entry, dict):
+        return {"ok": False, "error": "条目 %s/%s 不是对象" % (section, key)}
+    ok, why = check_transition(entry.get("status"), new_status)
+    if not ok:
+        return {"ok": False, "error": why}
+    old = entry.get("status") or "draft"
+    if old == new_status:
+        return {"ok": True, "unchanged": True, "status": new_status}
+    entry["status"] = new_status
+    hist = entry.get("lifecycle_history")
+    if not isinstance(hist, list):
+        hist = []
+    hist.append({"from": old, "to": new_status, "at": _today(),
+                 "by": actor, "reason": reason})
+    entry["lifecycle_history"] = hist
+    save(file_key, data)
+    return {"ok": True, "from": old, "to": new_status, "history_len": len(hist)}
+
+
+def _iter_entries(data, section):
+    """知识条目迭代：params/defect_rootcause 是 dict，cases 是 list，两种都要能走"""
+    sec = data.get(section)
+    if isinstance(sec, dict):
+        for k, v in sec.items():
+            yield (str(k), v)
+    elif isinstance(sec, list):
+        for i, v in enumerate(sec):
+            yield (str(v.get("name") or v.get("id") or ("#%d" % i)) if isinstance(v, dict)
+                   else ("#%d" % i), v)
+
+
+# 审计范围：specs 三个段走完整生命周期；cases 只查出处的覆盖率——
+# cases 用的是 A/B/C 证据等级（另一套词表），套生命周期词表会造一批假阳性。
+LIFECYCLE_TARGETS = (
+    {"file": "specs", "section": "params", "lifecycle": True},
+    {"file": "specs", "section": "defect_rootcause", "lifecycle": True},
+    {"file": "specs", "section": "processes", "lifecycle": True},
+    {"file": "cases", "section": "cases", "lifecycle": False},
+)
+
+
+def audit_lifecycle(targets=None, review_days=LIFECYCLE_REVIEW_DAYS,
+                    minimum=LIFECYCLE_MINIMUM, sample=8):
+    """知识生命周期与出处覆盖率审计（P2-2）。
+
+    返回 dict：overall（合计覆盖率）/ sections（分段）/ invalid（取值真错）/
+               stale（超期未复核）/ notes（该怎么读这些数字）
+    """
+    targets = targets or LIFECYCLE_TARGETS
+    today = datetime.date.today()
+    out = {"generated_at": _today(), "sections": {}, "invalid": [], "stale": [],
+           "notes": []}
+    tot = tot_src = tot_min = 0
+    for tgt in targets:
+        fk, sec = tgt.get("file"), tgt.get("section")
+        try:
+            data = load(fk) or {}
+        except Exception as _e:
+            degrade.note("kbstore.audit_lifecycle@load", _e)
+            continue
+        n = n_src = n_min = 0
+        status_counts = {}
+        miss_src, miss_min = [], []
+        for key, e in _iter_entries(data, sec):
+            if not isinstance(e, dict):
+                continue
+            n += 1
+            if e.get("source") or e.get("sources"):
+                n_src += 1
+            elif len(miss_src) < sample:
+                miss_src.append(key)
+            if tgt.get("lifecycle"):
+                bad = lifecycle_issues(e, minimum=())
+                if bad:
+                    out["invalid"].append({"section": "%s/%s" % (fk, sec),
+                                           "key": key, "issues": bad})
+                lack = [f for f in (minimum or ()) if not e.get(f)]
+                if lack:
+                    n_min += 1
+                    if len(miss_min) < sample:
+                        miss_min.append({"key": key, "missing": lack})
+                else:
+                    n_min = n_min
+                st = e.get("status")
+                if st:
+                    status_counts[st] = status_counts.get(st, 0) + 1
+                va = e.get("verified_at")
+                d = _parse_date(va) if va else None
+                if d is not None and (today - d).days > int(review_days or 0):
+                    out["stale"].append({"section": "%s/%s" % (fk, sec), "key": key,
+                                         "verified_at": va,
+                                         "age_days": (today - d).days})
+        tot += n
+        tot_src += n_src
+        tot_min += n_min
+        out["sections"]["%s/%s" % (fk, sec)] = {
+            "total": n, "with_source": n_src,
+            "source_coverage": (n_src / n) if n else None,
+            "missing_minimum": n_min,
+            "minimum_coverage": ((n - n_min) / n) if n and tgt.get("lifecycle") else None,
+            "status_counts": status_counts,
+            "missing_source_sample": miss_src,
+            "missing_minimum_sample": miss_min,
+            "lifecycle_applies": bool(tgt.get("lifecycle")),
+        }
+    out["overall"] = {
+        "total": tot, "with_source": tot_src,
+        "source_coverage": (tot_src / tot) if tot else None,
+        "minimum_coverage": ((tot - tot_min) / tot) if tot else None,
+        "missing_minimum": tot_min,
+        "invalid": len(out["invalid"]), "stale": len(out["stale"]),
+    }
+    cov = out["overall"]["source_coverage"]
+    if cov is not None and cov < 0.5:
+        out["notes"].append(
+            "出处覆盖率仅 %.1f%%（%d/%d）：含 typical_range 与控制阈值的条目大多没有出处。"
+            "出处要靠外部口径输入，编不出来——未标出处的条目在报告里按「待确认」处理，"
+            "不因它出现在库里就当作已验证"
+            % (cov * 100, tot_src, tot))
+    if tot_min:
+        out["notes"].append(
+            "%d 条缺生命周期最小必填项（%s）：这些条目无法判断「现在还能不能用」，"
+            "只能按未确证知识对待" % (tot_min, "、".join(minimum or ())))
+    if out["stale"]:
+        out["notes"].append(
+            "%d 条超过 %d 天未复核：只标「待复核」，不自动作废——"
+            "作废需要人做决定，工具替人作废是越权"
+            % (len(out["stale"]), int(review_days or 0)))
+    if out["invalid"]:
+        out["notes"].append("%d 条取值本身不合法（状态不在状态机内 / 证据等级不在词表内 / "
+                            "验证日期格式错）：这些是真缺陷，需逐条修" % len(out["invalid"]))
+    return out
