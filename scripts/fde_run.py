@@ -636,6 +636,8 @@ AUDIT_FILES = [
     # v2.7 契约规则的变异目标；缺了它同样会是静默 SKIP 而不是 FAIL
     os.path.join("lib", "contract.py"),
     os.path.join("lib", "spc.py"),
+    # 产品档配置解析：变异目标（规则 51），缺了它变异注不进去 → 静默 SKIP
+    os.path.join("lib", "profile.py"),
     # P2-4 可观测性规则的变异要注入这里；缺了它是静默 SKIP 而不是 FAIL
     os.path.join("lib", "observ.py"),
     # 规则 49 要读降级台账确认"护栏失败会转发到可观测性"，
@@ -1034,6 +1036,7 @@ CONFOUND_FILE = os.path.join("lib", "confound.py")
 DOE_FILE = os.path.join("lib", "doe.py")
 KBSTORE_FILE = os.path.join("lib", "kbstore.py")
 OBS_FILE = os.path.join("lib", "observ.py")
+PROFILE_FILE = os.path.join("lib", "profile.py")
 TENANCY_FILE = os.path.join("lib", "tenancy.py")
 EIGHTD_FILE = os.path.join("lib", "eightd.py")
 PIPELINE_FILE = os.path.join("lib", "pipeline.py")
@@ -2025,6 +2028,76 @@ def rule_boundary_policy_knob():
     return _r(True, "", {"boundary_policy": True})
 
 
+def rule_product_profile_merge():
+    """产品档与多产品配置合并：按语义合并、交人决断不猜、显式优先、能力可达。
+
+    这条规则要防的是一类特定退化：**多产品并存时"谁在后面谁赢"**。
+    那是 tenancy.deep_merge 的行为，对单一覆盖源是对的，对多个平级来源就是
+    静默抉择——系统替使用人选了一套判严尺度，还不告诉他选了哪个、为什么。
+    """
+    t = _read(PROFILE_FILE) or ""
+    if not t:
+        return _r(False, "读不到 lib/profile.py：产品档配置解析不存在")
+    if "def resolve_config(" not in t:
+        return _r(False, "缺 resolve_config：多产品配置没有解析入口")
+    if "def _merge_candidates(" not in t:
+        return _r(False, "缺 _merge_candidates：合并逻辑若散在各处，语义就会各写各的")
+    if "def cross_matrix(" not in t:
+        return _r(False, "缺 cross_matrix：多产品交叉搭配映射表无法生成")
+
+    # 1) 四类合并语义都在（取严/取大/取并集/交人）
+    for kind in ('"kind": "rank"', '"kind": "max"', '"kind": "set_union"',
+                 '"kind": "manual"'):
+        if kind not in t:
+            return _r(False, "合并语义缺 %s：多产品只能靠位置决定，等于谁后谁赢" % kind)
+
+    # 1b) rank 语义必须真的"按严度择优"，而不是按候选顺序取一个。
+    #     少了这条，取严退化成"取最后一个"时规则照样判过——
+    #     这正是判据停在字样层的典型症状：删掉要防的那行，规则还判过。
+    if not (re.search(r"max\(known,", t) and re.search(r"min\(known,", t)):
+        return _r(False, "rank 语义缺按严度择优的动作：取严会退化成按位置取，"
+                         "多产品又变谁在后面谁赢")
+
+    # 2) manual 必须真的交人：返回空值 + 标记需决断，而不是取第一个
+    if 'return (None, kind, "各来源不一致且该参数无法自动取' not in t:
+        return _r(False, "无法自动判定的参数没有交人（manual 语义未落地）")
+    if "needs.append(" not in t:
+        return _r(False, "需人决断的项没有进 needs_decision：等于悄悄丢掉")
+
+    # 3) 显式配置优先，且被覆盖的来源仍留痕
+    if "if param in explicit:" not in t:
+        return _r(False, "缺显式优先分支：角色/产品会覆盖使用人写死的值（越权）")
+    # 判据落在"显式分支内确实把值写进 config 并跳出"，
+    # 而不是只留一条 trace——只留痕不生效，等于显式优先形同虚设
+    _m = re.search(r"if param in explicit:(.*?)continue", t, re.S)
+    if not _m or "config[param] = ev" not in _m.group(1):
+        return _r(False, "显式分支未真正写入 config：显式优先形同虚设")
+
+    # 4) 角色视角每条都要带理由（没理由的判严等于黑箱）
+    if '"reason":' not in t:
+        return _r(False, "角色视角没写理由：使用人不知道为什么被这么配")
+
+    # 5) 交叉表要有规模上限（2^n 会爆炸，255 行的表没人看）
+    if "max_products" not in t:
+        return _r(False, "交叉表无产品数上限：产品一多就生成无人会看的表")
+
+    # 6) 语义表每条都要写明理由
+    if '"why":' not in t:
+        return _r(False, "合并语义没写理由：凭什么取严/取大说不清")
+
+    # 7) 能力必须可达：analyze 要真的用上，编排器要能查
+    tp = _read(PIPELINE_FILE) or ""
+    if "PF.resolve_config(" not in tp:
+        return _r(False, "pipeline 未调用 resolve_config：产品档是库里的死代码")
+    if "role=args.role" not in tp:
+        return _r(False, "pipeline CLI 未接 --role：使用者立场选不了")
+    tf = _read(os.path.join("scripts", "fde_run.py")) or ""
+    # 行首锚定：本规则就在 fde_run.py 里，不锚定会先命中自己的描述文字
+    if not re.search(r'^\s*ap\.add_argument\("--products"', tf, re.M):
+        return _r(False, "编排器未暴露 --products：多产品配置查不到、生不成")
+    return _r(True, "多产品配置按语义合并、冲突交人、显式优先、交叉表与角色视角可达")
+
+
 AUDIT_RULES = [
     Rule("LICENSE 为 Elastic 2.0 官方纯文本", rule_license,
          "LICENSE 首行必须是裸文本 'Elastic License 2.0'（前面有 # 或 ## 即判不过）",
@@ -2675,6 +2748,24 @@ AUDIT_RULES = [
           _mutant("旋钮被焊死成 warn（传什么都当 warn 处理）",
                   _re_sub(r'    policy = \(policy or "warn"\)',
                           '    policy = "warn"', flags=re.M), DOE_FILE)]),
+    Rule("多产品配置按语义合并，冲突交人决断且显式优先",
+         rule_product_profile_merge,
+         "resolve_config 按参数语义（rank/max/set_union/manual）合并；"
+         "manual 返回空值并进 needs_decision 而非取第一个；"
+         "explicit 分支先于角色与产品写入 config；角色每条带 reason；"
+         "cross_matrix 有规模上限；pipeline 调用 resolve_config 且 CLI 可达 --role/--products。",
+         PROFILE_FILE,
+         [_mutant("manual 不再交人（改取第一个，多产品又变谁先谁赢）",
+                  _re_sub(r'return \(None, kind, "各来源不一致且该参数无法自动取：%s" % detail, True\)',
+                          'return (uniq[0][1], kind, "取第一个", False)',
+                          flags=re.M), PROFILE_FILE),
+          _mutant("显式优先失效（角色/产品可覆盖使用人写死的值）",
+                  _re_sub(r'if param in explicit:', 'if False:',
+                          flags=re.M), PROFILE_FILE),
+          _mutant("取严退化成取最后一个（顺序又决定结果）",
+                  _re_sub(r'best = max\(known, key=lambda x: rank\[x\[1\]\]\) if pick == "max"',
+                          'best = known[-1] if pick == "max"',
+                          flags=re.M), PROFILE_FILE)]),
 ]
 
 
@@ -3185,11 +3276,119 @@ def flow_config(args):
     print("  改知识库走 kb_manage.py（propose → review → sync），")
     print("  不要直接编辑 JSON——直接改没有备份、没有版本、没有审核记录。")
 
+    if getattr(args, "init_products", False):
+        return _config_init_products(args)
+    if list(getattr(args, "products", None) or []) or getattr(args, "role", None):
+        _config_profile_block(list(getattr(args, "products", None) or []),
+                              getattr(args, "role", None),
+                              bool(getattr(args, "cross", False)))
+        print("\n" + "=" * 68)
+        return 0
+
     if not args.init:
         print("\n" + "=" * 68)
         print("加 --init 生成企业规格待填模板")
+        print("加 --products battery pv --cross 看多产品配置交叉表")
         return 0
     return _config_init(args)
+
+
+def _config_init_products(args):
+    """生成产品配置档待填模板。默认值一律留空——不替企业编参数。"""
+    sys.path.insert(0, ROOT)
+    from lib import profile as PF
+    prods = list(getattr(args, "products", None) or [])
+    if not prods:
+        # 没指定产品就取知识库里登记的行业域，省得使用者还得先知道 key 名
+        try:
+            from lib import scope as SC
+            prods = list(SC.known_industries(ROOT) or [])
+        except Exception:
+            prods = []
+    if not prods:
+        print("\n未指定产品，也读不到行业登记表：请用 --products battery pv 指定")
+        return 1
+    path = getattr(args, "out", None) or PF.PRODUCT_PROFILE_FILE
+    try:
+        p = PF.write_template(prods, path)
+    except Exception as e:
+        print("\n生成失败：%s" % e)
+        return 1
+    print("\n已生成产品配置档模板：%s" % p)
+    print("  ⚠ 默认值一律留空：本工具不替企业编参数——编出来的默认值会被当成")
+    print("    「系统给的」直接交付，那比留空危险得多。")
+    print("  填好后放在 knowledge/product_profiles.json（或租户层同名文件），")
+    print("  analyze 不指定开关时自动按产品档配；使用人显式指定的值始终优先。")
+    return 0
+
+
+def _config_profile_block(prods, role, cross=False):
+    """打印「这些产品 + 这个角色」解析出的一套配置，以及为什么是这套。"""
+    sys.path.insert(0, ROOT)
+    try:
+        from lib import profile as PF
+    except Exception as e:
+        print("\n【六】产品档配置解析：读不到 lib/profile.py（%s）" % e)
+        return
+    base = {"spc_exclusion_mode": "auto", "boundary_policy": "warn",
+            "doe_replicates": 1, "doe_blocks": 1, "doe_seed": 0}
+    print("\n【六】产品档与配置解析（多产品按语义合并，与书写顺序无关）")
+    print("  产品：%s   角色：%s" % ("、".join(prods) or "（未指定）",
+                                 PF.ROLE_LABEL.get(role, role) if role else "（未指定）"))
+
+    # 先说清楚"这些产品到底有没有配"：没配就回落基线，
+    # 而回落基线最容易被误读成"系统替我定好了"——判严尺度悄悄松了却没人知道。
+    try:
+        _pr = PF.load_profiles(ROOT)
+        _no_file = [p for p in prods if p not in (_pr.get("products") or {})]
+        _all_blank = [p for p in prods
+                      if p not in _no_file
+                      and all(v is None for v in (PF.defaults_of(p, _pr) or {}).values())]
+        if _no_file:
+            print("\n  ⚠ 以下产品没有配置档，其默认值全部回落基线：%s"
+                  % "、".join(_no_file))
+        if _all_blank:
+            print("  ⚠ 以下产品的配置档已建但默认值全空，等同于未配：%s"
+                  % "、".join(_all_blank))
+        if _no_file or _all_blank:
+            print("    生成待填模板：config --init-products --products %s"
+                  % " ".join(prods))
+    except Exception as e:
+        # 这块只是提示，读不到不该让 config 崩；但也不能一声不吭——
+        # 静默的后果是使用者以为"查过了没问题"，其实根本没查成。
+        print("  ⚠ 读产品档失败，无法判断这些产品是否已配置：%s" % e)
+
+    if cross and prods:
+        m = PF.cross_matrix(prods, role=role, baseline=base)
+        if not m.get("ok"):
+            print("  %s" % m.get("error"))
+            return
+        print("\n  交叉搭配映射表（%d 个组合，实时算出，不是抄来的）："
+              % m["n_combinations"])
+        for row in m["rows"]:
+            tail = ("   ⚠需人指定：" + "、".join(row["needs_decision"])) \
+                if row["needs_decision"] else ""
+            print("   %-22s %s%s" % (row["key"],
+                                     json.dumps(row["config"], ensure_ascii=False), tail))
+        print("\n  needs_decision 非空 = 该组合下这几个参数必须由使用人指定，")
+        print("  工具不替他选（各产品关注对象不同，选了就是替他决定看什么）。")
+        return
+
+    r = PF.resolve_config(prods, role=role, baseline=base)
+    if r["trace"]:
+        print("\n  逐参数判定：")
+        for t in r["trace"]:
+            print("   %-20s = %-22s [%s] %s"
+                  % (t["param"], str(t["value"]), t["semantics"], t["from"]))
+    if r["needs_decision"]:
+        print("\n  ⚠ 必须由使用人指定（工具不猜）：")
+        for n in r["needs_decision"]:
+            print("   %s：%s" % (n["param"], n["reason"]))
+    for nte in r["notes"]:
+        print("  · %s" % nte)
+    if not r["trace"] and not r["needs_decision"]:
+        print("\n  （产品档未配置任何默认值，全部回落基线。"
+              "生成待填模板：config --init-products --products ...）")
 
 
 def _config_init_from_data(args, path, params, tpl, kb):
@@ -3468,7 +3667,15 @@ def main(argv=None):
     ap.add_argument("--timeout", type=int, default=900, help="单步超时（秒）")
     ap.add_argument("--init", action="store_true",
                     help="config：生成企业规格待填模板（数值一律留空）")
-    ap.add_argument("--out", help="config --init：模板输出路径")
+    ap.add_argument("--out", help="config --init / --init-products：模板输出路径")
+    ap.add_argument("--products", nargs="+", default=None,
+                    help="config：按产品（行业域）看配置默认值怎么合并，"
+                         "如 --products battery pv（多产品按语义合并，与书写顺序无关）")
+    ap.add_argument("--init-products", action="store_true",
+                    help="config：生成产品配置档待填模板（数值一律留空，不替企业编）")
+    ap.add_argument("--cross", action="store_true",
+                    help="config：配合 --products 出交叉搭配映射表"
+                         "（所有产品组合 → 配置，含需人决断项）")
 
     # 把 lib/pipeline.py 的全部参数动态补进来（取长选项，不抢短选项）。
     # 目的是让「唯一入口」名副其实：pipeline 新增参数时编排器自动跟上，

@@ -42,6 +42,7 @@ from lib import table as T, stats as S, spc as SPC, doe as DOE, \
     preprocess as PP, rootcause as RC, charts as CH, pipeline as PL, report as RPT
 from lib import kbstore as KBS
 from lib import observ as OBS
+from lib import profile as PF
 from lib import degrade as DG
 
 PASS, FAIL = [], []
@@ -3446,6 +3447,174 @@ def test_boundary_policy_knob():
           "pipeline --help 里找不到 --boundary-policy")
 
 
+def test_product_profile_resolve():
+    """产品档与租户配置解析（多产品合并 / 交叉表 / 角色视角）。
+
+    这组用例要钉死的是一条：多产品并存时谁赢，由**参数语义**决定，
+    不是由书写顺序决定——后者等于系统替使用人选了一个还不告诉他。
+    """
+    print("\n--- 产品档与配置解析 ---")
+    pr = {"products": {
+        "alpha": {"name": "alpha", "defaults": {
+            "boundary_policy": "warn", "rules": "1,2,3,5",
+            "doe_replicates": 1, "target": "面密度"}},
+        "beta": {"name": "beta", "defaults": {
+            "boundary_policy": "block", "rules": "1,3,5,6",
+            "doe_replicates": 3, "target": "EL缺陷数"}},
+        "gamma": {"name": "gamma", "defaults": {"rules": "2,4", "doe_blocks": 2}},
+    }}
+
+    # 1) 单产品：默认值直出
+    r1 = PF.resolve_config(["alpha"], profiles=pr)
+    check("单产品：默认值直接生效",
+          r1["config"].get("rules") == "1,2,3,5"
+          and r1["config"].get("target") == "面密度",
+          str(r1["config"]))
+
+    # 2) 多产品：按语义合并（取严 / 并集 / 取大）
+    r2 = PF.resolve_config(["alpha", "beta"], profiles=pr)
+    check("多产品：阻断类取严（warn+block → block）",
+          r2["config"].get("boundary_policy") == "block",
+          str(r2["config"].get("boundary_policy")))
+    check("多产品：规则集取并集（1,2,3,5 ∪ 1,3,5,6）",
+          r2["config"].get("rules") == "1,2,3,5,6",
+          str(r2["config"].get("rules")))
+    check("多产品：样本量类取大（1 vs 3 → 3）",
+          r2["config"].get("doe_replicates") == 3,
+          str(r2["config"].get("doe_replicates")))
+
+    # 3) 关键：与书写顺序无关（这是 deep_merge「谁后谁赢」的反例）
+    r3 = PF.resolve_config(["beta", "alpha"], profiles=pr)
+    check("多产品：合并结果与书写顺序无关",
+          r3["config"] == r2["config"],
+          "%s vs %s" % (r2["config"], r3["config"]))
+
+    # 4) 无法自动判定的参数：交人，且不静默取第一个
+    _nd = [n["param"] for n in r2["needs_decision"]]
+    check("多产品：关注对象冲突时交人决断（不进 config）",
+          "target" in _nd and "target" not in r2["config"],
+          "needs=%s config_keys=%s" % (_nd, sorted(r2["config"].keys())))
+    _tgt = [n for n in r2["needs_decision"] if n["param"] == "target"][0]
+    check("多产品：交人决断项带完整候选（谁给了什么）",
+          _tgt["candidates"].get("产品 alpha") == "面密度"
+          and _tgt["candidates"].get("产品 beta") == "EL缺陷数",
+          str(_tgt["candidates"]))
+
+    # 5) 语义表外的参数冲突，同样交人而不是猜
+    pr_unknown = {"products": {
+        "a": {"defaults": {"custom_knob": "x"}},
+        "b": {"defaults": {"custom_knob": "y"}}}}
+    ru = PF.resolve_config(["a", "b"], profiles=pr_unknown)
+    check("未声明语义的参数冲突也交人（默认 manual，不猜）",
+          ru["config"] == {} and [n["param"] for n in ru["needs_decision"]] == ["custom_knob"],
+          str(ru["config"]))
+
+    # 6) 取值不在严度表内：能判就判，但必须标出来要人复核
+    pr_bad = {"products": {
+        "a": {"defaults": {"boundary_policy": "loose"}},
+        "b": {"defaults": {"boundary_policy": "block"}}}}
+    rb = PF.resolve_config(["a", "b"], profiles=pr_bad)
+    check("取值不在严度表内：按已知项判定并标需复核",
+          rb["config"].get("boundary_policy") == "block" and len(rb["conflicts"]) == 1,
+          "value=%s conflicts=%d" % (rb["config"].get("boundary_policy"), len(rb["conflicts"])))
+    pr_all_bad = {"products": {
+        "a": {"defaults": {"boundary_policy": "loose"}},
+        "b": {"defaults": {"boundary_policy": "maybe"}}}}
+    rab = PF.resolve_config(["a", "b"], profiles=pr_all_bad)
+    check("候选全部无法判定：不猜，直接交人",
+          rab["config"] == {} and [n["param"] for n in rab["needs_decision"]] == ["boundary_policy"],
+          str(rab["config"]))
+
+    # 7) 角色视角：施加判严尺度并给出理由
+    rq = PF.resolve_config(["alpha"], role="quality", profiles=pr)
+    _rules_trace = [t for t in rq["trace"] if t["param"] == "rules"]
+    check("角色视角：质量立场收紧判异规则与剔点审核",
+          rq["config"].get("spc_exclusion_mode") == "review"
+          and rq["config"].get("boundary_policy") == "block",
+          str({k: rq["config"].get(k) for k in ("spc_exclusion_mode", "boundary_policy")}))
+    check("角色视角：每个覆盖都带理由（不是黑箱）",
+          bool(_rules_trace) and "理由" in (_rules_trace[0].get("reason") or ""),
+          (_rules_trace[0].get("reason") or "")[:60] if _rules_trace else "无 trace")
+    check("角色视角：存在本轮补的检测分析/设备工程师角色",
+          "metrology" in PF.ROLE_LABEL and PF.ROLE_LABEL["metrology"] == "检测分析/设备工程师",
+          str(PF.ROLE_LABEL.get("metrology")))
+
+    # 7b) trace 的候选必须逐来源正确（曾把推导写成 {s: v for s, _ in srcs}，
+    #     值全被外层变量污染却因"有值"而蒙混过关——检查 needs 不检查 trace 就漏了）
+    _rt = [t for t in r2["trace"] if t["param"] == "rules"][0]
+    check("合并轨迹：逐来源候选值正确（不是被外层变量污染）",
+          _rt["candidates"] == {"产品 alpha": "1,2,3,5", "产品 beta": "1,3,5,6"},
+          str(_rt["candidates"]))
+
+    # 7c) 无产品档时角色视角仍要生效（曾因 products 为空触发未绑定变量而静默失效）
+    try:
+        rq0 = PF.resolve_config([], role="quality", baseline={
+            "spc_exclusion_mode": "auto", "boundary_policy": "warn", "doe_replicates": 1})
+        _ok0 = (rq0["config"].get("boundary_policy") == "block"
+                and rq0["config"].get("spc_exclusion_mode") == "review")
+        _d0 = str(rq0["config"])
+    except Exception as _ex0:
+        _ok0, _d0 = False, repr(_ex0)
+    check("角色视角：无产品档时仍生效（不依赖产品段）", _ok0, _d0)
+
+    # 8) 优先级：显式 > 角色 > 产品（角色不得越权覆盖使用人写死的）
+    re_ = PF.resolve_config(["alpha", "beta"], role="quality",
+                            explicit={"boundary_policy": "warn"}, profiles=pr)
+    check("优先级：使用人显式指定高于角色与产品",
+          re_["config"].get("boundary_policy") == "warn",
+          str(re_["config"].get("boundary_policy")))
+    check("优先级：被覆盖的来源仍留痕（不是悄悄丢掉）",
+          any(t["param"] == "boundary_policy" and t["decision"] == "explicit"
+              and len(t["candidates"]) >= 2 for t in re_["trace"]),
+          str([t for t in re_["trace"] if t["param"] == "boundary_policy"])[:80])
+
+    # 9) 交叉搭配映射表
+    m = PF.cross_matrix(["alpha", "beta", "gamma"], profiles=pr)
+    check("交叉表：组合数为 2^n-1 且可复现",
+          m.get("ok") and m["n_combinations"] == 7
+          and PF.cross_matrix(["alpha", "beta", "gamma"], profiles=pr)["rows"] == m["rows"],
+          "n=%s" % m.get("n_combinations"))
+    _ab = [r for r in m["rows"] if r["key"] == "alpha+beta"]
+    check("交叉表：多产品组合标出需人决断项",
+          bool(_ab) and _ab[0]["needs_decision"] == ["target"],
+          str(_ab[0]["needs_decision"]) if _ab else "无该行")
+    check("交叉表：单产品组合无需人决断",
+          all(r["needs_decision"] == [] for r in m["rows"] if r["n_products"] == 1),
+          "单产品组合全部自动定")
+    m_big = PF.cross_matrix([str(i) for i in range(8)], profiles=pr)
+    check("交叉表：产品过多时拒绝生成（255 行没人看）",
+          (not m_big.get("ok")) and "超过上限" in (m_big.get("error") or ""),
+          str(m_big.get("error"))[:50])
+
+    # 10) 待填模板：不替企业编参数
+    tpl = PF.init_template(["battery", "pv"])
+    _d = tpl["products"]["battery"]["defaults"]
+    check("模板：默认值一律留空（不编造产品参数）",
+          all(v is None for v in _d.values()) and len(_d) >= 6,
+          "fields=%d all_none=%s" % (len(_d), all(v is None for v in _d.values())))
+    check("模板：配置档带生命周期且初始为草稿",
+          tpl["products"]["battery"]["lifecycle"]["status"] == "draft"
+          and tpl["products"]["battery"]["lifecycle"]["evidence_level"] == "unknown",
+          str(tpl["products"]["battery"]["lifecycle"]["status"]))
+
+    # 11) 坏输入不抛异常
+    try:
+        _e1 = PF.resolve_config([], profiles={"products": {}})
+        _e2 = PF.resolve_config(["不存在的产品"], profiles=pr)
+        _e3 = PF.resolve_config(["alpha"], role="不是角色", profiles=pr)
+        check("坏输入：空产品 / 不存在产品 / 非法角色都不抛异常",
+              _e1["config"] == {} and isinstance(_e2["config"], dict)
+              and isinstance(_e3["config"], dict),
+              "ok")
+    except Exception as _ex:
+        check("坏输入：空产品 / 不存在产品 / 非法角色都不抛异常", False, repr(_ex))
+
+    # 12) 语义表覆盖：每条都要有 why（没理由的语义等于拍脑袋）
+    check("语义表：每条合并语义都写明理由",
+          all(s.get("why") for s in PF.MERGE_SEMANTICS.values()),
+          "n=%d" % len(PF.MERGE_SEMANTICS))
+
+
 if __name__ == "__main__":
     print("newenergy-fde 自检开始")
     test_table()
@@ -3483,6 +3652,7 @@ if __name__ == "__main__":
     test_p2_knowledge_lifecycle()
     test_p2_observability()
     test_boundary_policy_knob()
+    test_product_profile_resolve()
     print("\n" + "=" * 56)
     print("通过 %d 项，失败 %d 项" % (len(PASS), len(FAIL)))
     if FAIL:

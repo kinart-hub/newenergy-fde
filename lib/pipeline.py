@@ -50,6 +50,10 @@ if __package__ in (None, ""):
         from lib import observ as OBS
     except Exception:
         OBS = None
+    try:                    # 产品档配置解析；失败只影响"自动配默认值"，不影响主流程
+        from lib import profile as PF
+    except Exception:
+        PF = None
     try:                    # v1.11 新增模块，导入失败不能拖垮整条流水线
         from lib import events as EV
         _HAS_EVENTS = True
@@ -71,6 +75,10 @@ else:
         from . import observ as OBS
     except Exception:
         OBS = None
+    try:                    # 产品档配置解析；失败只影响"自动配默认值"，不影响主流程
+        from . import profile as PF
+    except Exception:
+        PF = None
     try:
         from . import events as EV
         _HAS_EVENTS = True
@@ -343,8 +351,9 @@ def encode_judgement(table):
 def analyze(paths, outdir="output", target=None, process=None, defect=None,
             sheet=None, spec_overrides=None, do_doe=True, max_charts=12,
             auto_adapt=False, tenant=None, industry=None, rules=None,
-            spc_exclusion_mode="auto",
-            doe_replicates=1, doe_blocks=1, doe_seed=0, boundary_policy="warn",
+            spc_exclusion_mode=None,
+            doe_replicates=None, doe_blocks=None, doe_seed=None, boundary_policy=None,
+            role=None,
             export_xlsx=True, d2_card=None, emit_d2_card=True, verbose=False,
             views=None):
     """
@@ -415,6 +424,83 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
     # 保证"做了哪些自动决定"在报告和血缘里是同一个事实源——两边各记一份，
     # 迟早会出现报告写了、血缘没写的分裂。
     result["decisions"] = []
+
+    # ------------------------------------------------------------------
+    # 产品档配置解析：多产品租户的默认值怎么合并出一套能用的
+    #
+    # 只在使用人**没有显式指定**时补位——他写死的值一律优先，
+    # 角色视角也不得推翻（优先级 显式 > 角色 > 产品 > 基线）。
+    # 未指定产品、也没配产品档时，resolve 返回空，各参数回落基线，行为与原来一致。
+    _prods = [p for p in (industry if isinstance(industry, (list, tuple))
+                          else ([industry] if industry else [])) if p]
+    _explicit = {}
+    for _k, _v in (("spc_exclusion_mode", spc_exclusion_mode),
+                   ("boundary_policy", boundary_policy),
+                   ("doe_replicates", doe_replicates),
+                   ("doe_blocks", doe_blocks),
+                   ("doe_seed", doe_seed),
+                   ("rules", rules),
+                   ("target", target), ("process", process), ("defect", defect)):
+        if _v not in (None, ""):
+            _explicit[_k] = _v
+    _cfg = {}
+    _cfg_needs, _cfg_trace = [], []
+    if PF is not None:
+        try:
+            _res = PF.resolve_config(
+                products=_prods, role=role, explicit=_explicit,
+                baseline={"spc_exclusion_mode": "auto", "boundary_policy": "warn",
+                          "doe_replicates": 1, "doe_blocks": 1, "doe_seed": 0})
+            _cfg = _res.get("config") or {}
+            _cfg_needs = _res.get("needs_decision") or []
+            _cfg_trace = _res.get("trace") or []
+        except Exception as _cfg_e:
+            # 配不出来不能静默：静默的后果是"以为按产品配好了，其实全回落基线"，
+            # 而回落基线比报错更危险——报告照样出，只是判严尺度悄悄松了。
+            degrade.note("pipeline.analyze@profile_resolve", _cfg_e)
+            _cfg = {}
+            result["decisions"].append({
+                "kind": "config_resolve_failed",
+                "detail": "产品档配置解析失败，本次全部回落基线默认值：%s" % _cfg_e,
+            })
+            (result.setdefault("warnings", [])).append(
+                "产品档配置解析失败（%s）：本次参数全部回落基线默认值，"
+                "判严尺度可能比产品档要求的松" % _cfg_e)
+    spc_exclusion_mode = spc_exclusion_mode or _cfg.get("spc_exclusion_mode") or "auto"
+    boundary_policy = boundary_policy or _cfg.get("boundary_policy") or "warn"
+    doe_replicates = doe_replicates if doe_replicates is not None \
+        else int(_cfg.get("doe_replicates") or 1)
+    doe_blocks = doe_blocks if doe_blocks is not None else int(_cfg.get("doe_blocks") or 1)
+    doe_seed = doe_seed if doe_seed is not None else int(_cfg.get("doe_seed") or 0)
+    if not rules and _cfg.get("rules"):
+        rules = _cfg.get("rules")
+    # 关注对象同理：产品档给了默认值且使用人没指定时才用，
+    # 两个产品给了不同关注对象且使用人没指定 → 不猜，留空并进 needs_decision
+    if not target and _cfg.get("target"):
+        target = _cfg.get("target")
+    if not process and _cfg.get("process"):
+        process = _cfg.get("process")
+    if not defect and _cfg.get("defect"):
+        defect = _cfg.get("defect")
+    if _prods or role or _cfg_trace:
+        result["config_profile"] = {
+            "products": _prods, "role": role,
+            "resolved": {k: v for k, v in _cfg.items()},
+            "needs_decision": [{"param": n.get("param"),
+                                "candidates": n.get("candidates"),
+                                "reason": n.get("reason")} for n in _cfg_needs],
+            "trace": [{"param": t.get("param"), "value": t.get("value"),
+                       "semantics": t.get("semantics"), "from": t.get("from")}
+                      for t in _cfg_trace],
+            "note": "配置按参数语义合并（取严/取并集/取大），与产品书写顺序无关；"
+                    "使用人显式指定的值优先级最高，角色视角不覆盖它",
+        }
+    for _n in _cfg_needs:
+        result["decisions"].append({
+            "kind": "config_needs_decision",
+            "detail": "参数 %s 各来源不一致且无法自动判定，未采用任何候选，需使用人指定（%s）"
+                      % (_n.get("param"), _n.get("reason")),
+        })
 
     # P2-4 可观测性：日志跟着本次输出走，不写脚本自身目录，
     # 也不落进用户的个人目录——交付时它是可带走、可发出去的东西，必须先脱敏。
@@ -2795,22 +2881,31 @@ def main():
                     help="启用的 Nelson 判异规则：1,2,3,5（默认基本集）/ all / basic / "
                          "shift / trend。规则开太多会误报泛滥，默认只开四条")
     ap.add_argument("--spc-exclusion-mode", dest="spc_exclusion_mode",
-                    default="auto", choices=["auto", "suggest", "review"],
-                    help="SPC 剔除模式：auto=命中即剔除(默认)；suggest=只标记可疑点不剔除、"
-                         "交人复核；review=按外部复核结论剔除（需另行提供复核记录）")
-    ap.add_argument("--doe-replicates", dest="doe_replicates", type=int, default=1,
+                    default=None, choices=["auto", "suggest", "review"],
+                    help="SPC 剔除模式：auto=命中即剔除(基线默认)；suggest=只标记可疑点"
+                         "不剔除、交人复核；review=按外部复核结论剔除。"
+                         "不指定时按产品档与角色自动定（多产品取严）")
+    ap.add_argument("--role", dest="role", default=None,
+                    choices=sorted((PF.ROLE_LABEL or {}) if PF is not None else {}) or None,
+                    help="使用者立场，据此施加判严尺度：process=工艺工程师（要灵敏度）"
+                         " quality=质量管理人员（要证据链与可审计）"
+                         " metrology=检测分析/设备工程师（要量纲与分辨力）。"
+                         "只补使用人没指定的参数，不覆盖他写死的值")
+    ap.add_argument("--doe-replicates", dest="doe_replicates", type=int, default=None,
                     help="DOE 每个试验号的重复次数（>=1）。不重复就没有纯误差估计，"
                          "显著性结论站不住")
-    ap.add_argument("--doe-blocks", dest="doe_blocks", type=int, default=1,
-                    help="DOE 区组数（>=1），用于隔离班次/机台/原料批等已知噪声")
-    ap.add_argument("--doe-seed", dest="doe_seed", type=int, default=0,
-                    help="DOE 运行顺序随机化种子（默认 0，保证顺序可复现；"
+    ap.add_argument("--doe-blocks", dest="doe_blocks", type=int, default=None,
+                    help="DOE 区组数（>=1），用于隔离班次/机台/原料批等已知噪声；"
+                         "不指定时按产品档取大")
+    ap.add_argument("--doe-seed", dest="doe_seed", type=int, default=None,
+                    help="DOE 运行顺序随机化种子（基线 0，保证顺序可复现；"
                          "现场排产时可另指定）")
-    ap.add_argument("--boundary-policy", dest="boundary_policy", default="warn",
+    ap.add_argument("--boundary-policy", dest="boundary_policy", default=None,
                     choices=["warn", "block"],
                     help="推断边界（缺受控出处）的处置政策：warn=出方案+警告+要求"
-                         "工艺工程师书面确认（默认）；block=直接不出方案，"
-                         "逼出那份受控规格文件")
+                         "工艺工程师书面确认（基线默认）；block=直接不出方案，"
+                         "逼出那份受控规格文件。不指定时按产品档与角色自动定"
+                         "（多产品取严：只要有一个产品要求阻断就阻断）")
     ap.add_argument("--no-xlsx", action="store_true",
                     help="不导出 Excel 结果表")
     ap.add_argument("--d2-card", default=None,
@@ -2842,6 +2937,7 @@ def main():
                   spc_exclusion_mode=args.spc_exclusion_mode,
                   doe_replicates=args.doe_replicates, doe_blocks=args.doe_blocks,
                   doe_seed=args.doe_seed, boundary_policy=args.boundary_policy,
+                  role=args.role,
                   export_xlsx=not args.no_xlsx, d2_card=args.d2_card,
                   emit_d2_card=not args.no_d2_card,
                   verbose=args.verbose, views=args.view)

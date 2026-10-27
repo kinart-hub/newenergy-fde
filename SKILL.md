@@ -48,6 +48,7 @@ python scripts/fde_run.py config                      # 可调参数清单（从
 python scripts/fde_run.py config --init --input 数据.csv  # 按真实列名生成规格待填模板
 python scripts/fde_run.py kb                          # 知识生命周期与出处覆盖率审计
 python scripts/fde_run.py ops                         # 可观测性运维视图（回读结构化日志）
+python scripts/fde_run.py config --products battery pv --role quality  # 多产品配置怎么合并的
 python scripts/static_scan.py                         # 全库静态扫描（8 类检查一次扫穿）
 python scripts/sync_install.py --check                # 核对仓库与安装目录是否一致
 ```
@@ -136,6 +137,34 @@ python scripts/fde_run.py analyze --input <数据文件> --outdir <输出目录>
 - `--doe-replicates N` DOE 每号重复次数（默认 1）。不重复就没有纯误差估计，显著性结论站不住
 - `--doe-blocks N` DOE 区组数（默认 1），用于隔离班次/机台/原料批等已知噪声
 - `--doe-seed N` DOE 运行顺序随机化种子（默认 0，保证顺序可复现）
+- `--role process|quality|metrology` 使用者立场，据此施加判严尺度：
+  `process` 工艺工程师（要灵敏度）／`quality` 质量管理人员（要证据链与可审计）／
+  `metrology` 检测分析·设备工程师（要量纲与分辨力）。角色只补你没指定的参数，
+  **不会覆盖你写死的值**
+
+多个产品（综合性租户）的配置默认值
+----------------------------------
+租户同时做两个以上产品时，各产品的配置默认值按**参数语义**合并，与书写顺序无关：
+
+| 参数类别 | 合并方式 | 理由 |
+|---|---|---|
+| 阻断类（`--boundary-policy`、`--spc-exclusion-mode`） | 取严 | 只要有一个产品要求阻断，就必须阻断 |
+| 判异规则（`--rules`）、角色视图（`--view`） | 取并集 | 多报一条是提醒，漏报一条是事故 |
+| 样本量类（`--doe-replicates`、`--doe-blocks`） | 取大 | 省下的几次试验换不来结论可信度 |
+| 关注对象（`--target`/`--process`/`--defect`） | **交人决断** | 各产品关注点不同，工具替你选等于替你决定看什么 |
+
+优先级：**你显式指定的 > 角色视角 > 产品档 > 基线**。
+需要人拍板的参数不会出现在结果里，而是进 `needs_decision` 并列出各来源给了什么。
+
+```
+python scripts/fde_run.py config --products battery pv --role quality  # 看这套配置怎么来的
+python scripts/fde_run.py config --products battery pv --cross         # 交叉搭配映射表
+python scripts/fde_run.py config --init-products --products battery pv # 生成产品档待填模板
+```
+
+产品档（`knowledge/product_profiles.json`）的默认值**一律留空由企业侧填**：
+编出来的默认值会被当成"系统给的"直接交付，那比留空危险得多。
+没填的产品全部回落基线，`config --products` 会点名哪些产品尚未配置。
 
 多个文件（上游 + 本工序）一起传入时：
 

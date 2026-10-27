@@ -1,0 +1,62 @@
+{
+  "meta": {
+    "version": "1.0.0",
+    "note": "产品配置档。defaults 内为该产品的配置默认值；未填的项回落基线，不会报错。值必须由企业侧按受控口径填写——本模板不预填任何数值，编出来的默认值会被误当成已验证的。"
+  },
+  "products": {
+    "battery": {
+      "name": "battery",
+      "defaults": {
+        "rules": null,
+        "spc_exclusion_mode": null,
+        "boundary_policy": null,
+        "doe_replicates": null,
+        "doe_blocks": null,
+        "view": null
+      },
+      "field_help": {
+        "rules": "启用的 Nelson 判异规则，如 1,2,3,5 / all / basic",
+        "spc_exclusion_mode": "剔点模式：auto=自动剔 / suggest=只提名 / review=人审核",
+        "boundary_policy": "边界政策：warn=警告放行 / block=无受控出处即阻断",
+        "doe_replicates": "DOE 重复数（整数，估纯误差用）",
+        "doe_blocks": "DOE 区组数（整数，跨班次/设备划区组）",
+        "view": "默认出哪些角色视图，逗号分隔"
+      },
+      "lifecycle": {
+        "status": "draft",
+        "evidence_level": "unknown",
+        "verified_at": null,
+        "invalidates_if": null,
+        "owner": null,
+        "note": "与知识条目同一套生命周期（见 kbstore.LIFECYCLE_FIELDS）；未复核的配置档只能当草稿，不得直接用于交付判定"
+      }
+    },
+    "pv": {
+      "name": "pv",
+      "defaults": {
+        "rules": null,
+        "spc_exclusion_mode": null,
+        "boundary_policy": null,
+        "doe_replicates": null,
+        "doe_blocks": null,
+        "view": null
+      },
+      "field_help": {
+        "rules": "启用的 Nelson 判异规则，如 1,2,3,5 / all / basic",
+        "spc_exclusion_mode": "剔点模式：auto=自动剔 / suggest=只提名 / review=人审核",
+        "boundary_policy": "边界政策：warn=警告放行 / block=无受控出处即阻断",
+        "doe_replicates": "DOE 重复数（整数，估纯误差用）",
+        "doe_blocks": "DOE 区组数（整数，跨班次/设备划区组）",
+        "view": "默认出哪些角色视图，逗号分隔"
+      },
+      "lifecycle": {
+        "status": "draft",
+        "evidence_level": "unknown",
+        "verified_at": null,
+        "invalidates_if": null,
+        "owner": null,
+        "note": "与知识条目同一套生命周期（见 kbstore.LIFECYCLE_FIELDS）；未复核的配置档只能当草稿，不得直接用于交付判定"
+      }
+    }
+  }
+}
