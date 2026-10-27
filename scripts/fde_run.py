@@ -2165,6 +2165,46 @@ def rule_product_profile_merge():
     return _r(True, "多产品配置按语义合并、冲突交人、显式优先、交叉表与角色视角可达")
 
 
+def rule_autocorrelation_chart():
+    """自相关过程必须换图，且必须说出这张图的能力边界。
+
+    判据落在**动作与算术**上：把 `cusum` 里的放大乘法删掉、把 EWMAST 换回普通
+    EWMA、把能力边界的告警删掉，都要被这条抓出来——只查"有没有这个函数"的话，
+    函数名还在而行为被换掉照样判过。
+    """
+    t = _read(SPCPy) or ""
+    p = _read(PIPELINE_FILE) or ""
+    if "def autocorrelation_diagnosis(" not in t or "def ewma_stationary(" not in t:
+        return _r(False, "缺自相关诊断或 EWMAST（lib/spc.py）")
+    # 1) CUSUM 的决策区间必须按自相关放大 —— 不放大等于把序列惯性当趋势报
+    if not re.search(r"hh\s*=\s*h\s*\*\s*sigma\s*\*\s*math\.sqrt\(_f\)", t):
+        return _r(False, "CUSUM 决策区间未按自相关放大（惯性会被当成趋势报出来）")
+    # 2) 自相关显著时管线必须换用 EWMAST，而不是继续用被放大限的普通 EWMA
+    if "SPC.ewma_stationary(" not in p:
+        return _r(False, "管线在自相关序列上未改用 EWMAST")
+    # 3) 能力边界：不给 min_detectable_shift，读者会把"没报警"读成"过程很稳"。
+    #    查**写入动作**而不是字样——只搜 "min_detectable_shift" 的话，
+    #    读取处（`(_ew or {}).get(...)`）会让整串一直存在，删掉赋值照样判过。
+    if "min_detectable_shift" not in t \
+            or not re.search(r'^\s*_acd\["min_detectable_shift"\] = ', p, flags=re.M):
+        return _r(False, "未把最小可检出偏移写进结果：自相关越强检不出越大，"
+                         "不说等于默认这张图什么都能抓到")
+    # 4) 行号/序号这类列不得进 SPC（必然自相关 r1≈1，会刷出一整排报警把真异常淹没）。
+    #    按"column_role 后几行内出现 measure/count 白名单"匹配，
+    #    不用 `[^)]*` 那种写法——它跨不过 numeric_column(c) 里的右括号，
+    #    正则静默不命中，判据就变成摆设。
+    _lines = p.splitlines()
+    _ok = False
+    for i, ln in enumerate(_lines):
+        if "QG.column_role(c," in ln:
+            for j in range(i, min(i + 3, len(_lines))):
+                if 'not in ("measure", "count")' in _lines[j]:
+                    _ok = True
+    if not _ok:
+        return _r(False, "SPC 未按列角色过滤：序号/行号列必然自相关，会把真异常淹没")
+    return _r(True, "", {"n_checks": 4})
+
+
 def rule_msa_gate():
     """测量系统能力必须真能限制结论，而不是报告末尾的一句免责。
 
@@ -3053,6 +3093,32 @@ AUDIT_RULES = [
           _mutant("未登记测量系统时沉默（把没登记当成尺子合格）",
                   _re_sub(r'\s*result\["msa_unverified"\] = MSA\.unverified_notice\(\)',
                           "", flags=re.M), PIPELINE_FILE)]),
+
+    Rule("自相关过程必须换图，并说明这张图的能力边界", rule_autocorrelation_chart,
+         "（1）lib/spc.py 有 autocorrelation_diagnosis 与 ewma_stationary；"
+         "（2）CUSUM 决策区间按自相关放大（hh = h*sigma*sqrt(F)，"
+         "不放大就是把序列惯性当趋势报）；"
+         "（3）自相关显著时管线改用 EWMAST 而非普通 EWMA"
+         "（普通 EWMA 按 F≈5.25 放大后连 3σ 阶跃都常落在限内）；"
+         "（4）结果里给出最小可检出偏移（防止把'没报警'读成'过程很稳'）；"
+         "（5）SPC 按列角色过滤，序号/行号列不得参与（必然自相关）",
+         SPCPy,
+         [_mutant("CUSUM 不按自相关放大（惯性被当趋势）",
+                  _re_sub(r"hh = h \* sigma \* math\.sqrt\(_f\)",
+                          "hh = h * sigma", flags=re.M), SPCPy),
+          _mutant("自相关时退回普通 EWMA（限被放大到抓不住东西）",
+                  _sub("SPC.ewma_stationary(vals)", "SPC.ewma(vals, mu=_mu0, sigma=_sig_long)"),
+                  PIPELINE_FILE),
+          _mutant("不再说明最小可检出偏移（没报警＝很稳的错觉）",
+                  _re_sub(r'\s*if _h3 is not None:\n\s*_acd\["min_detectable_shift"\] = _h3',
+                          "", flags=re.M), PIPELINE_FILE),
+          _mutant("SPC 不再按列角色过滤（序号列必然自相关，会刷屏）",
+                  lambda t: t.replace(
+                      '            if QG.column_role(c, work.numeric_column(c) '
+                      'if c in work.columns else None) \\\n'
+                      '                    not in ("measure", "count"):\n'
+                      '                continue\n', ""),
+                  PIPELINE_FILE)]),
 ]
 
 

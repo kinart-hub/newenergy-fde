@@ -1094,6 +1094,16 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
                 ordered.remove(c)
                 ordered.insert(0, c)
         for c in ordered[:12]:
+            # 行号/序号/列这类"和每一行都同步变化"的东西不是被测的量。
+            # 它们落在 SPC 里必然自相关（r1≈0.99）并在控制图上刷出一整排报警，
+            # 把真正的异常淹没在噪声里 —— 修できず,只有角色判据能挡住。
+            # 同一个 is_internal_column 判据也排除 __ 前缀的派生列
+            # （它在找列/分组/归因三处已经在用了）。
+            if QG.is_internal_column(c):
+                continue
+            if QG.column_role(c, work.numeric_column(c) if c in work.columns else None) \
+                    not in ("measure", "count"):
+                continue
             vals = work.numeric_column(c)
             key = col_map.get(c)
             spec = KB["params"].get(key, {}) if key else {}
@@ -1133,6 +1143,97 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
             if xc and xc.sigma_within:
                 vios = SPC.nelson_violations(xc.values, xc.center, xc.sigma_within,
                                              rules=_rules)
+            # 自相关诊断 + EWMA/CUSUM：
+            # Nelson 规则假设观测**独立**。连续涂布厚度、连铸温度这类序列相邻点
+            # 天然牵连，在这上面跑常规判异，"惯性"会被读成"连续 9 点同侧"（规则 2），
+            # 报警刷屏的最后结果是现场把图关了——比没有图更糟。
+            # 所以先测自相关，显著就自动补 EWMA（对自相关稳健）与 CUSUM（抓缓慢爬行）。
+            # 这里不给开关：用哪种图由数据的自相关证据决定，不由使用人猜。
+            _acd, _ewma_out, _cusum_out = None, None, None
+            try:
+                _acd = SPC.autocorrelation_diagnosis(vals)
+            except Exception as _ac_e:
+                degrade.note("pipeline.spc@autocorr", _ac_e)
+            if isinstance(_acd, dict) and _acd.get("significant"):
+                # 先拿 ACF 谱，再作图：**控制限要按自相关放大**，不是把数据滤平。
+                #
+                # 走过的弯路（实测，值得留下）：一开始改成"滤掉一阶自相关后对残差作图"，
+                # 误报确实压住了（200 点 135 报 → 2 报），但同一组构造数据里
+                # 后段 1.5σ 的持续漂移一条都没报出来——持续阶跃在 innovations 里
+                # 只表现为发生瞬间的一个尖峰，之后残差又回到白噪声。
+                # 也就是说：滤平的代价是把最想知道的那类失效一起滤没了。
+                # 正确口径是按 Var(z)=γ₀·λ/(2−λ)·[1+2Σ(1−λ)^k ρ_k] 放大控制限。
+                # 自相关场景的主图用 EWMAST（对阶跃灵敏，λ 经实测标定），
+                # CUSUM 仍按 Newey–West 放大后的尺度给出（对缓慢爬行灵敏）。
+                # 两张图互补：阶跃看 EWMAST，爬行看 CUSUM。
+                _acf_rows = _acd.get("acf") or []
+                _mu0 = xc.center if xc else None
+                _sig_long = None
+                try:
+                    _sig_long = S.stdev([v for v in vals if v is not None])
+                except Exception as _sd_e:
+                    degrade.note("pipeline.spc@sigma", _sd_e)
+                try:
+                    _ewst = SPC.ewma_stationary(vals)
+                    _cu = SPC.cusum(vals, mu=_mu0, sigma=_sig_long, acf=_acf_rows)
+                    # 顺便记下 AR(1) 系数：它是"这根序列记得多远"的直观刻度，
+                    # 也是判断能否靠拉大采样间隔解决问题的依据（φ 越大越要拉大）
+                    _ar1 = SPC.ar1_residuals(vals)
+                    _acd["phi"] = _ar1.get("phi")
+                except Exception as _ew_e:
+                    degrade.note("pipeline.spc@ewma", _ew_e)
+                    _ewst, _cu = None, None
+                _ew = _ewst
+
+                def _brief(d, extra=()):
+                    if not isinstance(d, dict) or d.get("status") != "OK":
+                        return None
+                    out = {"method": d.get("method"), "n_alarms": d.get("n_alarms"),
+                           "first_alarm": (d.get("alarm_indexes") or [None])[0],
+                           "alarm_indexes": (d.get("alarm_indexes") or [])[:100]}
+                    for k_ in extra:
+                        out[k_] = d.get(k_)
+                    return out
+
+                _ewma_out = _brief(_ew, ("lambda", "L"))
+                _cusum_out = _brief(_cu, ("k", "h"))
+                _acd["acf_factor_cusum"] = (_cu or {}).get("acf_factor")
+                # 能力边界要写清楚：自相关越强，能检出的最小偏移越大。
+                # 拿着一张"什么都不报"的图以为过程很稳，是这里最贵的误读。
+                _h3 = (_ew or {}).get("min_detectable_shift")
+                if _h3 is not None:
+                    _acd["min_detectable_shift"] = _h3
+                    # 可操作建议：隔多少个点采样才能让自相关降到可忽略。
+                    # 只说"降低自相关"等于没说——现场能执行的只有"少采一点、隔开采"。
+                    _thin = None
+                    try:
+                        _thin = SPC.thin_for_independence(vals)
+                    except Exception as _th_e:
+                        degrade.note("pipeline.spc@thin", _th_e)
+                    _step = ((_thin or {}).get("step") or 1)
+                    _acd["suggested_sampling_step"] = _step
+                    _acd["thinned_note"] = (_thin or {}).get("note")
+                    result.setdefault("warnings", []).append(
+                        "「%s」序列自相关（r1=%.2f，AR(1) φ=%s）：已改用 EWMAST"
+                        "（一步预测残差图）+ CUSUM（按自相关放大 %.2f 倍）代替常规 X-MR 判异。"
+                        "该图上小于 %.4g %s 的阶跃在统计上未必看得出；"
+                        "要提高灵敏度建议把采样间隔拉到 ≥ %d 个（该间隔下约 %d 个样本）"
+                        % (spec.get("name", c), _acd.get("lag1") or 0.0,
+                           round(_acd.get("phi") or 0.0, 3), (_cu or {}).get("acf_factor") or 1.0,
+                           _h3, spec.get("unit", ""), _step,
+                           len([v for v in vals if v is not None]) // max(1, _step)))
+                # 常规判异在自相关数据上不可信：把这件事说透，而不是照给报警
+                if _acd.get("recommend") == "ewma" and vios:
+                    _nviol = sum(len(v.get("indexes") or []) for v in vios)
+                    result.setdefault("warnings", []).append(
+                        "「%s」存在显著自相关（r1=%.2f）：本次常规 Nelson 判异共 %d 个异常点，"
+                        "其中部分可能只是序列惯性而非真实异常，请以 EWMA/CUSUM 结果为准"
+                        % (spec.get("name", c), _acd.get("lag1") or 0.0, _nviol))
+                result.setdefault("decisions", []).append({
+                    "kind": "spc_autocorrelated",
+                    "detail": "「%s」自相关显著（%s）：已自动追加 EWMA 与 CUSUM，"
+                              "常规 X-MR 报警仅供参考" % (spec.get("name", c),
+                                                    (_acd.get("reason") or "")[:60])})
             cap = SPC.process_capability(vals, lsl, usl, tgt,
                                          sigma_within=(xc.sigma_within if xc else None))
             if cap and p1:
@@ -1156,6 +1257,7 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
                 "sigma_overall": sd, "mean": mu,
                 "violations": vios, "capability": cap,
                 "lsl": lsl, "usl": usl, "target_value": tgt, "spec_source": _spec_src,
+                "autocorrelation": _acd, "ewma": _ewma_out, "cusum": _cusum_out,
                 "phase1": p1, "rules_used": list(_rules),
                 "exclusion_review": {
                     "mode": spc_exclusion_mode,
@@ -2444,6 +2546,31 @@ def build_report(res, work, spc_res, corr, assoc, pare, root, gaps, conf,
                       caption="%s 触发的 Nelson 判异规则" % title)
         else:
             rep.text(s4, "%s：未触发判异规则，过程处于统计受控状态。" % title)
+        # 自相关 → EWMA/CUSUM：这段紧跟在该参数的 X-MR 之后，
+        # 因为它的作用是修正读者刚看到的那些判异结论
+        _acd = d.get("autocorrelation")
+        if isinstance(_acd, dict) and _acd.get("significant"):
+            rep.callout(s4, "【自相关】%s" % (_acd.get("reason") or ""), "bad")
+            rows_ew = []
+            if d.get("ewma"):
+                rows_ew.append(["EWMA(λ=%s, L=%s)" % (d["ewma"].get("lambda"),
+                                                       d["ewma"].get("L")),
+                                d["ewma"].get("n_alarms"),
+                                d["ewma"].get("first_alarm")])
+            if d.get("cusum"):
+                rows_ew.append(["CUSUM(k=%s, h=%s)" % (d["cusum"].get("k"),
+                                                       d["cusum"].get("h")),
+                                d["cusum"].get("n_alarms"),
+                                d["cusum"].get("first_alarm")])
+            if rows_ew:
+                rep.table(s4, ["方法", "报警点数", "首个报警点"], rows_ew,
+                          caption="%s：自相关序列的补充判异（首点越小发现越早）" % title)
+                rep.callout(s4, "上表的报警点才是本序列的可靠信号：X-MR 里那些 Nelson "
+                                "报警可能只是相邻点相互牵连造成的序列惯性。"
+                                "另外，这张图上小于 %.4g %s 的阶跃在统计上未必看得出——"
+                                "要更高灵敏度需把采样间隔拉到 ≥ %s 个（或取子组均值）。"
+                                % (_acd.get("min_detectable_shift") or 0, d.get("unit") or "",
+                                   _acd.get("suggested_sampling_step") or "?"), "info")
 
     # 5 过程能力
     s5 = rep.section("5. 过程能力指数")

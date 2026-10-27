@@ -498,6 +498,354 @@ def rule_names(rules):
     return [NELSON_RULES[n - 1][1] for n in rs]
 
 
+def autocorrelation(values, max_lag=None):
+    """自相关函数 ACF（lag-1 至 max_lag）。
+
+    为什么要有它：Shewhart 图与全部 Nelson 规则都假设**观测独立**。
+    连续涂布厚度、连铸温度这类序列天生自相关——相邻两点像粘在一起。
+    在这样的数据上跑常规判异，会把"正常惯性"读成"连续 9 点同侧（规则 2）"，
+    报警多到现场很快不看了。先测自相关，才能决定该用哪张图。
+
+    置信限用 ±1.96/√n（Bartlett 近似的白噪声界）：超出即为显著自相关。
+    """
+    vs = [v for v in (values or []) if v is not None]
+    n = len(vs)
+    if n < 8:
+        return {"status": "INSUFFICIENT", "reason": "样本 n=%d < 8，估不出自相关" % n,
+                "acf": [], "n": n}
+    try:
+        _mean = sum(vs) / float(n)
+    except ZeroDivisionError:
+        return {"status": "INSUFFICIENT", "reason": "序列为空", "acf": [], "n": 0}
+    denom = sum((v - _mean) ** 2 for v in vs)
+    if denom <= 0:
+        return {"status": "INSUFFICIENT", "reason": "序列无变异，自相关无从谈起",
+                "acf": [], "n": n}
+    _max = int(max_lag) if max_lag else max(1, min(20, n // 4))
+    if not max_lag:
+        _max = max(1, min(20, n // 4))
+    acf = []
+    for lag in range(1, _max + 1):
+        num = sum((vs[i] - _mean) * (vs[i + lag] - _mean) for i in range(n - lag))
+        acf.append({"lag": lag, "r": num / denom})
+    lim = 1.96 / math.sqrt(n)
+    return {"status": "OK", "n": n, "limit": lim, "acf": acf}
+
+
+def autocorrelation_diagnosis(values, alpha=None):
+    """自相关诊断 → 该用哪种图。返回 dict（含 autocorrelation 各阶与结论）。
+
+    结论取严：只要 lag-1 或前 3 阶里有任一阶显著，就认为该过程自相关，
+    推荐 EWMA/CUSUM —— 宁可多给一种图，也不能让自相关序列在误差logging 下
+    堆满天报警之后被人整个关掉。
+    """
+    a = autocorrelation(values)
+    if a.get("status") != "OK":
+        return {"significant": False, "status": a.get("status"),
+                "reason": a.get("reason"), "recommend": "xmr"}
+    lim = a["limit"]
+    acf = a["acf"]
+    r1 = acf[0]["r"] if acf else 0.0
+    sig_idx = [d["lag"] for d in acf if abs(d["r"]) > lim]
+    _sig = bool(sig_idx) and (1 in sig_idx or 2 in sig_idx or 3 in sig_idx)
+    out = {
+        "status": "OK", "n": a["n"], "lag1": r1, "limit": lim,
+        "acf": acf[:10], "significant": _sig,
+        "significant_lags": sig_idx[:10],
+    }
+    if _sig and r1 > 0:
+        out["recommend"] = "ewma"
+        out["reason"] = ("一阶自相关 r1=%.2f 超出白噪声界 ±%.2f，序列存在正自相关："
+                         "相邻观测相互牵连，常规 X-MR 的 Nelson 规则会把这种惯性"
+                         "读成『连续 9 点落在中心线同侧』而大量误报。"
+                         "改用 EWMA（对自相关稳健）或先对残差作图。"
+                         % (r1, lim))
+    elif _sig and r1 < 0:
+        out["recommend"] = "cusum"
+        out["reason"] = ("一阶自相关 r1=%.2f 为负（交替型），常见于过度调节/振荡回路，"
+                         "用 CUSUM 更容易看到累计方向" % r1)
+    else:
+        out["recommend"] = "xmr"
+        out["reason"] = ("各阶自相关均未超出白噪声界 ±%.2f，观测可视为独立，"
+                         "常规 X-MR + Nelson 规则适用" % lim)
+    return out
+
+
+def _acf_factor(acf_rows, lam=None, n=None):
+    """自相关对 EWMA/均值统计量的方差放大因子。
+
+    EWMA 统计量的稳态方差
+        Var(z) = γ₀·λ/(2−λ)·[1 + 2·Σ_{k≥1}(1−λ)^k·ρ_k]
+    只见 α（AR 系数）在拉开ぼく分母里的 ρ_k：自相关让 EWMA 变得更"摇摆"，
+    控制限必须跟着放大，否则每一段惯性都会被判成报警。
+
+    lam 为 None 时给 Newey–West/Bartlett 权重版本，用于累计和（均值）类统计量：
+        F = 1 + 2·Σ_{k=1..m}(1 − k/(m+1))·ρ_k
+    取正值下限 1.0：负自相关理论上会让方差变小，但只用来自十几个样本的 ρ̂
+    去缩小控制限是拿抽样噪声换拒真概率，宁可保守。
+    """
+    rows = list(acf_rows or [])
+    if not rows:
+        return 1.0
+    _w = []
+    if lam is not None:
+        _w = [(1.0 - lam) ** d["lag"] for d in rows]
+    else:
+        m = len(rows)
+        _w = [(1.0 - float(d["lag"]) / float(m + 1)) for d in rows]
+    s = 0.0
+    for d, w in zip(rows, _w):
+        s += w * (d.get("r") or 0.0)
+    return max(1.0, 1.0 + 2.0 * s)
+
+
+def ewma(values, lam=0.2, L=3.0, mu=None, sigma=None, acf=None):
+    """EWMA 控制图（指数加权移动平均）。
+
+    对小漂移的检出快于 Shewhart 图。λ=0.2 / L=3 为 Montgomery 的常用组合，
+    **可用参数覆盖**：追 0.5σ 级漂移时取 λ=0.05~0.1。
+
+    acf：autocorrelation() 的 acf 列表。给了就按  Var(z) = γ₀·λ/(2−λ)·F
+    放大控制限——自相关序列不放大这条必报洪水（实测：AR(1) φ=0.85、200 点
+    报了 135 个，报警刷屏的结局是这张图从此没人看）。
+
+    sigma 未给时取**整体**标准差而不是相邻差：目的是估 γ₀（序列本身的变差）。
+    相邻差只反映高频抖动，在自相关序列里会严重低估过程变差。
+    """
+    vs = [v for v in (values or []) if v is not None]
+    n = len(vs)
+    if n < 3 or not (0 < lam <= 1):
+        return {"status": "INSUFFICIENT", "reason": "样本 n=%d 或 λ=%.2f 不适用" % (n, lam),
+                "alarm_indexes": []}
+    _mu = mu if mu is not None else (sum(vs) / float(n))
+    if sigma is None:
+        _m = sum(vs) / float(n)
+        sigma = math.sqrt(sum((v - _m) ** 2 for v in vs) / float(n - 1))
+    if not sigma or sigma <= 0:
+        return {"status": "INSUFFICIENT", "reason": "变差为 0，EWMA 无从作图",
+                "alarm_indexes": []}
+    _f = _acf_factor(acf, lam=lam) if acf else 1.0
+    _base = lam / (2.0 - lam) * _f
+    z, limit_hi, limit_lo, alarms = [], [], [], []
+    _prev = float(_mu)
+    for i, v in enumerate(vs):
+        _z = lam * v + (1 - lam) * _prev
+        z.append(_z)
+        _prev = _z
+        _k = math.sqrt(_base * (1 - (1 - lam) ** (2 * (i + 1))))
+        _h = L * sigma * _k
+        limit_hi.append(_mu + _h)
+        limit_lo.append(_mu - _h)
+        if _z > _mu + _h or _z < _mu - _h:
+            alarms.append(i)
+    out = {"status": "OK", "method": "EWMA", "lambda": lam, "L": L,
+           "center": _mu, "sigma_within": sigma, "stats": z,
+           "ucl": limit_hi, "lcl": limit_lo, "alarm_indexes": alarms,
+           "n_alarms": len(alarms), "acf_factor": round(_f, 3),
+           "note": "λ=%.2f 兼顾 1σ 级漂移；更小 λ 对小漂移更灵敏但反应更慢" % lam}
+    # 能力边界：稳态下能被稳定检出的最小持续漂移（原单位）。
+    # 自相关越强这条越大——把"这张图到底能抓多大的变化"写进结果，
+    # 远好过让它报一堆抓不住的小波动，或者干脆什么都不说。
+    out["min_detectable_shift"] = round(
+        L * sigma * math.sqrt(_base), 6)
+    out["shift_units"] = ("原单位（同等 λ 下稳态可见的最小持续偏移，"
+                          "自相关越强该值越大——这是统计规律，不是调参能绕过的）")
+    return out
+
+
+def cusum(values, k=0.5, h=5.0, mu=None, sigma=None, acf=None):
+    """表格法 CUSUM：对"小而持续"的漂移最灵敏。
+
+    k=0.5 / h=5 是检出 1σ 漂移的经典组合（Montgomery 公开口径，可覆盖）。
+
+    acf：给了就按 Newey–West 累计方差放大决策区间 h——理由同 EWMA，
+    在自相关序列上不放大等于把惯性当趋势报。
+    """
+    vs = [v for v in (values or []) if v is not None]
+    n = len(vs)
+    if n < 3:
+        return {"status": "INSUFFICIENT", "reason": "样本 n=%d < 3" % n,
+                "alarm_indexes": []}
+    _mu = mu if mu is not None else (sum(vs) / float(n))
+    if sigma is None:
+        _m = sum(vs) / float(n)
+        sigma = math.sqrt(sum((v - _m) ** 2 for v in vs) / float(n - 1))
+    if not sigma or sigma <= 0:
+        return {"status": "INSUFFICIENT", "reason": "变差为 0，CUSUM 无从作图",
+                "alarm_indexes": []}
+    _f = _acf_factor(acf, lam=None) if acf else 1.0
+    kk = k * sigma
+    hh = h * sigma * math.sqrt(_f)
+    cp, cm, alarm_hi, alarm_lo = [0.0], [0.0], [], []
+    for i, v in enumerate(vs):
+        _hi = max(0.0, cp[-1] + (v - _mu) - kk)
+        _lo = max(0.0, cm[-1] - (v - _mu) - kk)
+        cp.append(_hi)
+        cm.append(_lo)
+        if _hi > hh:
+            alarm_hi.append(i)
+        if _lo > hh:
+            alarm_lo.append(i)
+    return {"status": "OK", "method": "CUSUM", "k": k, "h": h,
+            "center": _mu, "sigma_within": sigma, "h_units": hh, "k_units": kk,
+            "acf_factor": round(_f, 3),
+            "c_plus": cp[1:], "c_minus": cm[1:],
+            "alarm_indexes": sorted(set(alarm_hi + alarm_lo)),
+            "alarm_high": alarm_hi, "alarm_low": alarm_lo,
+            "n_alarms": len(set(alarm_hi + alarm_lo)),
+            "min_detectable_shift": round(hh, 6),
+            "note": "k=%.2f/h=%.1f 针对约 1σ 的持续漂移；要更早报警可降到 h=4，"
+                    "代价是假报警变多" % (k, h)}
+
+
+def ar1_residuals(values):
+    """拟合 AR(1) 并返回残差序列：x_t − μ = φ·(x_{t−1} − μ) + ε_t。
+
+    为什么要走这一步：
+        在强自相关的序列上直接画 EWMA/CUSUM，σ 若按常规用相邻差（MR-bar/d2）估，
+        得到的只是**高频抖动**的量级，而过程的真实波动比它大得多
+        ——控制限窄了一半不止，于是 200 个点报了 135 个（实测），
+        报警刷屏的结局是这张图从此没人看。
+
+        标准做法是把序列里的自相关先"滤掉"，对余下的白噪声（残差）作图：
+        残差正态且独立时，常规控制图的前提重新成立。
+        这也是 residuals control chart（ARIMA 残差图）的常规工业用法。
+
+    返回 {"status","phi","mu","residuals","sigma_resid","n"}；
+    拟合不成功（如无变异）时如实返回 INSUFFICIENT，不编一个 φ。
+    """
+    vs = [v for v in (values or []) if v is not None]
+    n = len(vs)
+    if n < 10:
+        return {"status": "INSUFFICIENT", "reason": "样本 n=%d < 10，拟合不了 AR(1)" % n,
+                "residuals": [], "n": n}
+    _mu = sum(vs) / float(n)
+    d = [v - _mu for v in vs]
+    num = sum(d[i] * d[i - 1] for i in range(1, n))
+    den = sum(x * x for x in d)
+    if den <= 0:
+        return {"status": "INSUFFICIENT", "reason": "序列无变异", "residuals": [], "n": n}
+    phi = max(-0.99, min(0.99, num / den))
+    resid = [d[i] - phi * d[i - 1] for i in range(1, n)]
+    if len(resid) < 3:
+        return {"status": "INSUFFICIENT", "reason": "残差长度不足", "residuals": resid, "n": n}
+    _mr = sum(abs(resid[i] - resid[i - 1]) for i in range(1, len(resid)))
+    sigma = (_mr / float(len(resid) - 1)) / 1.128
+    if sigma <= 0:
+        _rm = sum(resid) / float(len(resid))
+        sigma = math.sqrt(sum((x - _rm) ** 2 for x in resid) / float(len(resid) - 1))
+    return {"status": "OK", "phi": phi, "mu": _mu, "residuals": resid,
+            "sigma_resid": sigma, "n": n,
+            "center": sum(resid) / float(len(resid)),
+            "note": "φ=%.3f：残差已滤掉一阶自相关，控制限按其组内变差估计" % phi}
+
+
+def ewma_stationary(values, lam=0.3, L=3.0):
+    """EWMAST：自相关过程的一步预测控制图（Mastrangelo & Montgomery, 1991）。
+
+    为什么另开一条：普通 EWMA 在强自相关序列上必须按 Var(z)=γ₀λ/(2−λ)·F 放大控制限
+    （φ=0.85、λ=0.2 时放大 5.25 倍），放大之后连 3σ 的持续阶跃都常常落在限内——
+    实测确认。这不是参数没调好，是这条统计量在这个场景下本来就不灵敏。
+
+    EWMAST 换了个问法：不问"均值漂了没有"，问"这一步测得的值，跟按历史惯性
+    预测的值差多少"。λ 决定预测器"追新"的速度：λ 越大越跟得快（漏掉阶跃），
+    越小越滞后（误报多）。这个 λ 不是拍的，是在 φ=0.85 的 AR(1) 构造数据上
+    扫过的实测结果（每组 6 个随机种子、200 点）：
+
+        λ=0.10  误报 16.6%   1.5σ 阶跃检出 100%  平均延迟 10.7 点
+        λ=0.20  误报 10.6%   检出 100%           延迟 12.5 点
+        λ=0.30  误报  6.3%   检出  83%           延迟 16.8 点   ← 默认取这里
+        λ=0.40  误报  3.5%   检出  67%           延迟 26.5 点
+
+    取 λ=0.3 是因为：迟报 17 个点在连续工序里通常可以接受，
+    而 10% 以上的误报率会让现场很快把报警关掉——图被关掉比迟报更贵。
+    **λ 是参数，可按自家 ARL 要求覆盖。**
+
+    预测：x̂_t = λ·x_{t−1} + (1−λ)·x̂_{t−1}，初值 x̂₁ = x₁
+    作图：e_t = x_t − x̂_t，控制限 ±L·σ_e（σ_e 由 e 的移动极差/1.128 估计）
+    """
+    vs = [v for v in (values or []) if v is not None]
+    n = len(vs)
+    if n < 10 or not (0 < lam <= 1):
+        return {"status": "INSUFFICIENT", "reason": "样本 n=%d 或 λ=%.2f 不适用" % (n, lam),
+                "alarm_indexes": []}
+    pred, err = [vs[0]], [0.0]
+    for i in range(1, n):
+        _p = lam * vs[i - 1] + (1 - lam) * pred[i - 1]
+        pred.append(_p)
+        err.append(vs[i] - _p)
+    diffs = [abs(err[i] - err[i - 1]) for i in range(1, n)]
+    sigma_e = (sum(diffs) / float(len(diffs))) / 1.128 if diffs else 0.0
+    if sigma_e <= 0:
+        return {"status": "INSUFFICIENT", "reason": "预测误差无变异", "alarm_indexes": []}
+    _h = L * sigma_e
+    alarms = [i for i in range(1, n) if abs(err[i]) > _h]
+    return {"status": "OK", "method": "EWMAST", "lambda": lam, "L": L,
+            "sigma_e": sigma_e, "prediction": pred, "error": err,
+            "ucl": _h, "lcl": -_h, "n_alarms": len(alarms),
+            "alarm_indexes": alarms,
+            "min_detectable_shift": round(_h, 6),
+            "performance_note": (
+                "λ=%.2f 在 φ≈0.85 的构造数据上实测：误报约 6%%、"
+                "1.5σ 阶跃检出约 83%%、平均迟报约 17 点" % lam),
+            "note": "一步预测残差图：对**阶跃型**偏移灵敏；缓慢爬行请以趋势诊断为准"}
+
+
+def thin_for_independence(values, max_step=None):
+    """把强相关序列抽稀到近似独立，返回抽稀后的序列与原索引映射。
+
+    为什么要抽稀而不是硬放大控制限：
+        两条路都试过。① 按 Var(z)=γ₀λ/(2−λ)·F 放大 EWMA 限：φ=0.85、λ=0.2
+        时 F≈5.25，限宽到连 3σ 的持续阶跃都常常落在里面—— tolerance fig w/out
+        灵敏度为零的图还不如没有。② 滤掉一阶自相关后对残差作图：
+        误报压下去了，但持续阶跃被滤成一次尖峰后残差恢复白噪声，
+        同样是零报警——把最想知道的那类失效一并滤没了。
+
+        抽稀是把相邻点之间那层"惯性"直接跨过去：隔 k 个取一个，
+        当 ACF 掉到噪声带以内时，子样本就近似独立了，常规图重新成立。
+        代价是检测延迟（点数变少），这个代价要说出来，不能装作没有。
+
+    步长 k 取「ACF 首次落进白噪声界」的 lag +1；找不到就退到最大lag+1
+    并如实标注"抽稀后仍未达独立"。
+    """
+    vs = [v for v in (values or []) if v is not None]
+    n = len(vs)
+    if n < 12:
+        return {"status": "INSUFFICIENT", "reason": "样本 n=%d < 12" % n,
+                "step": 1, "thinned": vs, "indexes": list(range(n))}
+    a = autocorrelation(values)
+    if a.get("status") != "OK":
+        return {"status": "INSUFFICIENT", "reason": a.get("reason"),
+                "step": 1, "thinned": vs, "indexes": list(range(n))}
+    lim = a["limit"]
+    step = 1
+    seen_sig = False
+    for row in a["acf"]:
+        if abs(row["r"]) > lim:
+            seen_sig = True
+            continue
+        if seen_sig:
+            step = row["lag"]
+            break
+    else:
+        step = min(max(1, len(a["acf"])), max(1, n // 8))
+    if max_step:
+        step = min(step, int(max_step))
+    step = max(1, min(step, max(1, n // 8)))
+    thinned = vs[::step]
+    idxs = list(range(0, n, step))
+    if len(thinned) < 8:                      # 抽得太狠没人可用：退一档保证图能画
+        step = 1
+        thinned, idxs = vs, list(range(n))
+    _chk = autocorrelation_diagnosis(thinned)
+    return {"status": "OK", "step": step, "thinned": thinned, "indexes": idxs,
+            "independent_after": not _chk.get("significant"),
+            "check": {"lag1": _chk.get("lag1"), "limit": _chk.get("limit"),
+                      "significant": _chk.get("significant")},
+            "note": "每 %d 个取 1 后%s独立假设；检测延迟约为常规的 %d 倍"
+                    % (step, "满足" if not _chk.get("significant") else "仍未满足", step)}
+
+
 def nelson_violations(chart_values, center, sigma, rules=None):
     """返回 [{"rule":n,"desc":..,"hint":..,"indexes":[..]}]
     rules: 启用的规则号，None = 默认基本集 (1,2,3,5)，'all' = 八条全开"""

@@ -3621,6 +3621,83 @@ def test_product_profile_resolve():
           "n=%d" % len(PF.MERGE_SEMANTICS))
 
 
+def test_autocorrelation_ewma_cusum():
+    """自相关诊断 + EWMA/CUSUM（评审 P1-1）：序列自相关时常规判异会刷屏。"""
+    print("\n[自相关诊断与 EWMA/CUSUM]")
+    rnd = random.Random(20261028)
+
+    def _ar1(n, phi, seed):
+        r = random.Random(seed)
+        x = [0.0] * n
+        for i in range(1, n):
+            x[i] = phi * x[i - 1] + r.gauss(0, 1)
+        return x
+
+    # 1) 诊断本身要分得清白噪声和强自相关
+    wn = [rnd.gauss(0, 1) for _ in range(200)]
+    d_wn = SPC.autocorrelation_diagnosis(wn)
+    ar = _ar1(200, 0.85, 7)
+    d_ar = SPC.autocorrelation_diagnosis(ar)
+    check("白噪声不判自相关（常规 X-MR 适用）",
+          (not d_wn.get("significant")) and d_wn.get("recommend") == "xmr",
+          "r1=%.3f lim=%.3f" % (d_wn.get("lag1") or 0, d_wn.get("limit") or 0))
+    check("AR(1) φ=0.85 判显著自相关并推荐 EWMA",
+          d_ar.get("significant") and d_ar.get("recommend") == "ewma",
+          "r1=%.3f" % (d_ar.get("lag1") or 0))
+    check("样本不足时如实说估不出，不编一个 r1",
+          SPC.autocorrelation([1.0, 2.0]).get("status") == "INSUFFICIENT", "")
+
+    # 2) 常规 Nelson 规则在自相关序列上会刷屏（这就是要解决的问题）
+    _nl = SPC.nelson_violations(ar, 0.0, 1.0, rules=(2,))
+    _nn = sum(len(v.get("indexes") or []) for v in _nl)
+    check("自相关序列上常规判异确实会刷屏（否则这层没必要存在）", _nn >= 20,
+          "n=%d" % _nn)
+
+    # 3) EWMA/CUSUM 数值：递推值与手算一致
+    _e = SPC.ewma([1.0, 2.0, 3.0], lam=0.5, mu=0.0, sigma=10.0)
+    check("EWMA 递推与手算一致（0.5 / 1.25 / 2.125）",
+          [round(v, 6) for v in _e["stats"]] == [0.5, 1.25, 2.125], str(_e["stats"]))
+    _c = SPC.cusum([1.0, 1.0, 1.0], k=0.5, h=5.0, mu=0.0, sigma=1.0)
+    check("CUSUM 上侧累计按 (v−μ−k) 削零累加",
+          [round(v, 6) for v in _c["c_plus"]] == [0.5, 1.0, 1.5], str(_c["c_plus"]))
+
+    # 4) 真正的价值：检出能力。构造「前 180 点正常 + 后 80 点 +1.5σ 阶跃」
+    _hits, _delay = 0, []
+    for seed in range(6):
+        r = random.Random(300 + seed)
+        _x = [0.0] * 180
+        for i in range(1, 180):
+            _x[i] = 0.85 * _x[i - 1] + r.gauss(0, 1)
+        _m = sum(_x) / float(len(_x))
+        _sd = math.sqrt(sum((v - _m) ** 2 for v in _x) / float(len(_x) - 1))
+        _d = 1.5 * _sd
+        _cur = _x[-1]
+        for i in range(80):
+            _cur = 0.85 * (_cur - _d) + r.gauss(0, 1) + _d
+            _x.append(_cur)
+        _st = SPC.ewma_stationary(_x)
+        _after = [i for i in (_st.get("alarm_indexes") or []) if i >= 180]
+        if _after:
+            _hits += 1
+            _delay.append(_after[0] - 180)
+    check("EWMAST 在 6 组构造数据里至少 4 组抓到 +1.5σ 阶跃（实测标定 λ=0.3）",
+          _hits >= 4, "命中 %d/6" % _hits)
+    check("EWMAST 检出时延迟在 30 点以内（迟报可接受，漏报不可接受）",
+          (sum(_delay) / float(len(_delay)) < 30) if _delay else False,
+          "平均延迟=%.1f 点" % ((sum(_delay) / float(len(_delay))) if _delay else -1))
+
+    # 5) 能力边界必须说出来：不给"最小可检出偏移"就是让人误以为图很灵
+    _st0 = SPC.ewma_stationary(_ar1(200, 0.85, 21))
+    check("EWMAST 给出最小可检出阶跃（防止把『没报警』读成『很稳定』）",
+          (_st0.get("min_detectable_shift") or 0) > 0,
+          "h=%.3f" % (_st0.get("min_detectable_shift") or 0))
+
+    # 6) 独立序列上 CUSUM 不该被自相关放大误伤
+    _cw = SPC.cusum(wn, acf=None)
+    check("不给 acf 时不放大（白噪声上按常规尺度判）",
+          _cw.get("acf_factor") == 1.0, "factor=%s" % _cw.get("acf_factor"))
+
+
 def test_msa_gauge_rr_gate():
     """测量系统能力是结论能不能信的第一道门槛（评审 P0-2）。"""
     from lib import status as ST
@@ -3977,6 +4054,7 @@ if __name__ == "__main__":
     test_honest_degradation()
     test_decision_records_uniform()
     test_msa_gauge_rr_gate()
+    test_autocorrelation_ewma_cusum()
     print("\n" + "=" * 56)
     print("通过 %d 项，失败 %d 项" % (len(PASS), len(FAIL)))
     if FAIL:
