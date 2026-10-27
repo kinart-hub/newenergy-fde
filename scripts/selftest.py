@@ -27,6 +27,7 @@ try:
 except Exception:
     pass
     # scan:keep stdout 编码兜底在模块加载期执行，degrade 尚未导入；且非 Windows 环境没有 reconfigure 属正常分支，不是降级。
+import random
 import io
 import math
 import re
@@ -44,6 +45,7 @@ from lib import table as T, stats as S, spc as SPC, doe as DOE, \
 from lib import kbstore as KBS
 from lib import observ as OBS
 from lib import profile as PF
+from lib import msa as MSA
 from lib import degrade as DG
 
 PASS, FAIL = [], []
@@ -3619,6 +3621,104 @@ def test_product_profile_resolve():
           "n=%d" % len(PF.MERGE_SEMANTICS))
 
 
+def test_msa_gauge_rr_gate():
+    """测量系统能力是结论能不能信的第一道门槛（评审 P0-2）。"""
+    from lib import status as ST
+    print("\n[测量系统 Gauge R&R 门槛]")
+
+    # 1) 数值：构造已知方差分量的平衡设计，看估计是否站得住
+    rnd = random.Random(20261028)
+    sig_p, sig_o, sig_e = 20.0, 2.0, 0.5
+    _parts = [rnd.gauss(0, sig_p) for _ in range(20)]
+    _ops = [rnd.gauss(0, sig_o) for _ in range(4)]
+    tri = [("P%02d" % i, "OP%d" % j, 100.0 + pv + ov + rnd.gauss(0, sig_e))
+           for i, pv in enumerate(_parts) for j, ov in enumerate(_ops)
+           for _k in range(3)]
+    g = MSA.gauge_rr(tri)
+    _true = 100.0 * math.sqrt(sig_o ** 2 + sig_e ** 2) / math.sqrt(
+        sig_p ** 2 + sig_o ** 2 + sig_e ** 2)
+    check("交叉型 GRR 能算出结果", g.get("status") == ST.SUCCESS,
+          "reason=%s" % (g.get("reason") or ""))
+    check("重复性估计对得上构造值（5.15σe=%.2f）" % (5.15 * sig_e),
+          abs(g.get("ev", 0) - 5.15 * sig_e) < 0.6, "ev=%s" % g.get("ev"))
+    check("%%GRR 落在构造真值 %.1f%% 附近（±6 个百分点）" % _true,
+          abs(g.get("pct_grr", 999) - _true) < 6.0, "pct=%s" % g.get("pct_grr"))
+    check("分级与%%GRR一致：%s → %s" % (g.get("pct_grr"), g.get("level")),
+          g.get("level") in ("acceptable", "marginal"),
+          "level=%s action=%s" % (g.get("level"), g.get("action")))
+
+    # 2) 算不了的时候必须如实说算不了，不能给近似数
+    _unbal = ([("P1", "A1", 1.0), ("P1", "A2", 1.1), ("P2", "A1", 2.0),
+               ("P2", "A2", 2.1), ("P2", "A2", 2.2)])
+    check("不平衡设计不给近似 GRR（宁可承认算不了）",
+          MSA.gauge_rr(_unbal).get("status") == ST.INSUFFICIENT_DATA, "")
+    check("读数全同不算出一个百分比（避免除以 0 得 nan）",
+          MSA.gauge_rr([("P1", "A1", 1.0), ("P1", "A2", 1.0),
+                        ("P2", "A1", 1.0), ("P2", "A2", 1.0),
+                        ("P1", "A1", 1.0), ("P1", "A2", 1.0),
+                        ("P2", "A1", 1.0), ("P2", "A2", 1.0)]).get("status")
+          == ST.INSUFFICIENT_DATA, "")
+
+    # 3) 分级：阈值 + ndc 双证据，取严
+    check("%GRR>30% 判不可接受（action=block）",
+          MSA.classify(45.0, None)["action"] == "block", "")
+    check("10–30% 判有条件接受（action=warn）",
+          MSA.classify(18.0, None)["action"] == "warn", "")
+    check("<10% 且 ndc 够：可接受（action=pass）",
+          MSA.classify(6.0, 8)["action"] == "pass", "")
+    check("%GRR 合格但 ndc<5 也要降级处理（两条独立证据取严）",
+          MSA.classify(6.0, 3)["level"] == "marginal"
+          and MSA.classify(6.0, 3)["action"] == "warn", "")
+    check("分级口径可被子企业管控标准覆盖（threshold 不固化）",
+          MSA.classify(45.0, None, grading={"marginal_max": 50.0})["action"] == "warn",
+          "")
+
+    # 4) 结论侧：三档限制真的落到根因结果上
+    _base = {"candidates": [{"param_name": "烘箱二区温度", "score": 0.6}],
+             "all_candidates": [{"param_name": "烘箱二区温度", "score": 0.6}],
+             "five_why": [{"level": 1, "why": "？"}], "status": ST.SUCCESS}
+    b = MSA.apply_msa_limit(dict(_base), {"action": "block", "level": "unacceptable",
+                                          "pct_grr": 45.0, "ndc": 2.0, "reason": "R"})
+    check("block：候选、兜底候选一并清空（只清 candidates 会被下游捞回来）",
+          not b.get("candidates") and not b.get("all_candidates"),
+          "n=%d/%d" % (len(b.get("candidates") or []),
+                       len(b.get("all_candidates") or [])))
+    check("block：5Why 一并封存（否则'指向某参数'换个地方又把结论说了一遍）",
+          not b.get("five_why"), "n=%d" % len(b.get("five_why") or []))
+    check("block：状态改 INSUFFICIENT_DATA 并给出整改要求",
+          b.get("status") == ST.INSUFFICIENT_DATA and b.get("what_to_provide"),
+          "status=%s" % b.get("status"))
+    w = MSA.apply_msa_limit(dict(_base), {"action": "warn", "level": "marginal",
+                                          "pct_grr": 18.0, "reason": "R"})
+    check("warn：候选保留但每条挂分辨力限制注记",
+          len(w.get("candidates") or []) == 1
+          and all(c.get("msa_note") for c in w["candidates"]), "")
+    p_ = MSA.apply_msa_limit(dict(_base), {"action": "pass", "level": "acceptable",
+                                           "pct_grr": 6.0, "reason": "R"})
+    check("pass：结论不受影响，且写明变差可归因于过程本身",
+          len(p_.get("candidates") or []) == 1 and p_.get("msa_note"), "")
+
+    # 5) 从未做过测量系统分析：必须说出"这条从未被验证过"
+    un = MSA.unverified_notice()
+    check("未登记时有前置提示，且给出怎么验", bool(un.get("note")) and un.get("to_verify"),
+          "")
+
+    # 6) 自动识别：产线表里同一件被多人重复测 → 认得出 crossed 结构
+    rows, cols = [], ["样品编号", "检验员", "厚度"]
+    for i in range(6):
+        for j in range(2):
+            for k in range(2):
+                rows.append(["S%02d" % i, "I%d" % j, 100.0 + i * 0.5 + j * 0.1 + k * 0.01])
+    st = MSA.detect_msa_structure(T.Table(cols, rows), target_col="厚度")
+    check("自动认出重复测量结构（样品/检验员/测量值）",
+          bool(st) and st.get("part_col") == "样品编号" and st.get("value_col") == "厚度",
+          str(st and {k: st.get(k) for k in ("part_col", "appraiser_col", "kind")}))
+    _r = MSA.from_table(T.Table(cols, rows), st.get("part_col"),
+                        st.get("appraiser_col"), st.get("value_col")) if st else {}
+    check("按识别出的列能算出 GRR", (_r or {}).get("pct_grr") is not None,
+          "pct=%s" % (_r or {}).get("pct_grr"))
+
+
 def test_boundary_policy_evidence():
     """边界政策必须由受控规格证据推导，不能留给使用人拍板。
 
@@ -3876,6 +3976,7 @@ if __name__ == "__main__":
     test_boundary_policy_evidence()
     test_honest_degradation()
     test_decision_records_uniform()
+    test_msa_gauge_rr_gate()
     print("\n" + "=" * 56)
     print("通过 %d 项，失败 %d 项" % (len(PASS), len(FAIL)))
     if FAIL:

@@ -60,6 +60,10 @@ if __package__ in (None, ""):
     except Exception:
         EV = None
         _HAS_EVENTS = False
+    try:                    # P0-2 测量系统分析；失败只丢掉"结论能不能信"的门槛，不拖垮流水线
+        from lib import msa as MSA
+    except Exception:
+        MSA = None
     try:                    # v1.13 8D 引擎
         from lib import eightd as EV8D
         _HAS_8D = True
@@ -79,6 +83,10 @@ else:
         from . import profile as PF
     except Exception:
         PF = None
+    try:                    # P0-2 测量系统分析（同上）
+        from . import msa as MSA
+    except Exception:
+        MSA = None
     try:
         from . import events as EV
         _HAS_EVENTS = True
@@ -360,8 +368,8 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
             spc_exclusion_mode=None,
             doe_replicates=None, doe_blocks=None, doe_seed=None, boundary_policy=None,
             role=None, controlled_spec=None,
-            export_xlsx=True, d2_card=None, emit_d2_card=True, verbose=False,
-            views=None):
+            msa_spec=None, export_xlsx=True, d2_card=None, emit_d2_card=True,
+            verbose=False, views=None):
     """
     auto_adapt —— 字段认不出来时，把"新别名/新参数"自动登记到**租户层**并当场生效。
                   默认关闭：知识库条目还是应该过一遍人。开了也不会碰到基线。
@@ -380,6 +388,12 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
     views       —— 角色视角：process/shopfloor/quality/production/mgmt，或 ["all"]。
                    视角层只做筛选与措辞，不重算——五类使用者各拿一份能直接用的东西，
                    而不是都在同一份大而全的报告里自己翻。
+    msa_spec    —— 测量系统（Gauge R&R）登记 dict。三种给法：
+                     {"path": "msa.csv"}                       读专用 MSA 表，自动认列
+                     {"path": ..., "part/appraiser/value": 列名}   显式指定列
+                     {"pct_grr": 18.0, "ndc": 4}              直接登记已有 GRR 结论
+                   给不出就不登记——**未登记不等于合格**：那时结论会带上
+                   "未验证测量系统"的前置提示，而不是悄悄当作尺子准。
     """
     try:
         from . import tenancy as TN
@@ -1383,6 +1397,40 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
                 if root and not (result.get("spatial_clusters") or []):
                     root["candidates"] = []
                     root["negative_verdict"] = _nv
+        # ---- 测量系统门槛（MSA）：结论能不能信的第一道门槛 ----------------
+        #
+        # 放在根因之后、落结果之前，是因为它限制的就是根因结论本身。
+        # 之前"测量系统未验证"只是报告结尾的一句免责声明——
+        # 写在最后的免责，等于告诉读报告的人"上面那些你可以放心相信"。
+        # 现在：%GRR 超标直接清空根因榜（IMA MSA 分级>30%），
+        #       处在 10–30% 就在每条候选上挂限制注记，
+        #       压根没登记则把提示提到根因章节之前。
+        try:
+            _msa = _resolve_msa(msa_spec, table=work, target=y_col)
+        except Exception as _msa_e:
+            degrade.note("pipeline.msa@resolve", _msa_e)
+            _msa = {"kind": "error",
+                    "reason": "测量系统数据解析失败：%s（按未登记处理，"
+                              "结论不得作为调整工艺的依据）" % _msa_e}
+        if isinstance(_msa, dict) and _msa.get("kind") == "error":
+            result["msa_error"] = _msa.get("reason")
+            result.setdefault("warnings", []).append(_msa.get("reason"))
+            _msa = None
+        if isinstance(_msa, dict) and _msa.get("action") in ("block", "warn", "pass"):
+            if root:
+                root = MSA.apply_msa_limit(root, _msa)
+            if _msa.get("action") == "block":
+                result.setdefault("decisions", []).append({
+                    "kind": "msa_blocked",
+                    "detail": "测量系统不合格，根因结论不予出具：%s" % _msa.get("reason")})
+                result.setdefault("warnings", []).append(
+                    "⚠ 测量系统能力不足，本次未出根因结论：%s" % _msa.get("reason"))
+            elif _msa.get("action") == "warn":
+                result.setdefault("warnings", []).append(
+                    "测量系统仅有条件接受：%s。结论须标注受分辨力限制" % _msa.get("reason"))
+        else:
+            result["msa_unverified"] = MSA.unverified_notice()
+        result["msa"] = _msa
         result["rootcause"] = root
         gaps = RC.assess_gaps(work, defect_name, y_col, groups)
         conf = RC.confidence_level(gaps, sum(1 for a in assoc if a.get("significant")))
@@ -1864,6 +1912,82 @@ def _pick_redundant(c1, c2, r1, r2, kb=None):
     if r2 > r1:
         return c1
     return max(c1, c2)                               # 完全持平时给个确定答案
+
+
+def _resolve_msa(spec, table=None, target=None):
+    """把「测量系统登记」解析成结论 dict（含 action）。没人登记过就返回 None。
+
+    为什么宁可返回 None 也不返回一个"默认合格"：
+        "没登记"和"量过了、合格"在工具眼里必须长得不一样。
+        返回默认值等于替使用人宣布"尺子没问题"，而没有任何证据支持这句话。
+        （读表失败同理 —— 那读不出来是事故，不是事实。）
+
+    三种给法：
+        {"path": ...}                        专用 MSA 表（自动或显式认列）
+        {"pct_grr": 18.0, "ndc": 4, ...}     直接登记企业已有的 GRR 结论
+        不给                                  尝试从主数据自动识别重复测量结构
+    """
+    if MSA is None:
+        return None
+    if isinstance(spec, dict) and spec.get("pct_grr") is not None:
+        try:
+            _pct = float(spec["pct_grr"])
+        except (TypeError, ValueError):
+            return {"kind": "error",
+                    "reason": "登记的 pct_grr 不是数字：%r（按未登记处理）" % (spec.get("pct_grr"),)}
+        _lv = MSA.classify(_pct, spec.get("ndc"), grading=spec.get("grading"))
+        out = {"status": ST.SUCCESS, "method": "registered",
+               "pct_grr": round(_pct, 2), "ndc": spec.get("ndc"),
+               "source": spec.get("source") or "企业登记",
+               "doc_id": spec.get("doc_id"), "review_by": spec.get("review_by"),
+               "note": "登记值由企业出具、本工具未重算；分级按 AIAG MSA 公开口径"}
+        out.update(_lv)
+        return out
+
+    _path = spec.get("path") if isinstance(spec, dict) else spec
+    if _path:
+        _tb = T.read_any(_path)
+        if _tb is None:
+            return {"kind": "error",
+                    "reason": "测量系统数据读不出来：%s（未纳入本次判定，"
+                              "按未登记处理——读不出来是事故，不能当作企业没做）"
+                              % _path}
+        _part = spec.get("part") if isinstance(spec, dict) else None
+        _appr = spec.get("appraiser") if isinstance(spec, dict) else None
+        _val = spec.get("value") if isinstance(spec, dict) else None
+        if not (_part and _val):
+            _st = MSA.detect_msa_structure(_tb, target_col=_val)
+            if _st:
+                _part, _appr, _val = (_st.get("part_col"), _st.get("appraiser_col"),
+                                      _st.get("value_col"))
+            else:
+                return {"kind": "error",
+                        "reason": "在 %s 里认不出「零件/测量者/测量值」三列，"
+                                  "请显式指定后用 --msa-part/--msa-appraiser/--msa-value 重跑"
+                                  % _path}
+        _tol = spec.get("tolerance") if isinstance(spec, dict) else None
+        _k = spec.get("k") if isinstance(spec, dict) else None
+        _res = MSA.from_table(_tb, _part, _appr, _val, tolerance=_tol,
+                              k=_k if _k else MSA.K99)
+        if isinstance(_res, dict):
+            _res["source"] = "MSA 数据表：%s" % _path
+        return _res
+
+    # 没给登记也没给文件：从主数据里找重复测量结构。
+    # 证据强度不如专门 MSA 计划表，但足以把"尺子可能不准"这件事摆到台面上。
+    if table is not None:
+        _st = MSA.detect_msa_structure(table, target_col=target)
+        if _st:
+            _res = MSA.from_table(table, _st.get("part_col"),
+                                  _st.get("appraiser_col"), _st.get("value_col"))
+            if isinstance(_res, dict):
+                _res["source"] = "自动识别（%s / %s / %s）" % (
+                    _st.get("part_col"), _st.get("appraiser_col") or "(单一来源)",
+                    _st.get("value_col"))
+                _res["structure"] = _st
+                _res["auto_detected"] = True
+            return _res
+    return None
 
 
 def data_driven_rootcause(assoc, spc_res, col_map, process_key, y_col, recog=None, corr=None,
@@ -2422,6 +2546,10 @@ def build_report(res, work, spc_res, corr, assoc, pare, root, gaps, conf,
 
     # 8 根因
     s8 = rep.section("8. 根因定位与 5Why")
+    # MSA 前置：这一节的位置是有意为之——
+    # 测量能力的结论必须排在根因结论**之前**读。写在报告最后的免责声明
+    # 等于告诉读者"上面那些你可以放心相信"，而这句话恰恰从未被验证过。
+    _render_msa_gate(rep, s8, res)
     # v1.11：位置聚集结论放在最前面 —— 事件表里它才是答案，相关矩阵算不出位置。
     for _cl in (res.get("spatial_clusters") or [])[:3]:
         rep.callout(s8, "【位置聚集】%s（缺陷类型：%s）" % (_cl.get("conclusion") or "",
@@ -2435,15 +2563,25 @@ def build_report(res, work, spc_res, corr, assoc, pare, root, gaps, conf,
             # 扩展：状态与结论必须一致。已经判定"数据与措施无关"，
             # 再往下渲染候选表就是把线索包装成结论（外部评审 E07 的原话）。
             _why = (root.get("data_sufficiency") or {}).get("reason") or ""
-            rep.callout(s8, "本次<b>未给出根因排序</b>：%s。"
-                            "知识库常见候选见下表，均为<b>未经本批数据验证的线索</b>，"
-                            "不得据此调整工艺参数。" % _why, "warn")
-            rep.table(s8, ["知识库常见候选", "单位", "未列入结论的原因"],
-                      [[h["param_name"], h.get("unit") or "—", h.get("why_not_conclusion") or ""]
-                       for h in (root.get("prior_only_hints") or [])[:8]],
-                      caption="待核实线索（非本次结论）")
-            for _need in (root.get("what_to_provide") or []):
-                rep.bullets(s8, ["需补充：" + _need])
+            # 测量系统不合格导致的降级，上面 MSA 门槛已经把结论、整改措施、
+            # 待补数据完整说过一遍；这里再复述一遍只会把重要的话稀释成背景噪声。
+            _msa_said = (res.get("msa") or {}).get("action") == "block"
+            if not _msa_said:
+                rep.callout(s8, "本次<b>未给出根因排序</b>：%s。"
+                                "知识库常见候选见下表，均为<b>未经本批数据验证的线索</b>，"
+                                "不得据此调整工艺参数。" % _why, "warn")
+            _hints = root.get("prior_only_hints") or []
+            # 空表比没有表更糟：表头在、内容空，读者会以为"没有线索"是查证结果，
+            # 而真相可能是这一条路径压根没生成线索。
+            if _hints:
+                rep.table(s8, ["知识库常见候选", "单位", "未列入结论的原因"],
+                          [[h["param_name"], h.get("unit") or "—",
+                            h.get("why_not_conclusion") or ""]
+                           for h in _hints[:8]],
+                          caption="待核实线索（非本次结论）")
+            if not _msa_said:
+                for _need in (root.get("what_to_provide") or []):
+                    rep.bullets(s8, ["需补充：" + _need])
             if root.get("five_why"):
                 rep.table(s8, ["层级", "提问", "推断", "依据", "有数据支撑"],
                           [[w["level"], w["why"], w["because"], w["evidence"],
@@ -2682,6 +2820,44 @@ def _decision_text(d):
             return ""       # 空记录不产出空条目：报告里一行光秃秃的"决策："没有意义
         return "%s：%s" % (_k or "决策", _v)
     return str(d) if d else ""
+
+
+def _render_msa_gate(rep, sec, res):
+    """根因章节的测量系统前置门槛。三档结论都在这里显式摆出来。"""
+    _m = res.get("msa")
+    _err = res.get("msa_error")
+    if _err:
+        rep.callout(sec, "【测量系统】%s" % _err, "warn")
+        return
+    if isinstance(_m, dict) and _m.get("action") in ("block", "warn", "pass"):
+        _lv = {"pass": "可接受", "warn": "有条件接受", "block": "不可接受"}
+        _kind = {"pass": "ok", "warn": "warn", "block": "bad"}.get(_m.get("action"), "warn")
+        _line = ["【测量系统 %s】%s" % (_lv.get(_m.get("action"), _m.get("action")),
+                                  _m.get("reason") or "")]
+        if _m.get("pct_grr") is not None:
+            _line.append("（%%GRR=%.1f%%%s，来源：%s）" % (
+                _m["pct_grr"],
+                ("，ndc=%.1f" % _m["ndc"]) if _m.get("ndc") is not None else "",
+                _m.get("source") or _m.get("method") or "—"))
+        rep.callout(sec, "".join(_line), _kind)
+        if _m.get("action") == "block":
+            rep.callout(sec, "本次<b>未产出根因排序</b>：观测到的变差里测量误差占主导，"
+                             "在上面排任何榜都是给噪声编故事。"
+                             "报告出具前须先整改测量系统并复测。", "bad")
+            _wtp = ((res.get("rootcause") or {}).get("what_to_provide") or [])
+            if _wtp:
+                rep.bullets(sec, ["整改与验证要求："] + list(_wtp))
+        elif _m.get("auto_detected"):
+            rep.callout(sec, "该结论由生产数据中的重复测量结构自动估算，"
+                             "证据强度弱于专门的 Gauge R&R 计划表：拉警报够用，"
+                             "作为正式测量能力报告不够。", "info")
+        return
+    _un = res.get("msa_unverified")
+    if _un:
+        rep.callout(sec, "【测量系统未验证】%s" % _un.get("note"), "warn")
+        _tv = _un.get("to_verify") or []
+        if _tv:
+            rep.bullets(sec, ["把它变成已验证，需要："] + list(_tv))
 
 
 def _render_disclaimer(rep, res):
@@ -2991,6 +3167,24 @@ def main():
                          "无需手动指定 --boundary-policy。"
                          "内容与产品档 knowledge/product_profiles.json 的 controlled_specs 段一致，"
                          "适合企业已有受控文件清单时直接指过去")
+    ap.add_argument("--msa-data", dest="msa_data", default=None,
+                    help="测量系统（Gauge R&R）数据文件路径：含「零件/样品 + 测量者(人或设备)"
+                         " + 测量值」三列即可自动认列；认不准用下面三个参数显式指定。"
+                         "%%GRR > 30%%%% 或 ndc < 5 时本次**不出根因结论**"
+                         "（那是给噪声排榜），10–30%%%% 出结论但每条候选挂分辨力限制注记")
+    ap.add_argument("--msa-part", dest="msa_part", default=None,
+                    help="MSA 表中的零件/样品列列名（配合 --msa-data）")
+    ap.add_argument("--msa-appraiser", dest="msa_appraiser", default=None,
+                    help="MSA 表中的测量者/设备列列名（配合 --msa-data）")
+    ap.add_argument("--msa-value", dest="msa_value", default=None,
+                    help="MSA 表中的测量值列列名（配合 --msa-data）")
+    ap.add_argument("--msa-pct-grr", dest="msa_pct_grr", type=float, default=None,
+                    help="直接登记企业已有的 %%%%GRR（不必重算原始数据）；"
+                         "配合 --msa-ndc 给区分类别数")
+    ap.add_argument("--msa-ndc", dest="msa_ndc", type=float, default=None,
+                    help="登记已有的区分类别数 ndc（<5 判分辨力不足）")
+    ap.add_argument("--msa-tolerance", dest="msa_tolerance", type=float, default=None,
+                    help="公差带宽 USL-LSL；给了就额外算 %%%%Tolerance")
     ap.add_argument("--no-xlsx", action="store_true",
                     help="不导出 Excel 结果表")
     ap.add_argument("--d2-card", default=None,
@@ -3023,6 +3217,13 @@ def main():
                   doe_replicates=args.doe_replicates, doe_blocks=args.doe_blocks,
                   doe_seed=args.doe_seed, boundary_policy=args.boundary_policy,
                   role=args.role, controlled_spec=args.controlled_spec,
+                  msa_spec={
+                      "path": args.msa_data,
+                      "part": args.msa_part, "appraiser": args.msa_appraiser,
+                      "value": args.msa_value,
+                      "pct_grr": args.msa_pct_grr, "ndc": args.msa_ndc,
+                      "tolerance": args.msa_tolerance,
+                  } if args.msa_data or args.msa_pct_grr is not None else None,
                   export_xlsx=not args.no_xlsx, d2_card=args.d2_card,
                   emit_d2_card=not args.no_d2_card,
                   verbose=args.verbose, views=args.view)

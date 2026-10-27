@@ -111,7 +111,13 @@ class Report(object):
                 return ["![%s](%s/%s)" % (b.get("caption") or "chart", chart_rel, b["fname"])]
             return ["> （图表见 HTML 版报告）"]
         if t == "callout":
-            return ["> **%s** %s" % ("提示：" if b.get("kind") == "warn" else "说明：", b["content"])]
+            # 严重性要在 Markdown 里也看得出区分：
+            # 以前只有"提示/说明"两种，于是"测量系统不合格、结论不予出具"
+            # 和"这里有个小技巧"在纯文本报告里长得一模一样。
+            _tag = {"bad": "⛔ 重要提示：", "warn": "⚠ 提示：",
+                    "ok": "✅ 结论：", "info": "ℹ 说明："}.get(
+                b.get("kind"), "ℹ 说明：")
+            return ["> **%s** %s" % (_tag, b["content"])]
         if t == "code":
             return ["```", b["content"], "```"]
         return []

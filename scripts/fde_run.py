@@ -643,6 +643,8 @@ AUDIT_FILES = [
     os.path.join("lib", "quality_guard.py"),
     os.path.join("scripts", "eval_enterprise.py"),
     # 规则 53 还读 views.py（消费端不得兜底），它在上面已列
+    # 规则 54：测量系统能力不合格时必须真的拦住结论，未登记时要有前置提示
+    os.path.join("lib", "msa.py"),
     # P2-4 可观测性规则的变异要注入这里；缺了它是静默 SKIP 而不是 FAIL
     os.path.join("lib", "observ.py"),
     # 规则 49 要读降级台账确认"护栏失败会转发到可观测性"，
@@ -1104,6 +1106,7 @@ EVAL_FILE = os.path.join("scripts", "eval_enterprise.py")
 TENANCY_FILE = os.path.join("lib", "tenancy.py")
 EIGHTD_FILE = os.path.join("lib", "eightd.py")
 PIPELINE_FILE = os.path.join("lib", "pipeline.py")
+MSA_FILE = os.path.join("lib", "msa.py")
 PREPROCESS_FILE = os.path.join("lib", "preprocess.py")
 SPCPy = os.path.join("lib", "spc.py")
 CONTRACT_FILE = os.path.join("lib", "contract.py")
@@ -2162,6 +2165,38 @@ def rule_product_profile_merge():
     return _r(True, "多产品配置按语义合并、冲突交人、显式优先、交叉表与角色视角可达")
 
 
+def rule_msa_gate():
+    """测量系统能力必须真能限制结论，而不是报告末尾的一句免责。
+
+    判据落在**动作**上（会不会真的拦、拦的时候有没有漏别处），
+    而不是"有没有这个模块"——后者只要函数名在就永远判过。
+    """
+    t = _read(MSA_FILE) or ""
+    p = _read(PIPELINE_FILE) or ""
+    if "def gauge_rr(" not in t or "def apply_msa_limit(" not in t:
+        return _r(False, "缺 Gauge R&R 计算或结论限制入口（lib/msa.py）")
+    if '"unacceptable": "block"' not in t.replace("'", '"'):
+        return _r(False, "分级缺 block 动作：>"
+                         "测量系统不合格时结论照样出去")
+    if 'res["all_candidates"] = []' not in t or 'res["five_why"] = []' not in t:
+        return _r(False, "block 时没把 all_candidates / five_why 一并清空："
+                         "结论会从兜底路径与 5Why 里泄露出来")
+    if "apply_msa_limit(" not in p or "_render_msa_gate(" not in p:
+        return _r(False, "管线未调用 MSA 限制，或未渲染测量系统门槛")
+    _i = p.find("_render_msa_gate(rep, s8")
+    _j = p.find('rep.section("8. 根因')
+    if _i < 0 or _j < 0 or _j > _i:
+        return _r(False, "测量系统提示必须排在根因章节之前："
+                         "写在报告末尾等于告诉读者『上面那些可以放心相信』")
+    # 「没登记」不能被当成「尺子合格」：判据查的是**赋值动作**而不是字样，
+    # 只搜 "msa_unverified" 的话，渲染端的读取语句会让整串一直存在，
+    # 把赋值删掉照样判过——读取点救不了写入点缺失。
+    if not re.search(r'^\s*result\["msa_unverified"\] = ', p, flags=re.M) \
+            or "def unverified_notice(" not in t:
+        return _r(False, "未做 MSA 时缺少前置提示（写入）：没登记 ≠ 尺子合格")
+    return _r(True, "", {"n_checks": 5})
+
+
 def rule_honest_degradation():
     """信息不足时必须承认，并闭嘴——不得递上一份看起来专业的榜单。
 
@@ -2991,6 +3026,33 @@ AUDIT_RULES = [
           _mutant("内部衍生列不再被排除（__判定_NG__ 可当原因）",
                   _re_sub(r"return str\(name or \"\"\)\.startswith\(INTERNAL_COL_PREFIX\)",
                           "return False", flags=re.M), QG_FILE)]),
+
+    Rule("测量系统能力不合格时必须真的拦住结论（不是末尾一句免责）", rule_msa_gate,
+         "（1）lib/msa.py 有 gauge_rr 与 apply_msa_limit；"
+         "（2）分级含 unacceptable→block 动作；"
+         "（3）block 时 all_candidates 与 five_why 一并清空（只清 candidates 不够，"
+         "结论会从兜底路径与 5Why 泄露）；"
+         "（4）管线调用 apply_msa_limit 且 _render_msa_gate 排在根因 section 之前；"
+         "（5）未登记 MSA 时有 unverified 前置提示",
+         MSA_FILE,
+         [_mutant("取消 block（测量系统不合格照样出结论）",
+                  _re_sub(r'\s*"unacceptable": "block"',
+                          '\n    "unacceptable": "warn"', flags=re.M), MSA_FILE),
+          _mutant("清空候选但放过 all_candidates（结论从兜底路径回来）",
+                  _sub('res["all_candidates"] = []',
+                       'res["due_review"] = True  # 变异：all_candidates 未清空'),
+                  MSA_FILE),
+          _mutant("5Why 不封存（『指向某参数』换个地方把结论又说一遍）",
+                  _re_sub(r'\s*if res\.get\("five_why"\):\n\s*res\["five_why"\] = \[\]'
+                          r'\n\s*res\["five_why_note"\] = \([^)]*\)',
+                          "", flags=re.M), MSA_FILE),
+          _mutant("把测量系统门槛的渲染删掉（写在哪＝算在哪）",
+                  lambda t: t.replace("    _render_msa_gate(rep, s8, res)\n", "")
+                  if "_render_msa_gate(rep, s8, res)" in t else None,
+                  PIPELINE_FILE),
+          _mutant("未登记测量系统时沉默（把没登记当成尺子合格）",
+                  _re_sub(r'\s*result\["msa_unverified"\] = MSA\.unverified_notice\(\)',
+                          "", flags=re.M), PIPELINE_FILE)]),
 ]
 
 

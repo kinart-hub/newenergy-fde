@@ -483,6 +483,9 @@ def scan_param_chain():
     alias = {
         "paths": "-i/--input（位置参数，不是 --paths）",
         "views": "--view（单数，nargs='+'）",
+        "msa_spec": "--msa-data / --msa-part / --msa-appraiser / --msa-value / "
+                    "--msa-pct-grr / --msa-ndc / --msa-tolerance（一个 dict 由这组参数"
+                    "组装；不收单个 JSON 串，免得现场在命令行里手写转义过的 JSON）",
     }
     for p in sig:
         flag = "--" + p.replace("_", "-")
