@@ -313,6 +313,12 @@ def _data_evidence(table, param_key, target_col, defect_proc):
     aliases = spec.get("aliases", []) + [spec.get("name", "")]
     col = None
     for c in table.columns:
+        # 内部衍生列不是原始测量列，不得参与"找列"：
+        # encode_judgement 造的 __判定_NG__ 名字里带「判定」，用别名模糊匹配
+        # 必然命中 qa_judgement，于是"目标列的编码"被当成某个参数的真实列，
+        # 甚至作为它自己的原因上榜（E06 实测：__判定_NG__(0.22) 排第三）。
+        if QG.is_internal_column(c) or (target_col and c == target_col):
+            continue
         nc = PP._norm_name(c)
         for a in aliases:
             if PP._norm_name(a) and (PP._norm_name(a) == nc or PP._norm_name(a) in nc
@@ -596,6 +602,7 @@ def rank_root_causes(defect_name, table, target_col=None, top=5,
              and (d.get("param") is None or QG.role_of(table, d.get("param")) == "measure")]
     if not cands:
         return None
+
     cands.sort(key=lambda d: -d["score"])
     _annotate_evidence(cands, table, target_col, info or {})
 
@@ -611,12 +618,64 @@ def rank_root_causes(defect_name, table, target_col=None, top=5,
         c["verifiability_score"] = round(_vf, 3)
         c["score"] = round(_final, 4)
         c["gate_note"] = _gate
-    cands.sort(key=lambda d: -d["score"])
+    # 排序分区：**在表里指得到列、且拿到数据支撑**的候选永远排在前，
+    # 指不到列的纯先验候选一律在后。
+    #
+    # 不这么做的话，真因一旦不够显著，纯先验候选就会顶到榜首
+    # （外部评审 E07 的"浆料固含 0.24"就是这么来的）。
+    # 保留而不是删除：它们仍是知识库对该缺陷的常见原因，只是本批数据里没有对应列，
+    # 属于"该去核实"而不是"本次结论"——报告里按 data_status 区分呈现。
+    def _rank_key(d):
+        _backed = bool(d.get("param")) and d.get("data_status") == ST.SUCCESS
+        return (0 if _backed else 1, -d["score"])
+    cands.sort(key=_rank_key)
 
     # 数据充分性：**排序这件事本身**能不能站得住，和每条候选的证据，是两回事。
     # 一条候选可以诚实地标着"机理支持"，但如果整张表只有两行，
     # 那这份排序整体就不能被当成"本轮数据的结论"来读。
     suf = _data_sufficiency(table, target_col, cands)
+
+    # ---- 一条候选都没拿到数据支撑时，不得输出根因榜单 ----------------------
+    #
+    # 外部评审 E07 抓的就是这里：候选全靠 prior 那一项权重排出来，
+    # status 虽然标了 NO_FINDING，榜单却照出不误（浆料固含 0.24、浆料粘度 0.22…），
+    # 数字规整、措辞专业，现场照着去调机，真因一点没动。
+    # **状态与结论必须一致**：既然都说"没查到"，就不该同时递上一份 Top 榜单。
+    #
+    # 候选不丢——它们仍是知识库对该缺陷的"常见候选"，只是显式降级为
+    # 未经本批数据验证的线索（prior_only_hints），不得当作本批数据的结论。
+    # 注意 all_candidates 同样要清空：views.py 有 `candidates or all_candidates`
+    # 的兜底取法，只清前者会被那条路径原样泄露出去。
+    if not suf.get("n_data_backed") and (suf.get("n_effective") or 0) >= MIN_N_FOR_RANKING:
+        return {
+            "defect": defect_name,
+            "process": proc,
+            "process_name": kb["processes"].get(proc, {}).get("name", "") if proc else "",
+            "mechanism": (info or {}).get("mechanism"),
+            "verify_data": (info or {}).get("verify_data", []),
+            "quick_checks": (info or {}).get("quick_checks", []),
+            "candidates": [],
+            "all_candidates": [],
+            "prior_only_hints": [{
+                "param_key": c.get("param_key"),
+                "param_name": c.get("param_name"),
+                "unit": c.get("unit") or "",
+                "source": c.get("source"),
+                "why_not_conclusion": "未经本批数据验证（%s），只作线索，不得据此调机"
+                                      % (c.get("gate_note") or "该候选未拿到数据支持"),
+            } for c in cands],
+            "history_cases": [hist[k] for k in hist],
+            "status": suf["status"],
+            "data_sufficiency": suf,
+            "honest_degraded": True,
+            "what_to_provide": [
+                "至少一个可被认出的工艺参数列（标准列名，或贵厂通用叫法）",
+                "该参数的规格上下限或受控出处",
+                "若为自定义列名：登记设备档案/字段映射（列名→参数名→量纲）",
+            ],
+            "score_note": "本批数据未能支撑任何根因候选，故不给出排序；"
+                          "prior_only_hints 为知识库常见候选，属待核实线索而非结论",
+        }
     return {
         "defect": defect_name,
         "process": proc,

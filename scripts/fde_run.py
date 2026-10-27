@@ -638,6 +638,11 @@ AUDIT_FILES = [
     os.path.join("lib", "spc.py"),
     # 产品档配置解析：变异目标（规则 51），缺了它变异注不进去 → 静默 SKIP
     os.path.join("lib", "profile.py"),
+    # 规则 53 要读并注入缺陷：内部衍生列判据在 quality_guard，回归断言在评测脚本。
+    # 缺了它们同样不是 FAIL 而是静默 SKIP（教训见第 11 条）。
+    os.path.join("lib", "quality_guard.py"),
+    os.path.join("scripts", "eval_enterprise.py"),
+    # 规则 53 还读 views.py（消费端不得兜底），它在上面已列
     # P2-4 可观测性规则的变异要注入这里；缺了它是静默 SKIP 而不是 FAIL
     os.path.join("lib", "observ.py"),
     # 规则 49 要读降级台账确认"护栏失败会转发到可观测性"，
@@ -1037,6 +1042,8 @@ DOE_FILE = os.path.join("lib", "doe.py")
 KBSTORE_FILE = os.path.join("lib", "kbstore.py")
 OBS_FILE = os.path.join("lib", "observ.py")
 PROFILE_FILE = os.path.join("lib", "profile.py")
+QG_FILE = os.path.join("lib", "quality_guard.py")
+EVAL_FILE = os.path.join("scripts", "eval_enterprise.py")
 TENANCY_FILE = os.path.join("lib", "tenancy.py")
 EIGHTD_FILE = os.path.join("lib", "eightd.py")
 PIPELINE_FILE = os.path.join("lib", "pipeline.py")
@@ -2098,6 +2105,65 @@ def rule_product_profile_merge():
     return _r(True, "多产品配置按语义合并、冲突交人、显式优先、交叉表与角色视角可达")
 
 
+def rule_honest_degradation():
+    """信息不足时必须承认，并闭嘴——不得递上一份看起来专业的榜单。
+
+    这条规则要防的是一种"看不出错"的错：分数算得出来、表排得整整齐齐、
+    措辞像模像样，而背后没有任何一列数据支撑。外部评审抓到的 E07 就是原型
+    （识别率 0% 却给出「浆料固含 0.24」）。它对信任的破坏比算错更大：
+    算错会被复核发现，硬凑的结论会被直接拿去调机。
+    """
+    t = _read(ROOTCAUSE_FILE) or ""
+    if not t:
+        return _r(False, "读不到 lib/rootcause.py")
+    if '"honest_degraded": True' not in t:
+        return _r(False, "缺 honest_degraded：数据不足时没有任何降级出口")
+    # 1) 降级分支必须真的清空榜单（两个字段都要清，all_candidates 会被下游兜底读取）
+    _m = re.search(r'if not suf\.get\("n_data_backed"\)(.*?)"score_note"', t, re.S)
+    if not _m:
+        return _r(False, "找不到「零数据支撑」的降级分支：没有任何候选拿到支撑时仍会排序")
+    _blk = _m.group(1)
+    if '"candidates": []' not in _blk or '"all_candidates": []' not in _blk:
+        return _r(False, "降级分支未清空 candidates 与 all_candidates："
+                         "状态说没有证据，榜单却照出")
+    if "what_to_provide" not in _blk:
+        return _r(False, "降级时没告诉使用人该补什么：只说「数据不足」等于把人晾在那里")
+
+    # 2) 有数据支撑的候选必须排在前，纯先验候选不得与它同榜竞争榜首。
+    #    判据落在**排序键怎么算**上，不是"有没有这个函数"——
+    #    函数留着、键换成 -score，逐字检查照样判过（本规则首版就踩了这条）。
+    _rk = re.search(r"def _rank_key\(d\):(.*?)\n\s*cands\.sort", t, re.S)
+    if not _rk:
+        return _r(False, "缺排序分区：纯先验候选会顶到真因前面（E07 的成因）")
+    if "0 if _backed else 1" not in _rk.group(1) or "ST.SUCCESS" not in _rk.group(1):
+        return _r(False, "排序键未按「是否拿到数据支撑」分区：纯先验候选仍可与真因争榜首")
+
+    # 3) 内部衍生列不得参与找列/分组/归因（三处都要用同一条判据）。
+    #    同样要落到"前缀判定这个动作"，否则把 return 改成 False 也判过。
+    q = _read(QG_FILE) or ""
+    _ic = re.search(r"def is_internal_column\(name\):(.*?)\n\S", q, re.S)
+    if not _ic or "INTERNAL_COL_PREFIX" not in _ic.group(1):
+        return _r(False, "内部衍生列判据未真的判前缀：__判定_NG__ 会被当成真实参数")
+    if "QG.is_internal_column(" not in t:
+        return _r(False, "rootcause 找列时未排除内部衍生列")
+    tp = _read(PIPELINE_FILE) or ""
+    if tp.count("QG.is_internal_column(") < 2:
+        return _r(False, "pipeline 的分组与数据驱动归因未排除内部衍生列")
+
+    # 4) 消费端不得用 all_candidates 把降级后的榜单又兜回来
+    v = _read(VIEWS_FILE) or ""
+    if 'if rc.get("honest_degraded")' not in v:
+        return _r(False, "views 仍用 candidates or all_candidates 兜底：降级后从这条路径泄露榜单")
+
+    # 5) 回归断言必须真存在（只写在报告里的判据等于没有）
+    e = _read(EVAL_FILE) or ""
+    if "def assert_regressions(" not in e or "honest_degraded" not in e:
+        return _r(False, "评测脚本缺 E07 回归断言：下次改回归因逻辑没人拦")
+    return _r(True, "数据不足时诚实降级（清空榜单+说明该补什么），"
+                    "纯先验候选不参与榜首竞争，内部衍生列在找列/分组/归因三处均被排除，"
+                    "消费端无兜底泄露，评测有回归断言")
+
+
 def rule_boundary_policy_evidence():
     """边界政策由受控规格证据推导，不是留给使用人拍的旋钮。
 
@@ -2833,6 +2899,26 @@ AUDIT_RULES = [
           _mutant("产品档模板无受控登记段（企业给了文件也无处登记）",
                   _re_sub(r'"controlled_specs": \[\{', '"specs": [{',
                           flags=re.M), PROFILE_FILE)]),
+    Rule("信息不足时必须诚实降级，不得硬凑根因",
+         rule_honest_degradation,
+         "零数据支撑时清空 candidates 与 all_candidates 并给出 what_to_provide；"
+         "有数据支撑的候选用 _rank_key 分区排在前；"
+         "内部衍生列（__ 前缀）在 rootcause 找列、pipeline 分组与数据驱动归因三处都被排除；"
+         "views 不得用 all_candidates 兜底；评测脚本有 E07 回归断言。",
+         ROOTCAUSE_FILE,
+         [_mutant("取消失信降级（零支撑时照样排序）",
+                  _re_sub(r'if not suf\.get\("n_data_backed"\)',
+                          "if False", flags=re.M), ROOTCAUSE_FILE),
+          _mutant("降级了但仍交出榜单（candidates 不清空）",
+                  _re_sub(r'"candidates": \[\],\n\s*"all_candidates": \[\],',
+                          '"candidates": cands,\n            "all_candidates": cands,',
+                          flags=re.M), ROOTCAUSE_FILE),
+          _mutant("取消排序分区（纯先验候选可顶到真因前）",
+                  _re_sub(r"return \(0 if _backed else 1, -d\[\"score\"\]\)",
+                          "return -d[\"score\"]", flags=re.M), ROOTCAUSE_FILE),
+          _mutant("内部衍生列不再被排除（__判定_NG__ 可当原因）",
+                  _re_sub(r"return str\(name or \"\"\)\.startswith\(INTERNAL_COL_PREFIX\)",
+                          "return False", flags=re.M), QG_FILE)]),
 ]
 
 

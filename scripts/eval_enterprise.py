@@ -53,7 +53,17 @@ def brief(res):
                      for s in (res.get("spc") or []) if s.get("violations")]
     b["defects"] = res.get("defects")
     b["groups"] = res.get("groups")
-    b["insufficient"] = rc.get("evidence_insufficient")
+    # 是否"明确承认判不出"，看三处状态而不是分数阈值：
+    #   honest_degraded —— 本次修复新增：没有任何候选拿到数据支撑时不排序
+    #   evidence_insufficient —— 旧标志：所有候选关联都很弱
+    #   status —— 统一枚举，INSUFFICIENT_DATA 就是数据不足
+    from lib import status as _ST
+    b["insufficient"] = bool(rc.get("honest_degraded")
+                             or rc.get("evidence_insufficient")
+                             or (rc.get("status") in (_ST.INSUFFICIENT_DATA,
+                                                      _ST.NOT_APPLICABLE)))
+    b["degraded"] = bool(rc.get("honest_degraded"))
+    b["n_root"] = len(rc.get("candidates") or [])
     b["recog"] = res.get("column_recognition_rate")
     b["warns"] = len(res.get("warnings") or [])
     b["gaps"] = [g.get("item") for g in (res.get("gaps") or []) if isinstance(g, dict)][:4]
@@ -107,7 +117,40 @@ def run(cases_dir, out_dir, verbose=True):
     _write_summary(results, out_dir)
     if verbose:
         print("结果已写入 %s/results.json 与 summary.md" % out_dir)
+    assert_regressions(results)
     return results
+
+
+def assert_regressions(results):
+    """回归断言：这几条一旦回退就必须让评测失败，而不是只写在报告里。
+
+    外部评审抓到的 E07 就是这个性质——状态标了"证据不足"，榜单却照出，
+    数字规整、措辞专业。所以判据不能只看"命中与否"，
+    还要硬性检查**降级时有没有偷偷递上榜单**。
+
+    只在全量（7 套）跑时校验：sweep 的单套子集不包含所有场景，不该被这条卡住。
+    """
+    bad = []
+    e07 = results.get("E07_小厂脏数据")
+    if e07 is not None and not e07.get("error"):
+        if not e07.get("degraded"):
+            bad.append("E07 未触发诚实降级（honest_degraded=False）")
+        if e07.get("n_root"):
+            bad.append("E07 降级后仍输出 %d 条根因候选：%s"
+                       % (e07["n_root"],
+                          "、".join(str(x.get("name")) for x in (e07.get("root_top") or []))))
+    # 通用：任何场景的根因候选里都不许出现内部衍生列（__ 前缀）
+    for cid, b in results.items():
+        if b.get("error"):
+            continue
+        for x in (b.get("root_top") or []):
+            if str(x.get("name") or "").startswith("__"):
+                bad.append("%s 把内部衍生列 %r 当成根因候选" % (cid, x.get("name")))
+    if bad:
+        print("\n[回归断言失败] 以下行为已回退，必须修复：")
+        for x in bad:
+            print("  · " + x)
+        sys.exit(1)
 
 
 # 每套数据的真因关键词（来自 truth.json 植入的因果链）。

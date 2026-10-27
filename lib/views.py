@@ -181,7 +181,10 @@ def view_process(result):
     """工艺工程师：调哪个参数、区间多少、怎么验证。"""
     rep = Report("工艺参数建议（工艺工程师视角）", _meta(result, "process"))
     rc = result.get("rootcause") or {}
-    cands = rc.get("candidates") or rc.get("all_candidates") or []
+    # 诚实降级时不得用 all_candidates 兜底：那条路径会把"没查到"重新渲染成
+    # 一份看起来正常的候选清单（与外部评审 E07 同源：状态说没证据，结论照给）。
+    cands = ([] if rc.get("honest_degraded")
+             else (rc.get("candidates") or rc.get("all_candidates") or []))
     lead = rc.get("lead") or (cands[0] if cands else None)
 
     s = rep.section("1. 结论：优先动哪个参数")

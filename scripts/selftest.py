@@ -2349,11 +2349,14 @@ def test_confound_and_evidence():
           str(res.get("limitations"))[:60])
 
     # 反向：真的有层内关系的数据，不能被冤枉成混杂
-    rows2, cols2 = [], ["批次号", "X参数", "目标Y"]
+    # 这张表要验的是"候选结构字段齐全"，所以必须带一个**可识别**的工艺参数列：
+    # 只用 批次号/X参数/目标Y 这种表，按新规则会被判"没有可用列"而诚实降级
+    # （那是对的——但那样就测不到结构字段了）。
+    rows2, cols2 = [], ["批次号", "X参数", "目标Y", "浆料固含(wt%)"]
     for i in range(14):
-        rows2.append(["A", 10 + 0.1 * i, 5.0 + 0.2 * i])
+        rows2.append(["A", 10 + 0.1 * i, 5.0 + 0.2 * i, 60 + 0.3 * i])
     for i in range(14):
-        rows2.append(["B", 20 + 0.1 * i, 8.0 + 0.2 * i])
+        rows2.append(["B", 20 + 0.1 * i, 8.0 + 0.2 * i, 64 + 0.3 * i])
     tb2 = T.Table(cols2, rows2)
     it2 = (CF.check(tb2, "X参数", "目标Y").get("confounders") or [{}])[0]
     check("混杂：真实层内关系不得被误判为消失",
@@ -3718,6 +3721,73 @@ def test_boundary_policy_evidence():
           "policy=%s" % ri["config"].get("boundary_policy"))
 
 
+def test_honest_degradation():
+    """数据不足以支撑根因时，必须承认并闭嘴，不得递上一份看起来专业的榜单。
+
+    外部评审抓到的原话：识别率 0% 却仍给出根因结论（浆料固含）。
+    这类缺陷的可怕之处不在算错，而在**像真的**——数字规整、措辞专业、
+    现场照着调机，真因一点没动，信任一次就没了。
+    """
+    from lib import status as ST
+    from lib import views as VW
+
+    print("\n[信息不足时必须降级：不臆造根因]")
+
+    # 场景 A：列名全部不可识别（模拟未知名仪器的 T1/T2/Load）
+    rows = [[i, "A" if i % 2 else "B", 80 + (i % 7), 92 - (i // 70) * 8,
+             35 + (i % 5), 180 + (i % 11), "OK" if i % 3 else "NG"] for i in range(120)]
+    tb = T.Table(["LotID", "Op", "T1", "T2", "Speed", "Load", "判定"], rows)
+    # 走真实链路：判定列先被 encode_judgement 编成 __判定_NG__，再拿去归因。
+    # 不手写这个衍生列名——它的存在本身就是"内部列"这条规则的由来。
+    _tgt = PL.encode_judgement(tb) or "判定"
+    cm = PP.map_columns(tb)
+    res = RC.rank_root_causes("面密度超差", tb, target_col=_tgt, col_map=cm)
+    check("列名不可识别时不输出根因候选（candidates 为空）",
+          bool(res) and res.get("candidates") == [] and res.get("all_candidates") == [],
+          "candidates=%s" % (len((res or {}).get("candidates") or [])))
+    check("状态不得是 SUCCESS（不许声称给出了本批数据的结论）",
+          bool(res) and res.get("status") in (ST.INSUFFICIENT_DATA, ST.NO_FINDING)
+          and res.get("status") != ST.SUCCESS,
+          "status=%s" % ((res or {}).get("status")))
+    check("标记 honest_degraded，供报告端改写成「无法判定」",
+          bool(res) and res.get("honest_degraded") is True,
+          "honest_degraded=%s" % ((res or {}).get("honest_degraded")))
+    check("知识库候选降级为线索（prior_only_hints），并说明为何不能当结论",
+          bool(res) and (res.get("prior_only_hints") or [])
+          and all(h.get("why_not_conclusion") for h in (res.get("prior_only_hints") or [])),
+          "hints=%d" % len((res or {}).get("prior_only_hints") or []))
+    check("明确告诉使用人该补什么（不是一句「数据不足」了事）",
+          bool(res) and len(res.get("what_to_provide") or []) >= 2,
+          str((res or {}).get("what_to_provide"))[:60])
+
+    # 场景 B/C：一张有可用参数列的正常表 —— 候选取得到，且内部衍生列不混进来
+    # 线性关系而不是取模循环：取模两列在每个周期内负相关、跨周期互相抵消，
+    # 整体 r 会掉到 0.04，测出来的是"无关联"而不是"有可用列"。
+    _rows = [[150 + i * 0.1, 100 - i * 0.5, 1.0 if i % 3 else 0.0] for i in range(40)]
+    tb2 = T.Table(["烘箱二区温度(℃)", "面密度", "__判定_NG__"], _rows)
+    res2 = RC.rank_root_causes("面密度超差", tb2, target_col="面密度",
+                               col_map={"烘箱二区温度(℃)": "oven_zone2_temp"},
+                               process="battery_coating")
+    _names = [c.get("param") for c in ((res2 or {}).get("candidates") or [])]
+    check("内部衍生列（__ 前缀）不得进根因候选",
+          all(not str(n or "").startswith("__") for n in _names), str(_names))
+    check("有可用列时不误伤：正常表仍能给出候选",
+          bool(res2) and len(res2.get("candidates") or []) >= 1,
+          "n=%d status=%s" % (len((res2 or {}).get("candidates") or []),
+                              (res2 or {}).get("status")))
+
+    # 场景 D：工艺视角在降级时不得用 all_candidates 兜底成"有候选"
+    _v = VW.view_process({"rootcause": {"honest_degraded": True,
+                                        "candidates": [],
+                                        "all_candidates": [{"param_name": "浆料固含",
+                                                            "score": 0.24,
+                                                            "evidence_score": 0.0}]}})
+    _txt = _v.render_md() if hasattr(_v, "render_md") else str(_v)
+    check("工艺视角降级时不拿 all_candidates 兜底（那条路径会泄露出榜单）",
+          ("未定位到可行动" in _txt) and ("浆料固含" not in _txt),
+          "降级后仍出现了候选名" if "浆料固含" in _txt else "缺少降级说明")
+
+
 def test_decision_records_uniform():
     """决策记录必须形态统一，且渲染端不假设元素一定是字符串。
 
@@ -3804,6 +3874,7 @@ if __name__ == "__main__":
     test_boundary_policy_knob()
     test_product_profile_resolve()
     test_boundary_policy_evidence()
+    test_honest_degradation()
     test_decision_records_uniform()
     print("\n" + "=" * 56)
     print("通过 %d 项，失败 %d 项" % (len(PASS), len(FAIL)))

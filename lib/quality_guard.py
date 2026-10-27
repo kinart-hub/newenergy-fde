@@ -92,6 +92,23 @@ def is_test_condition(name):
     return bool(_TEST_COND_RE.search(_norm(name)))
 
 
+INTERNAL_COL_PREFIX = "__"
+
+
+def is_internal_column(name):
+    """内部衍生列（__ 前缀）：由本工具编码/派生而来，不是原始观测。
+
+    为什么必须单独立一条：`encode_judgement` 会把 OK/NG 判定列编成
+    `__判定_NG__`（1/0）。它与目标常常是同义反复——组件 IV 里
+    "功率低" 与 "判定=NG" 本来就是同一件事。可它的数值形态（0/1）
+    会被 role 判成 measure、会被低基数规则当成理想的分组维度、
+    还会在按别名找列时命中「判定」这个别名。
+    任何"找原因 / 找分组 / 找列"的路径都必须先把它排除，
+    否则必然出现「功率低是因为功率低」排进根因（E06 实测排第三）。
+    """
+    return str(name or "").startswith(INTERNAL_COL_PREFIX)
+
+
 # ------------------------------------------------------------------ 长表
 
 def collapse_longform(table):

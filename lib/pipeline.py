@@ -297,6 +297,12 @@ def pick_groups(table):
     nrow = len(table.rows) or 1
     texts = set(table.text_columns() or [])
     for c in table.columns:
+        # 内部衍生列不是原始观测，绝不能当分组维度：
+        # __判定_NG__ 是判定列编码出来的结果列，拿它分组必然"差异巨大"，
+        # 于是它作为根因候选高居榜单（E06 实测排第三），
+        # 而那只是"不合格组的不合格率更高"这种同义反复。
+        if QG.is_internal_column(c):
+            continue
         n = PP._norm_name(c)
         vals = [v for v in table.column(c) if v not in (None, "")]
         n_uniq = len(set(str(v) for v in vals))
@@ -1901,7 +1907,7 @@ def data_driven_rootcause(assoc, spc_res, col_map, process_key, y_col, recog=Non
         nm = a["param"]
         # v1.10 护栏：目标本身、被 STC 替换的原始列、测试条件、编号/时间/坐标列都不是原因
         if (nm == y_col or nm in set(exclude_cols or []) or QG.is_test_condition(nm)
-                or _is_bin_label(nm)
+                or _is_bin_label(nm) or QG.is_internal_column(nm)
                 or QG.column_role(nm) not in ("measure", "count")):
             skipped.append(nm)
             continue
@@ -2425,29 +2431,53 @@ def build_report(res, work, spc_res, corr, assoc, pare, root, gaps, conf,
     if root:
         rep.kv(s8, [("缺陷/问题", root["defect"]), ("所属工序", root["process_name"]),
                     ("机理", root.get("mechanism") or "—")])
-        if root.get("evidence_insufficient"):
-            rep.callout(s8, "本次数据<b>支撑不出根因结论</b>：所有候选参数的关联强度都很弱"
-                            "（最高分 %.2f，低于 0.20 的证据门槛）。下表仅供排查方向参考，"
-                            "<b>不应据此调整工艺参数</b>。请先补充关键检测数据或核对列名含义。"
-                            % (root["candidates"][0]["score"] if root.get("candidates") else 0),
-                        "warn")
-        if root.get("data_driven"):
-            rep.callout(s8, "本次未指定缺陷类型，未启用缺陷机理库。下表为 <b>纯数据驱动</b> 的参数归因，"
-                            "只能说明「哪些参数与目标指标同步变化」，不等于已确认根因。"
-                            "用 --defect 指定缺陷类型后可获得机理加权结果。", "warn")
-            cap = "候选参数排序（按与目标列的关联强度，未经缺陷机理库加权）"
+        if root.get("honest_degraded"):
+            # 扩展：状态与结论必须一致。已经判定"数据与措施无关"，
+            # 再往下渲染候选表就是把线索包装成结论（外部评审 E07 的原话）。
+            _why = (root.get("data_sufficiency") or {}).get("reason") or ""
+            rep.callout(s8, "本次<b>未给出根因排序</b>：%s。"
+                            "知识库常见候选见下表，均为<b>未经本批数据验证的线索</b>，"
+                            "不得据此调整工艺参数。" % _why, "warn")
+            rep.table(s8, ["知识库常见候选", "单位", "未列入结论的原因"],
+                      [[h["param_name"], h.get("unit") or "—", h.get("why_not_conclusion") or ""]
+                       for h in (root.get("prior_only_hints") or [])[:8]],
+                      caption="待核实线索（非本次结论）")
+            for _need in (root.get("what_to_provide") or []):
+                rep.bullets(s8, ["需补充：" + _need])
+            if root.get("five_why"):
+                rep.table(s8, ["层级", "提问", "推断", "依据", "有数据支撑"],
+                          [[w["level"], w["why"], w["because"], w["evidence"],
+                            "是" if w["supported"] else "否"] for w in root["five_why"]],
+                          caption="5Why 链条")
+            rep.bullets(s8, ["现场快速验证：" + c for c in (root.get("quick_checks") or [])])
+            _gaps = res.get("gaps") or []
+            if _gaps:
+                rep.callout(s8, "数据缺口 %d 项已单列报告第 13 节，补齐后重跑即可参与排序"
+                                % len(_gaps))
         else:
-            cap = ("候选根因排序（0.40×数据证据 + 0.35×知识先验 + 0.15×时序吻合 + 0.10×可验证性）")
-        rep.table(s8, ["候选参数", "综合得分", "数据证据", "知识先验", "时序吻合", "数据状态"],
-                  [[c["param_name"], _fmt(c["score"], 3), _fmt(c["evidence_score"], 3),
-                    _fmt(c["prior_score"], 3), _fmt(c["temporal_score"], 3),
-                    c["data_status"]] for c in root["candidates"]], caption=cap)
-        if root.get("five_why"):
-            rep.table(s8, ["层级", "提问", "推断", "依据", "有数据支撑"],
-                      [[w["level"], w["why"], w["because"], w["evidence"],
-                        "是" if w["supported"] else "否"] for w in root["five_why"]],
-                      caption="5Why 链条")
-        rep.bullets(s8, ["现场快速验证：" + c for c in (root.get("quick_checks") or [])])
+            if root.get("evidence_insufficient"):
+                rep.callout(s8, "本次数据<b>支撑不出根因结论</b>：所有候选参数的关联强度都很弱"
+                                "（最高分 %.2f，低于 0.20 的证据门槛）。下表仅供排查方向参考，"
+                                "<b>不应据此调整工艺参数</b>。请先补充关键检测数据或核对列名含义。"
+                                % (root["candidates"][0]["score"] if root.get("candidates") else 0),
+                            "warn")
+            if root.get("data_driven"):
+                rep.callout(s8, "本次未指定缺陷类型，未启用缺陷机理库。下表为 <b>纯数据驱动</b> 的参数归因，"
+                                "只能说明「哪些参数与目标指标同步变化」，不等于已确认根因。"
+                                "用 --defect 指定缺陷类型后可获得机理加权结果。", "warn")
+                cap = "候选参数排序（按与目标列的关联强度，未经缺陷机理库加权）"
+            else:
+                cap = ("候选根因排序（0.40×数据证据 + 0.35×知识先验 + 0.15×时序吻合 + 0.10×可验证性）")
+            rep.table(s8, ["候选参数", "综合得分", "数据证据", "知识先验", "时序吻合", "数据状态"],
+                      [[c["param_name"], _fmt(c["score"], 3), _fmt(c["evidence_score"], 3),
+                        _fmt(c["prior_score"], 3), _fmt(c["temporal_score"], 3),
+                        c["data_status"]] for c in root["candidates"]], caption=cap)
+            if root.get("five_why"):
+                rep.table(s8, ["层级", "提问", "推断", "依据", "有数据支撑"],
+                          [[w["level"], w["why"], w["because"], w["evidence"],
+                            "是" if w["supported"] else "否"] for w in root["five_why"]],
+                          caption="5Why 链条")
+            rep.bullets(s8, ["现场快速验证：" + c for c in (root.get("quick_checks") or [])])
 
         # 单元级热点：这类问题（某个通道/卷针/供应商单独跑偏）单因素 ANOVA 抓不到，
         # 单独列出来，否则现场只能看到「组间无显著差异」而漏掉它
