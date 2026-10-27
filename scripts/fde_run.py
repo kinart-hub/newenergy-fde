@@ -636,6 +636,11 @@ AUDIT_FILES = [
     # v2.7 契约规则的变异目标；缺了它同样会是静默 SKIP 而不是 FAIL
     os.path.join("lib", "contract.py"),
     os.path.join("lib", "spc.py"),
+    # P2-4 可观测性规则的变异要注入这里；缺了它是静默 SKIP 而不是 FAIL
+    os.path.join("lib", "observ.py"),
+    # 规则 49 要读降级台账确认"护栏失败会转发到可观测性"，
+    # 不复制过去副本里就没有这个文件，基线直接判不过
+    os.path.join("lib", "degrade.py"),
     os.path.join("knowledge", "process_specs.json"),
 ]
 
@@ -1028,6 +1033,7 @@ PROVENANCE_FILE = os.path.join("lib", "provenance.py")
 CONFOUND_FILE = os.path.join("lib", "confound.py")
 DOE_FILE = os.path.join("lib", "doe.py")
 KBSTORE_FILE = os.path.join("lib", "kbstore.py")
+OBS_FILE = os.path.join("lib", "observ.py")
 TENANCY_FILE = os.path.join("lib", "tenancy.py")
 EIGHTD_FILE = os.path.join("lib", "eightd.py")
 PIPELINE_FILE = os.path.join("lib", "pipeline.py")
@@ -1927,6 +1933,57 @@ def rule_p2_knowledge_lifecycle():
     return _r(True, "", {"knowledge_lifecycle": True})
 
 
+def rule_p2_observability():
+    """P2-4：结构化日志与可观测性——耗时/重试/错误分类/模块成功率/资源上限/脱敏。
+
+    审计原话：无结构化日志、耗时、重试、错误分类、模块成功率、输入质量指标、
+    资源上限、日志脱敏。
+
+    判据一律落在**计算动作**上：脱敏规则要真的被遍历、错误分类要真的走分类表、
+    失败要真的进成功率的分母。只查"函数定义存在"的话，
+    把实现掏空只留壳也能判过——那等于这条规则没写。
+    """
+    t = _read(OBS_FILE) or ""
+    if not t:
+        return _r(False, "读不到 " + OBS_FILE)
+    # 1) 结构化事件与七项能力
+    for fn in ("def event(", "def mask(", "def classify_error(", "class Timer(",
+               "def retry(", "def check_resources(", "def record_input_quality(",
+               "def summary(", "def read_log(", "def summarize_log(", "def reset("):
+        if fn not in t:
+            return _r(False, "observ 缺 %s：可观测性能力不全" % fn)
+    # 2) 脱敏必须真的遍历规则表（不是只定义函数）
+    if not re.search(r"for\s+pat,\s+rep\s+in\s+_MASK_RULES", t):
+        return _r(False, "mask 未遍历 _MASK_RULES：日志脱敏是空壳")
+    if "1[3-9]" not in t or "<user>" not in t:
+        return _r(False, "脱敏规则缺手机号或用户目录：日志会带走个人信息")
+    # 3) 错误分类必须真的走分类表
+    if not re.search(r"for\s+cls,\s+types\s+in\s+_CLASSIFY_RULES", t):
+        return _r(False, "classify_error 未遍历 _CLASSIFY_RULES：失败该找谁说不清")
+    if '"self_errors"' not in t or "def _self_error(" not in t:
+        return _r(False, "observ 不暴露自身错误：诊断通道带病会让人以为查过了")
+    # 4) 资源上限
+    if "RESOURCE_LIMITS = {" not in t:
+        return _r(False, "缺 RESOURCE_LIMITS：病态输入会一直跑到既慢又不可信")
+    # 5) 模块成功率：失败必须进分母，否则成功率恒为 1.0 的假象
+    if not re.search(r'^\s+st\["ok" if ok else "fail"\]\s*\+=\s*1', t, re.M):
+        return _r(False, "失败未计入模块统计：成功率可以靠只数成功来伪造")
+    # 6) 接线：日志写完要有人能查，失败要能从唯一收口点进来
+    tf = _read(os.path.join("scripts", "fde_run.py")) or ""
+    #    判据在本文件里也出现同样字样，所以一律行首锚定，避免自我指涉。
+    if not re.search(r"^def\s+flow_ops\s*\(", tf, re.M):
+        return _r(False, "编排器未实现 flow_ops：日志写完没人能查")
+    if not re.search(r'^\s*if\s+args\.flow\s*==\s*"ops":', tf, re.M):
+        return _r(False, "编排器未把 ops 接进命令分发")
+    td = _read(os.path.join("lib", "degrade.py")) or ""
+    if "_OBS.fail(" not in td:
+        return _r(False, "降级台账未转发到 observ：护栏失败不计入模块成功率")
+    tp = _read(PIPELINE_FILE) or ""
+    if "OBS.end_run(" not in tp or "observability" not in tp:
+        return _r(False, "pipeline 未产出 observability 汇总：跑了也不留痕")
+    return _r(True, "", {"observability": True})
+
+
 AUDIT_RULES = [
     Rule("LICENSE 为 Elastic 2.0 官方纯文本", rule_license,
          "LICENSE 首行必须是裸文本 'Elastic License 2.0'（前面有 # 或 ## 即判不过）",
@@ -2542,6 +2599,25 @@ AUDIT_RULES = [
                   _re_sub(r'LIFECYCLE_MINIMUM = \("evidence_level", "verified_at", '
                           r'"invalidates_if", "status"\)',
                           "LIFECYCLE_MINIMUM = ()", flags=re.M), KBSTORE_FILE)]),
+    Rule("必须有结构化日志与可观测性：耗时/重试/错误分类/模块成功率/资源上限/脱敏",
+         rule_p2_observability,
+         "P2-4。lib/observ.py 必须提供 event/mask/classify_error/Timer/retry/"
+         "check_resources/record_input_quality/summary/read_log/summarize_log/reset；"
+         "mask 必须真的遍历 _MASK_RULES 且规则含手机号与用户目录；"
+         "classify_error 必须真的遍历 _CLASSIFY_RULES；失败必须计入模块统计分母；"
+         "必须暴露 self_errors（诊断通道自身带病要可见）；需有 RESOURCE_LIMITS；"
+         "编排器必须实现并分发 ops 流程，degrade 必须转发到 observ，"
+         "pipeline 必须产出 observability 汇总。",
+         OBS_FILE,
+         [_mutant("脱敏规则被清空（日志原样落盘，带走手机号与用户名）",
+                  _re_sub(r"^    for pat, rep in _MASK_RULES:",
+                          "    for pat, rep in ():", flags=re.M), OBS_FILE),
+          _mutant("错误分类退化为恒 unknown（该找谁说不清）",
+                  _re_sub(r"^(\s+)for cls, types in _CLASSIFY_RULES:",
+                          r"\1for cls, types in ():", flags=re.M), OBS_FILE),
+          _mutant("失败不进统计（模块成功率恒为 1.0 的假象）",
+                  _re_sub(r'^\s+st\["ok" if ok else "fail"\]\s*\+=\s*1',
+                          '            st["ok"] += 1', flags=re.M), OBS_FILE)]),
 ]
 
 
@@ -2703,6 +2779,54 @@ def rule_selftest_steps():
 
 
 # --------------------------------------------------------------- 流程定义
+
+def flow_ops(args):
+    """可观测性运维视图（P2-4）：从结构化日志回读"慢在哪、哪一步常失败、失败属哪一类"。
+
+    可观测性不是"写了日志"就算有——写完了没人能查，等于没写。
+    """
+    sys.path.insert(0, ROOT)
+    from lib import observ as OBS
+    path = getattr(args, "log", None) or OBS.log_path()
+    evs = OBS.read_log(path, limit=int(getattr(args, "limit", 500) or 500))
+    rep = OBS.summarize_log(evs)
+    print("=" * 68)
+    print("可观测性运维视图（P2-4）")
+    print("=" * 68)
+    print("日志：%s｜事件 %d 条｜资源越界 %d 次"
+          % (path, rep.get("n_events") or 0, rep.get("limit_breaches") or 0))
+    if not evs:
+        print("（日志为空：还没有跑过 analyze，或日志路径不对）")
+        print("=" * 68)
+        return 0
+    print("-" * 68)
+    print("%-20s %6s %6s %8s %8s" % ("模块", "调用", "失败", "成功率", "耗时ms"))
+    for m, st in sorted((rep.get("modules") or {}).items(),
+                        key=lambda kv: -(kv[1].get("ms") or 0)):
+        rate = st.get("success_rate")
+        print("%-20s %6d %6d %8s %8.1f"
+              % (m[:20], st.get("calls") or 0, st.get("fail") or 0,
+                 ("%.0f%%" % (rate * 100)) if rate is not None else "—",
+                 st.get("ms") or 0.0))
+    if rep.get("error_classes"):
+        print("-" * 68)
+        print("失败分类（决定该找谁：data 找数据 / config 找配置 / io 找环境 / "
+              "module 找我们）：")
+        for c, n in sorted((rep.get("error_classes") or {}).items(),
+                           key=lambda kv: -kv[1]):
+            print("      · %-10s %d" % (c, n))
+    _retry = [(m, st.get("retries") or 0) for m, st in (rep.get("modules") or {}).items()
+              if st.get("retries")]
+    if _retry:
+        print("-" * 68)
+        print("⚠ 靠重试才跑通的模块（一直带病运行）：")
+        for m, n in _retry:
+            print("      · %s：重试 %d 次" % (m, n))
+    print("=" * 68)
+    if getattr(args, "json", False):
+        print(json.dumps(rep, ensure_ascii=False, indent=2))
+    return 0
+
 
 def flow_kb(args):
     """知识生命周期与出处覆盖率审计（P2-2）。
@@ -3254,11 +3378,13 @@ def main(argv=None):
     ap = argparse.ArgumentParser(
         description="newenergy-fde 唯一入口编排器（流程代码化 + 证据落盘）")
     ap.add_argument("flow",
-                    choices=["audit", "verify", "analyze", "release", "config", "kb"],
+                    choices=["audit", "verify", "analyze", "release", "config",
+                             "kb", "ops"],
                     help="audit=约定落地核查  verify=质量闸门  "
                          "analyze=交付主流程  release=发布  "
                          "config=可调参数清单与企业规格模板  "
-                         "kb=知识生命周期与出处覆盖率审计")
+                         "kb=知识生命周期与出处覆盖率审计  "
+                         "ops=可观测性运维视图（结构化日志回读）")
     ap.add_argument("--input", "-i", nargs="+", help="analyze：数据文件")
     ap.add_argument("--outdir", "-o", default="output", help="analyze：输出目录")
     ap.add_argument("--target", help="analyze：目标指标列")
@@ -3320,6 +3446,8 @@ def main(argv=None):
         return flow_config(args)
     if args.flow == "kb":
         return flow_kb(args)
+    if args.flow == "ops":
+        return flow_ops(args)
     if args.flow == "audit":
         return flow_audit(args)
     if args.flow == "verify":

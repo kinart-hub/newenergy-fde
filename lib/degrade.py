@@ -64,6 +64,20 @@ def note(where, exc=None, stage=""):
             msg = str(exc)
         else:
             kind, msg = "unknown", ""
+        # P2-4：降级台账是所有护栏 except 的唯一收口点，在这里转发一次，
+        # observ 就白拿到"哪个模块失败过、失败属于哪一类"，不必改 50 个调用点。
+        # 必须放在去重判断**之前**：同类降级会被台账合并（信息量等于一次），
+        # 但模块成功率要数真实发生次数——放在合并分支之后，重复失败就漏记了。
+        # 台账自身仍必须静默（诊断通道不许搞崩主流程），所以这层也包在 try 里。
+        try:
+            from . import observ as _OBS        # 惰性导入：observ 不反向依赖 degrade
+            _OBS.fail(str(where).split(".")[0] or "unknown",
+                      exc if exc is not None else (msg or "降级"),
+                      stage=stage, where=str(where))
+        except Exception:
+            pass
+            # scan:keep 转发到 observ 失败必须静默：这里抛异常会被 note() 最外层再捕获一次，
+            # 而"记账失败"不该让主流程降级失败。可观测性缺失由 observ.self_errors 单独暴露。
         with _LOCK:
             w = str(where)
             if w in _IDX:

@@ -38,6 +38,7 @@ import json
 import re
 import argparse
 import datetime
+import time
 
 if __package__ in (None, ""):
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -45,6 +46,10 @@ if __package__ in (None, ""):
         correlation as CORR, doe as DOE, rootcause as RC, charts as CH, report as RPT, \
         kbstore as KBS, devices as DEV, crossprocess as XP, actions as AC, \
         adapt as AD, quality_guard as QG, status as ST, provenance as PROV, contract as CT
+    try:                    # P2-4 可观测性；导入失败不能拖垮整条流水线
+        from lib import observ as OBS
+    except Exception:
+        OBS = None
     try:                    # v1.11 新增模块，导入失败不能拖垮整条流水线
         from lib import events as EV
         _HAS_EVENTS = True
@@ -62,6 +67,10 @@ else:
         correlation as CORR, doe as DOE, rootcause as RC, charts as CH, report as RPT, \
         kbstore as KBS, devices as DEV, crossprocess as XP, actions as AC, \
         adapt as AD, quality_guard as QG, status as ST, provenance as PROV, contract as CT
+    try:                    # P2-4 可观测性；导入失败不能拖垮整条流水线
+        from . import observ as OBS
+    except Exception:
+        OBS = None
     try:
         from . import events as EV
         _HAS_EVENTS = True
@@ -406,6 +415,16 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
     # 保证"做了哪些自动决定"在报告和血缘里是同一个事实源——两边各记一份，
     # 迟早会出现报告写了、血缘没写的分裂。
     result["decisions"] = []
+
+    # P2-4 可观测性：日志跟着本次输出走，不写脚本自身目录，
+    # 也不落进用户的个人目录——交付时它是可带走、可发出去的东西，必须先脱敏。
+    if OBS is not None:
+        try:
+            OBS.set_log_path(os.path.join(outdir, "_observ.jsonl"))
+            OBS.start_run(n_inputs=len(paths) if isinstance(paths, (list, tuple)) else 1,
+                          version=ANALYZER_VERSION)
+        except Exception as _obs_e:
+            degrade.note("pipeline.analyze@observ_start", _obs_e)
     _plist = paths if isinstance(paths, (list, tuple)) else [paths]
     try:
         _inputs = PROV.input_fingerprints(_plist)
@@ -690,8 +709,11 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
     # 3. 清洗。log 记下每一条被剔除的行（文件+原始行号+原因），
     #    既能在报告里交代"删了什么"，也给了复核和撤销的依据。
     cleaning_log = []
+    _t_pp = time.time()
     clean_tb, clean_rep = PP.clean(main, missing="keep", outlier="mad", log=cleaning_log,
                                    prefer_process=chosen_proc)
+    if OBS is not None:     # P2-4 耗时埋点
+        OBS.ok("preprocess", (time.time() - _t_pp) * 1000.0, step="clean")
     result["clean"] = {k: v for k, v in clean_rep.items() if k != "col_map"}
     if len(clean_tb) < 3:
         cleaning_log = []
@@ -699,6 +721,24 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
                                        prefer_process=chosen_proc)
         result["clean"] = {k: v for k, v in clean_rep.items() if k != "col_map"}
     result["cleaning_log"] = cleaning_log
+    # P2-4：输入质量与资源上限。没有输入质量，"结论不可信"到底是数据的问题
+    # 还是算法的问题就说不清；没有资源上限，病态输入会一直跑到既慢又不可信。
+    if OBS is not None:
+        try:
+            _rows_in = len(main) if main is not None and hasattr(main, "__len__") else None
+            _cols_in = len(col_map) if col_map else None
+            OBS.record_input_quality(
+                rows=clean_rep.get("rows_in") or _rows_in, cols=_cols_in,
+                missing_rate=clean_rep.get("missing_rate"))
+            _res = OBS.check_resources(rows=_rows_in, cols=_cols_in)
+            if not _res.get("ok"):
+                result.setdefault("warnings", []).append(
+                    "输入规模超出资源上限（%s）：分析仍会继续，但耗时与内存可能失控，"
+                    "建议分批或先做抽样"
+                    % "、".join("%s=%s>%s" % (b["limit"], b["value"], b["max"])
+                                for b in _res.get("breaches") or []))
+        except Exception as _obs_e:
+            degrade.note("pipeline.analyze@observ_input", _obs_e)
     result["trace_meta"] = {
         "file": getattr(main, "src_file", lambda: None)(),
         "row_tracing": ("近似" if getattr(main, "src_approx", False) else "精确"),
@@ -810,7 +850,12 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
                 "整列会被当成文本；单元格里只写了「/」「-」「NA」等占位符同理。",
             ])
     # 6. 缺陷识别与 Pareto
+    # P2-4：关键步骤埋耗时。只记整轮时长等于什么都没记——
+    # 慢在哪一步不知道，就只能在最热的那个环节上瞎猜。
+    _t_rc = time.time()
     defects = RC.identify_defects(work, defect, process=chosen_proc)
+    if OBS is not None:
+        OBS.ok("rootcause", (time.time() - _t_rc) * 1000.0, step="identify_defects")
     result["defects"] = defects[:10]
     # P0-3：每个环节都要自己交代"到底算过没有"。
     # 不写 status 的话，下游只能看到"列表是空的"，
@@ -1634,6 +1679,22 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
         # 血缘写不出来要出声，但不能因此把整轮分析的结果带走
         result.setdefault("warnings", []).append("血缘记录落盘失败：%s" % _pv_e)
         degrade.note("pipeline.analyze@provenance_finish", _pv_e)
+    # P2-4 可观测性：整轮跑完必须留下"慢在哪、哪一步失败过、失败属于哪一类"。
+    # 没有它，事后只能凭印象猜——而猜错方向比不知道更贵。
+    try:
+        if OBS is None:
+            raise RuntimeError("可观测性模块未导入：本次运行无可观测数据")
+        OBS.end_run(n_warnings=len(result.get("warnings") or []),
+                    incomplete=bool(result.get("incomplete")))
+        result["observability"] = OBS.summary()
+        _obs_bad = (result["observability"].get("self_errors") or [])
+        if _obs_bad:
+            # 诊断通道自己带病必须出声：它让人以为"查过了"，其实没查全
+            result.setdefault("warnings", []).append(
+                "可观测性模块自身有 %d 次记录失败，本次运行的可观测数据不完整"
+                % len(_obs_bad))
+    except Exception as _obs_e:
+        degrade.note("pipeline.analyze@observability", _obs_e)
     return result
 
 

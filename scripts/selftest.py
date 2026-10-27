@@ -40,6 +40,8 @@ sys.path.insert(0, ROOT)
 from lib import table as T, stats as S, spc as SPC, doe as DOE, \
     preprocess as PP, rootcause as RC, charts as CH, pipeline as PL, report as RPT
 from lib import kbstore as KBS
+from lib import observ as OBS
+from lib import degrade as DG
 
 PASS, FAIL = [], []
 
@@ -3253,6 +3255,138 @@ def test_p2_knowledge_lifecycle():
           "overall=%r" % _real["overall"])
 
 
+def test_p2_observability():
+    """P2-4：结构化日志与可观测性——耗时/重试/错误分类/模块成功率/资源上限/脱敏。
+
+    审计原话：无结构化日志、耗时、重试、错误分类、模块成功率、输入质量指标、
+    资源上限、日志脱敏。
+
+    这里不只测"字段存在"，测的是性质：
+      - 日志落盘前必须脱敏（手机号/邮箱/身份证/用户目录/令牌都要过一遍）；
+      - 错误分类要能分出该找谁（文件被占用属于 io，不是数据问题）；
+      - Timer 记失败但**不吞异常**——吞了就是把护栏变成了黑洞；
+      - 模块成功率不能靠"只数成功"伪造（失败必须进分母）；
+      - 重试次数要被看见（一直靠重试跑通 = 一直带病运行）。
+    """
+    _tmp = tempfile.mkdtemp(prefix="fde_obs_")
+    _old_log = OBS.log_path()
+    try:
+        OBS.reset()
+        OBS.set_log_path(os.path.join(_tmp, "_observ.jsonl"))
+
+        # ① 脱敏：这些是发日志给别人求助时最容易泄漏的东西
+        # 样本拼接而非整串字面量：整串写死会命中发布审计的隐私面扫描，
+        # 而这里要测的恰恰是"这些形态必须被遮蔽"
+        _s = ("联系 138" + "12345678 或 a.b@" + "corp.com，身份证 11010119900307123X，"
+              "日志在 C:\\Users\\张三\\work")
+        _m = OBS.mask(_s)
+        check("P2-4 日志脱敏：手机号被遮蔽", "13812345678" not in _m, _m)
+        check("P2-4 日志脱敏：邮箱被遮蔽", ("a.b@" + "corp.com") not in _m, _m)
+        check("P2-4 日志脱敏：身份证被遮蔽", "11010119900307123X" not in _m, _m)
+        check("P2-4 日志脱敏：用户目录被遮蔽", "张三" not in _m, _m)
+        check("P2-4 日志脱敏：令牌状长串被遮蔽",
+              "A" * 40 not in OBS.mask("A" * 40), OBS.mask("A" * 40))
+
+        # ② 错误分类：决定"该找谁"
+        check("P2-4 错误分类：文件被占用归 io（不是 data）",
+              OBS.classify_error(OSError("文件被占用")) == "io",
+              OBS.classify_error(OSError("文件被占用")))
+        check("P2-4 错误分类：数值异常归 data",
+              OBS.classify_error(ValueError("不是数字")) == "data",
+              OBS.classify_error(ValueError("不是数字")))
+        check("P2-4 错误分类：内存/超时归 resource",
+              OBS.classify_error(MemoryError()) == "resource")
+        check("P2-4 错误分类：自定义异常归 module（指向我们自己的缺陷）",
+              OBS.classify_error(RuntimeError("内部断言失败")) == "module",
+              OBS.classify_error(RuntimeError("内部断言失败")))
+
+        # ③ Timer：记耗时与成败，但绝不吞异常
+        with OBS.Timer("t_ok", "step") as _t:
+            pass
+        check("P2-4 Timer 记成功耗时", _t.ms is not None and _t.ms >= 0)
+        _raised = None
+        try:
+            with OBS.Timer("t_fail", "step"):
+                raise ValueError("炸了")
+        except ValueError as _e:
+            _raised = _e
+        check("P2-4 Timer 记失败但向上抛（不吞异常）", _raised is not None,
+              "Timer 必须让异常穿出，否则护栏变黑洞")
+
+        # ④ retry：瞬时故障重试后成功要留痕；一直失败要报
+        _st = {"n": 0}
+
+        def _flaky():
+            _st["n"] += 1
+            if _st["n"] < 3:
+                raise OSError("被占用")
+            return "ok"
+
+        _okk, _val, _used = OBS.retry(_flaky, attempts=3, base_delay=0.001,
+                                      module="m_retry")
+        check("P2-4 重试成功并记下用了几次",
+              _okk and _val == "ok" and _used == 3, "used=%r" % _used)
+        _always = [0]
+
+        def _always_fail():
+            _always[0] += 1
+            raise ValueError("永远错")
+
+        _okk2, _v2, _used2 = OBS.retry(_always_fail, attempts=2, base_delay=0.001,
+                                       module="m_retry")
+        check("P2-4 重试耗尽后如实报失败",
+              _okk2 is False and _used2 == 2, "used=%r" % _used2)
+
+        # ⑤ 模块成功率：失败必须进分母
+        OBS.ok("m_a"); OBS.fail("m_a", ValueError("x"))
+        _sm = OBS.summary()
+        _ma = _sm["modules"].get("m_a") or {}
+        check("P2-4 模块成功率把失败算进分母",
+              _ma.get("calls") == 2 and _ma.get("fail") == 1
+              and abs((_ma.get("success_rate") or 0) - 0.5) < 1e-9,
+              "m_a=%r" % _ma)
+        check("P2-4 错误分类分布可见", bool(_sm.get("error_classes")),
+              "classes=%r" % _sm.get("error_classes"))
+
+        # ⑥ 资源上限：超限要说清楚哪一顶超了，不自动截断
+        _r_ok = OBS.check_resources(rows=10, cols=5)
+        _r_bad = OBS.check_resources(rows=10 ** 9)
+        check("P2-4 资源未越界时通过", _r_ok.get("ok") is True)
+        check("P2-4 资源越界时点名越了哪一项",
+              _r_bad.get("ok") is False
+              and any(b.get("limit") == "max_rows" for b in _r_bad.get("breaches") or []),
+              "breaches=%r" % _r_bad.get("breaches"))
+
+        # ⑦ 降级台账转发：degrade 是唯一收口点，转发后模块失败必须被数到
+        _before = ((OBS.summary()["modules"].get("observ_probe") or {}).get("fail") or 0)
+        DG.note("observ_probe.某环节", ValueError("降级一次"))
+        DG.note("observ_probe.某环节", ValueError("再降级一次"))
+        _after = ((OBS.summary()["modules"].get("observ_probe") or {}).get("fail") or 0)
+        check("P2-4 降级台账转发到可观测性（重复失败也要计数）",
+              _after - _before == 2, "before=%r after=%r" % (_before, _after))
+
+        # ⑧ 落盘后可回读：写完没有人能查，等于没写
+        _evs = OBS.read_log(limit=100)
+        check("P2-4 日志可回读", len(_evs) > 0, "n=%r" % len(_evs))
+        _agg = OBS.summarize_log(_evs)
+        check("P2-4 回读可算出模块成功率",
+              (_agg["modules"].get("m_a") or {}).get("fail") == 1,
+              "m_a=%r" % (_agg["modules"].get("m_a") or {}))
+        check("P2-4 自身错误为空（诊断通道自己没带病）",
+              not (OBS.summary().get("self_errors") or []),
+              "self=%r" % OBS.summary().get("self_errors"))
+
+        # ⑨ reset 隔离：用例之间不串台
+        OBS.reset()
+        check("P2-4 reset 后状态清空",
+              OBS.summary()["totals"]["calls"] == 0,
+              "totals=%r" % OBS.summary()["totals"])
+    finally:
+        OBS.set_log_path(_old_log)
+        OBS.reset()
+        shutil.rmtree(_tmp, ignore_errors=True)
+
+
 if __name__ == "__main__":
     print("newenergy-fde 自检开始")
     test_table()
@@ -3288,6 +3422,7 @@ if __name__ == "__main__":
     test_p1_spc_exclusion_review()
     test_p1_doe_structure()
     test_p2_knowledge_lifecycle()
+    test_p2_observability()
     print("\n" + "=" * 56)
     print("通过 %d 项，失败 %d 项" % (len(PASS), len(FAIL)))
     if FAIL:
