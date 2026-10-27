@@ -46,6 +46,8 @@ python scripts/fde_run.py analyze -i <数据> -o <输出>   # 交付主流程（
 python scripts/fde_run.py release                     # 闸门 + 分发包指纹
 python scripts/fde_run.py config                      # 可调参数清单（从代码与知识库读出）
 python scripts/fde_run.py config --init --input 数据.csv  # 按真实列名生成规格待填模板
+python scripts/fde_run.py kb                          # 知识生命周期与出处覆盖率审计
+python scripts/fde_run.py ops                         # 可观测性运维视图（回读结构化日志）
 python scripts/static_scan.py                         # 全库静态扫描（8 类检查一次扫穿）
 python scripts/sync_install.py --check                # 核对仓库与安装目录是否一致
 ```
@@ -126,6 +128,14 @@ python scripts/fde_run.py analyze --input <数据文件> --outdir <输出目录>
   基本集）；`--rules all` 才开满八条。**不要动不动开全八条**：规则越多误报越多，
   现场两天就会把报警当噪音关掉
 - `--no-xlsx` 不导出 Excel 结果表（默认导出）
+- `--spc-exclusion-mode auto|suggest|review` SPC 剔除模式。默认 `auto`（命中即剔除）；
+  `suggest` 只标记可疑点不剔除、交人复核；`review` 按复核结论剔除（逐点带规则身份与审核人）
+- `--boundary-policy warn|block` 推断边界（缺受控出处）的处置政策。默认 `warn`
+  （出方案 + 警告 + 要求工艺工程师书面确认）；`block` 直接不出方案，逼出那份受控规格文件。
+  **企业侧已有受控规格时应收紧为 block**
+- `--doe-replicates N` DOE 每号重复次数（默认 1）。不重复就没有纯误差估计，显著性结论站不住
+- `--doe-blocks N` DOE 区组数（默认 1），用于隔离班次/机台/原料批等已知噪声
+- `--doe-seed N` DOE 运行顺序随机化种子（默认 0，保证顺序可复现）
 
 多个文件（上游 + 本工序）一起传入时：
 
