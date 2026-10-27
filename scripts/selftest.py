@@ -3049,6 +3049,99 @@ def test_p1_spc_exclusion_review():
           _nelson_identity, "rules=%s" % [d["rules"] for d in sb["suspect_points"]])
 
 
+def test_p1_doe_structure():
+    """P1-7：DOE 方案必须给出随机化/重复/区组/别名/功效的结构化信息。
+
+    审计原话：随机化序列、重复数、区组、别名结构、样本量与功效仍停留在自由文本。
+    只测"字段存在"没意义，这里测的是这些字段算出来的**内容对不对**：
+      - 别名结构由矩阵按位异或直接判（不查表），L8 应得分辨度 III；
+      - 功效随样本量单调改善，不写死数值；
+      - 随机化顺序按种子可复现，换种子就变；
+      - 残差自由度归零时必须给出 high 级告警（否则"做了却下不了结论"无人知晓）。
+    """
+    # ① 别名结构：L8(2^7) 是饱和分辨度 III 设计，每个主效应恰好与 3 个二因子交互混杂
+    _m8 = DOE.build_design("taguchi_2level", 7, 2, 8)
+    check("P1-7 L8 二水平设计矩阵生成", _m8 is not None and len(_m8) == 8,
+          "rows=%r" % (len(_m8) if _m8 else None))
+    _a8 = DOE.alias_structure(_m8, ["A", "B", "C", "D", "E", "F", "G"])
+    check("P1-7 L8 别名分辨度为 III", _a8.get("resolution") == "III",
+          "resolution=%r" % _a8.get("resolution"))
+    check("P1-7 L8 每个主效应与 3 个二因子交互混杂",
+          len(_a8.get("main_aliases") or []) == 7
+          and all(len(m.get("aliased_with") or []) == 3 for m in _a8["main_aliases"]),
+          "n_main=%r counts=%r" % (len(_a8.get("main_aliases") or []),
+                                   [len(m.get("aliased_with") or []) for m in _a8.get("main_aliases") or []]))
+    check("P1-7 L8 主效应不干净（clear_main_effects=False）",
+          _a8.get("clear_main_effects") is False,
+          "clear=%r" % _a8.get("clear_main_effects"))
+
+    # ② 全因子 2^3 无混杂：不能因为"扫描器见过 L8"就把所有设计都判成 III
+    _mff = DOE.build_design("full_factorial", 3, 2)
+    _aff = DOE.alias_structure(_mff, ["A", "B", "C"])
+    check("P1-7 全因子 2^3 无主效应混杂",
+          _aff.get("applicable") and not (_aff.get("main_aliases") or []),
+          "res=%r main=%r" % (_aff.get("resolution"), _aff.get("main_aliases")))
+
+    # ③ 响应面设计不适用二水平别名代数，必须如实说"不适用"而不是硬套
+    _mcc = DOE.build_design("ccd", 3)
+    _acc = DOE.alias_structure(_mcc, ["A", "B", "C"])
+    check("P1-7 CCD 不做别名推断（如实标不适用）",
+          _acc.get("applicable") is False and bool(_acc.get("reason")),
+          "applicable=%r" % _acc.get("applicable"))
+
+    # ④ 功效：样本量翻倍，可检出效应必须变小（不写死数值，只看单调性与方向）
+    _p8 = DOE.power_analysis(8, levels=2)
+    _p32 = DOE.power_analysis(32, levels=2)
+    check("P1-7 功效分析可用且给出可检出效应",
+          _p8 and _p32 and _p8.get("detectable_effect_sigma") is not None,
+          "detect8=%r" % (_p8 or {}).get("detectable_effect_sigma"))
+    check("P1-7 样本量增加则可检出效应变小",
+          _p32["detectable_effect_sigma"] < _p8["detectable_effect_sigma"],
+          "8次=%.3fσ 32次=%.3fσ" % (_p8["detectable_effect_sigma"],
+                                    _p32["detectable_effect_sigma"]))
+    check("P1-7 功效随效应量增大而提高",
+          _p8["power_at_2sigma"] > _p8["power_at_1sigma"],
+          "1σ=%.3f 2σ=%.3f" % (_p8["power_at_1sigma"], _p8["power_at_2sigma"]))
+
+    # ⑤ 设计结构：重复数/区组数/作业顺序表
+    _st = DOE.design_structure(_m8, ["A", "B", "C", "D", "E", "F", "G"],
+                               n_replicates=2, n_blocks=2, seed=7)
+    check("P1-7 总试验次数 = 基础次数 × 重复数",
+          _st and _st["total_runs"] == len(_m8) * 2, "total=%r" % (_st or {}).get("total_runs"))
+    check("P1-7 作业顺序表覆盖全部试验且序号唯一连续",
+          len(_st["run_sheet"]) == _st["total_runs"]
+          and [r["seq"] for r in _st["run_sheet"]] == list(range(1, _st["total_runs"] + 1)),
+          "sheet=%r" % len(_st["run_sheet"]))
+    check("P1-7 区组分配覆盖全部区组",
+          len(_st["blocks"]["sizes"]) == 2 and sum(_st["blocks"]["sizes"].values()) == _st["total_runs"],
+          "sizes=%r" % _st["blocks"]["sizes"])
+    check("P1-7 随机化顺序可按种子复现",
+          DOE.design_structure(_m8, None, seed=7)["run_sheet"]
+          == DOE.design_structure(_m8, None, seed=7)["run_sheet"])
+    check("P1-7 换种子则运行顺序改变",
+          DOE.design_structure(_m8, None, seed=7)["run_sheet"]
+          != DOE.design_structure(_m8, None, seed=8)["run_sheet"])
+    check("P1-7 每个重复各自独立随机化（不是同一顺序复制）",
+          DOE.design_structure(_m8, None, n_replicates=2, seed=7)["run_sheet"][:len(_m8)]
+          != DOE.design_structure(_m8, None, n_replicates=2, seed=7)["run_sheet"][len(_m8):],
+          "replicate1 与 replicate2 的 base_run 序列不应相同")
+
+    # ⑥ 饱和设计残差自由度为 0，必须给 high 级告警
+    _hi = [c for c in (_st.get("caveats") or []) if c.get("level") == "high"]
+    check("P1-7 残差自由度归零时给出 high 级告警",
+          _st["residual_df"] <= 0
+          and any("残差自由度" in c.get("text", "") for c in _hi),
+          "residual_df=%r high=%r" % (_st["residual_df"], [c["text"][:20] for c in _hi]))
+    check("P1-7 分辨度 III 时给出 high 级告警",
+          any("分辨度 III" in c.get("text", "") for c in _hi),
+          "high=%r" % [c["text"][:24] for c in _hi])
+
+    # ⑦ 空矩阵/坏输入不应炸，返回 None 由调用方降级
+    check("P1-7 空设计矩阵返回 None（不抛异常）",
+          DOE.design_structure([]) is None and DOE.design_structure(None) is None)
+    check("P1-7 非法功效输入返回 None", DOE.power_analysis(0) is None)
+
+
 if __name__ == "__main__":
     print("newenergy-fde 自检开始")
     test_table()
@@ -3082,6 +3175,7 @@ if __name__ == "__main__":
     test_tenant_path_guard()
     test_p1_field_mapping_confidence()
     test_p1_spc_exclusion_review()
+    test_p1_doe_structure()
     print("\n" + "=" * 56)
     print("通过 %d 项，失败 %d 项" % (len(PASS), len(FAIL)))
     if FAIL:

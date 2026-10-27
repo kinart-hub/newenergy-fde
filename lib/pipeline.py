@@ -335,6 +335,7 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
             sheet=None, spec_overrides=None, do_doe=True, max_charts=12,
             auto_adapt=False, tenant=None, industry=None, rules=None,
             spc_exclusion_mode="auto",
+            doe_replicates=1, doe_blocks=1, doe_seed=0,
             export_xlsx=True, d2_card=None, emit_d2_card=True, verbose=False,
             views=None):
     """
@@ -1443,11 +1444,30 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
                 chosen = opts[0]
                 matrix = DOE.build_design(chosen["kind"], len(factors), 2, chosen.get("param"))
                 plan = DOE.decode_design(matrix, factors) if matrix else []
+                # P1-7：矩阵只是"做哪些组合"，不是可执行方案。随机化顺序、重复、
+                # 区组、别名结构、样本量功效这五件事不写出来，现场只能靠习惯补。
+                _struct = None
+                if matrix:
+                    try:
+                        _struct = DOE.design_structure(
+                            matrix, [f.get("name") for f in factors],
+                            n_replicates=doe_replicates, n_blocks=doe_blocks,
+                            seed=doe_seed)
+                    except Exception as _ds_e:
+                        degrade.note("pipeline.analyze@design_structure", _ds_e)
+                        _struct = None
                 doe_plan = {"factors": factors, "options": opts, "excluded": excluded,
                             "chosen": chosen, "matrix": matrix, "run_plan": plan,
                             "constraints": _cons, "clamped": _clamped}
                 doe_plan["boundaries"] = _bounds
                 doe_plan["boundary_gate"] = _gate
+                if _struct:
+                    doe_plan["design_structure"] = _struct
+                    # 只把"会让人下错结论"的那几条顶到 warnings，其余留在设计结构里自查
+                    for _c in (_struct.get("caveats") or []):
+                        if _c.get("level") == "high":
+                            result.setdefault("warnings", []).append(
+                                "DOE 设计结构：%s" % _c.get("text"))
                 _src_note = ""
                 for _w in (_gate.get("warnings") or []):
                     _src_note += "⚠ %s；" % _w
@@ -2717,6 +2737,14 @@ def main():
                     default="auto", choices=["auto", "suggest", "review"],
                     help="SPC 剔除模式：auto=命中即剔除(默认)；suggest=只标记可疑点不剔除、"
                          "交人复核；review=按外部复核结论剔除（需另行提供复核记录）")
+    ap.add_argument("--doe-replicates", dest="doe_replicates", type=int, default=1,
+                    help="DOE 每个试验号的重复次数（>=1）。不重复就没有纯误差估计，"
+                         "显著性结论站不住")
+    ap.add_argument("--doe-blocks", dest="doe_blocks", type=int, default=1,
+                    help="DOE 区组数（>=1），用于隔离班次/机台/原料批等已知噪声")
+    ap.add_argument("--doe-seed", dest="doe_seed", type=int, default=0,
+                    help="DOE 运行顺序随机化种子（默认 0，保证顺序可复现；"
+                         "现场排产时可另指定）")
     ap.add_argument("--no-xlsx", action="store_true",
                     help="不导出 Excel 结果表")
     ap.add_argument("--d2-card", default=None,
@@ -2746,6 +2774,8 @@ def main():
                   do_doe=not args.no_doe, auto_adapt=args.auto_adapt,
                   tenant=args.tenant, industry=args.industry, rules=args.rules,
                   spc_exclusion_mode=args.spc_exclusion_mode,
+                  doe_replicates=args.doe_replicates, doe_blocks=args.doe_blocks,
+                  doe_seed=args.doe_seed,
                   export_xlsx=not args.no_xlsx, d2_card=args.d2_card,
                   emit_d2_card=not args.no_d2_card,
                   verbose=args.verbose, views=args.view)

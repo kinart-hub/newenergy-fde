@@ -1812,6 +1812,58 @@ def rule_p1_spc_exclusion_review():
     return _r(True, "", {"spc_exclusion_review": True})
 
 
+def rule_p1_doe_structure():
+    """P1-7：DOE 方案必须给出随机化 / 重复 / 区组 / 别名结构 / 功效的结构化信息。
+
+    改造前只有一张设计矩阵：没说先做哪一号、做几次、要不要分区组、
+    哪些效应其实混在一起分不开、这个样本量能检出多大的差异——全靠现场用习惯补。
+    判据落在**计算动作**上（真的调用了随机化、真的用异或判别名、功效真的按公式算），
+    不落在"字段出现过"这种字样层，否则把计算删掉、只留字段也能蒙混过关。
+    """
+    t = _read(DOE_FILE) or ""
+    if not t:
+        return _r(False, "读不到 " + DOE_FILE)
+    # 1) 结构化入口存在
+    if "def design_structure(" not in t:
+        return _r(False, "缺少 design_structure：DOE 无结构化设计说明入口")
+    # 2) 随机化必须真的发生（有发生器 + 真的洗牌），不是只写一句"建议随机化"
+    if "random.Random(" not in t:
+        return _r(False, "design_structure 未建立可复现的随机化发生器（缺 random.Random）")
+    if not re.search(r"\.shuffle\s*\(", t):
+        return _r(False, "运行顺序未被随机化：run_sheet 会退化成顺序执行，未知干扰冒充因子效应")
+    # 3) 别名结构必须按矩阵计算（调用 _two_level_cols 取列后判异或），不能是查表或空壳
+    if "def alias_structure(" not in t:
+        return _r(False, "缺少 alias_structure：混杂关系无从得知")
+    if not re.search(r"[=(]\s*_two_level_cols\s*\(", t):
+        return _r(False, "alias_structure 未调用 _two_level_cols：别名不是从矩阵算出来的")
+    if not re.search(r"\^\s*y", t):
+        return _r(False, "别名判据缺按位异或运算：二水平交互列等价关系未成立")
+    if '"resolution"' not in t or '"main_aliases"' not in t:
+        return _r(False, "别名结构未输出 resolution / main_aliases")
+    # 4) 功效必须按公式算，不能写死一个数
+    if "def power_analysis(" not in t:
+        return _r(False, "缺少 power_analysis：样本量够不够无人知晓")
+    if not re.search(r"\(\s*z_a\s*\+\s*z_b\s*\)\s*\*\s*se", t):
+        return _r(False, "可检出效应不是按 (z_a+z_b)*se 计算的：功效数字不可信")
+    if '"detectable_effect_sigma"' not in t:
+        return _r(False, "功效未输出可检出效应（detectable_effect_sigma）")
+    # 5) 残差自由度归零必须告警——饱和正交表最常见，"做了却下不了结论"必须被说出来
+    if not re.search(r"if\s+residual_df\s*<=\s*0\s*:", t):
+        return _r(False, "残差自由度归零未告警：饱和设计的 F 检验不可用却无人提醒")
+    # 6) 重复与区组必须进结构化输出
+    if '"replicates"' not in t or '"blocks"' not in t:
+        return _r(False, "design_structure 未输出 repeats/blocks 结构")
+    if '"run_sheet"' not in t:
+        return _r(False, "缺少 run_sheet：没有可直接执行/打印的作业顺序表")
+    # 7) 管线必须真正接线，否则这些能力只是库里的死代码
+    tp = _read(PIPELINE_FILE) or ""
+    if "DOE.design_structure(" not in tp:
+        return _r(False, "pipeline 未调用 design_structure：DOE 结构化未接线")
+    if "doe_replicates" not in tp or "doe_seed" not in tp:
+        return _r(False, "pipeline.analyze 未接入 doe_replicates/doe_seed：参数不可调")
+    return _r(True, "", {"doe_structure": True})
+
+
 AUDIT_RULES = [
     Rule("LICENSE 为 Elastic 2.0 官方纯文本", rule_license,
          "LICENSE 首行必须是裸文本 'Elastic License 2.0'（前面有 # 或 ## 即判不过）",
@@ -2390,6 +2442,23 @@ AUDIT_RULES = [
           _mutant("review 不被实际使用（一律按 approved 剔除）",
                   _re_sub(r'isinstance\(rev, dict\) and rev\.get\("status"\) == "approved"',
                           'True', flags=re.M), SPCPy)]),
+    Rule("DOE 方案必须结构化：随机化顺序 / 重复 / 区组 / 别名结构 / 样本量功效",
+         rule_p1_doe_structure,
+         "P1-7。design_structure 必须真的建立随机化发生器并洗牌（run_sheet 可复现），"
+         "alias_structure 必须调用 _two_level_cols 并按位异或判混杂、输出 resolution/main_aliases，"
+         "power_analysis 必须按 (z_a+z_b)*se 计算可检出效应并输出 detectable_effect_sigma，"
+         "残差自由度归零必须告警，重复与区组必须进结构化输出；"
+         "pipeline.analyze 必须调用 design_structure 并接入 doe_replicates/doe_seed。",
+         DOE_FILE,
+         [_mutant("随机化退化成顺序执行（未知干扰会冒充因子效应）",
+                  _re_sub(r"rng\.shuffle\(order\)", "order = list(order)",
+                          flags=re.M), DOE_FILE),
+          _mutant("别名结构恒判不适用（混杂关系消失）",
+                  _re_sub(r"got = _two_level_cols\(matrix\)", "got = None",
+                          flags=re.M), DOE_FILE),
+          _mutant("可检出效应写死为 1.0（功效数字变成装饰）",
+                  _re_sub(r"d_detect = \(z_a \+ z_b\) \* se", "d_detect = 1.0",
+                          flags=re.M), DOE_FILE)]),
 ]
 
 

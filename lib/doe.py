@@ -17,6 +17,7 @@ doe.py —— 试验设计（DOE）与参数寻优
 
 import math
 import itertools
+import random
 import re
 try:
     from . import degrade          # 包模式
@@ -206,6 +207,288 @@ def decode_design(matrix, factor_specs):
                 rec[spec["name"]] = mid + (v - 1) * half
         out.append(rec)
     return out
+
+
+# ------------------------------------------------------------------ 设计结构（P1-7）
+#
+# 一张设计矩阵本身不是可执行方案：没说先做哪一号、做几次、要不要分区组、
+# 哪些效应其实混在一起分不开、这个样本量到底能检出多大的差异。
+# 这五件事过去都停在自由文本里，现场拿到矩阵只能靠习惯补——补错了没人发现。
+# 这一段把它们变成结构化字段，让"能不能照着做、做出来能不能下结论"可被检查。
+
+def _norm_ppf(p):
+    """标准正态分位数（二分法，零依赖；不引 scipy）。p∈(0,1)"""
+    try:
+        p = float(p)
+    except Exception:
+        return None
+    if not (0.0 < p < 1.0):
+        return None
+    lo, hi = -12.0, 12.0
+    for _ in range(200):
+        mid = (lo + hi) / 2.0
+        if S.norm_cdf(mid) < p:
+            lo = mid
+        else:
+            hi = mid
+    return (lo + hi) / 2.0
+
+
+def _two_level_cols(matrix):
+    """设计矩阵 -> 0/1 列。仅当矩阵确为二水平时返回 (cols, coding)，否则返回 None。
+
+    二水平设计有三种常见写法（0/1、1/2 水平号、-1/+1 编码），别名代数只在
+    二水平正规设计上成立，所以这里必须先判清楚，判不清就不做推断。
+    """
+    if not matrix or not matrix[0]:
+        return None
+    vals = set()
+    for row in matrix:
+        for v in row:
+            try:
+                vals.add(int(round(float(v))))
+            except Exception:
+                return None
+    if not vals:
+        return None
+    w = len(matrix[0])
+    try:
+        if vals <= {0, 1}:
+            return ([[int(round(float(r[j]))) for r in matrix] for j in range(w)], "0/1")
+        if vals <= {1, 2}:
+            return ([[int(round(float(r[j]))) - 1 for r in matrix] for j in range(w)], "1/2")
+        if vals <= {-1, 1}:
+            return ([[0 if int(round(float(r[j]))) < 0 else 1 for r in matrix]
+                     for j in range(w)], "-1/+1")
+    except Exception as _e:
+        degrade.note("doe._two_level_cols", _e)
+        return None
+    return None
+
+
+def alias_structure(matrix, factor_names=None):
+    """二水平正规设计的别名结构——在矩阵上直接判，不查表、不写死哪张表几级。
+
+    原理：±1 编码下交互列等于主效应列的按位异或（A·B ↔ a^b），
+    于是「主效应 j 与交互 (a,b) 混杂」等价于 col_j == col_a ^ col_b。
+    判据落在矩阵上，换任何一张二水平表都仍然成立；
+    三水平与响应面设计不适用这套代数，如实返回 applicable=False，不硬凑。
+    """
+    got = _two_level_cols(matrix)
+    if got is None:
+        return {"applicable": False,
+                "reason": "非二水平正规设计（三水平正交表 / 响应面设计不适用二水平别名代数）",
+                "resolution": None, "main_aliases": [], "two_fi_aliases": [],
+                "clear_main_effects": None,
+                "note": "该设计的混杂结构需按其自身模型评估，此处不做别名推断，避免给出看似精确的错结论"}
+    cols, coding = got
+    n = len(matrix)
+    k = len(cols)
+    names = [(factor_names[j] if factor_names and j < len(factor_names) and factor_names[j]
+              else "X%d" % (j + 1)) for j in range(k)]
+
+    def _xor(idxs):
+        acc = [0] * n
+        for i in idxs:
+            acc = [x ^ y for x, y in zip(acc, cols[i])]
+        return acc
+
+    pairs = list(itertools.combinations(range(k), 2))
+    pair_col = {}
+    for p in pairs:
+        pair_col[p] = _xor(p)
+
+    main_aliases = []
+    _main_with_2fi = False
+    _main_with_3fi = False
+    for j in range(k):
+        hit2 = ["%s×%s" % (names[a], names[b]) for a, b in pairs
+                if a != j and b != j and cols[j] == pair_col[(a, b)]]
+        hit3 = []
+        if not hit2 and k >= 4:
+            hit3 = ["%s×%s×%s" % (names[a], names[b], names[c])
+                    for a, b, c in itertools.combinations(range(k), 3)
+                    if j not in (a, b, c) and cols[j] == _xor((a, b, c))]
+        if hit2:
+            _main_with_2fi = True
+        elif hit3:
+            _main_with_3fi = True
+        if hit2 or hit3:
+            main_aliases.append({"factor": names[j],
+                                 "order": 2 if hit2 else 3,
+                                 "aliased_with": (hit2 or hit3)[:6]})
+
+    two_fi = []
+    for p in pairs:
+        hit = ["%s×%s" % (names[q[0]], names[q[1]]) for q in pairs
+               if q != p and not (set(q) & set(p)) and pair_col[p] == pair_col[q]]
+        if hit:
+            two_fi.append({"interaction": "%s×%s" % (names[p[0]], names[p[1]]),
+                           "aliased_with": hit[:6]})
+
+    if _main_with_2fi:
+        resolution = "III"
+    elif _main_with_3fi or two_fi:
+        resolution = "IV"
+    else:
+        resolution = "≥V"
+    notes = {
+        "III": "主效应与二因子交互混杂：交互若真实存在，它的贡献会被算进主效应。"
+               "只能用于筛选阶段，选出的因子必须经确认试验再下结论",
+        "IV": "主效应不与二因子交互混杂（主效应可解释），但二因子交互之间彼此混杂，"
+              "交互只能成组判断、不能指认到具体某一对",
+        "≥V": "主效应与二因子交互均互不混杂，可分别估计",
+    }
+    return {"applicable": True, "coding": coding, "resolution": resolution,
+            "main_aliases": main_aliases, "two_fi_aliases": two_fi,
+            "clear_main_effects": not _main_with_2fi,
+            "note": notes[resolution]}
+
+
+def power_analysis(n_runs, levels=2, alpha=0.05, target_power=0.80, sigma=None):
+    """二水平设计的功效评估（正态近似，零依赖）。
+
+    比较两个水平均值时每水平样本量 n_per = n_runs/levels，
+    均值差的标准误 = σ·sqrt(1/n_per + 1/n_per) = σ·sqrt(2/n_per)。
+    所以「能检出多大的效应」= (z_{1-α/2} + z_{1-β}) · sqrt(2/n_per) · σ。
+    这个数字不写进方案，使用者就不知道"没检出显著"到底是真没差异还是样本量不够。
+    """
+    try:
+        n_runs = int(n_runs)
+    except Exception:
+        return None
+    if n_runs < 2 or levels < 2:
+        return None
+    n_per = n_runs / float(levels)
+    if n_per < 1.0:
+        return None
+    se = math.sqrt(2.0 / n_per)
+    z_a = _norm_ppf(1.0 - alpha / 2.0)
+    z_b = _norm_ppf(target_power)
+    if z_a is None or z_b is None:
+        return None
+    d_detect = (z_a + z_b) * se
+
+    def _pw(d):
+        ncp = d / se
+        return S.norm_cdf(ncp - z_a) + S.norm_cdf(-ncp - z_a)
+
+    out = {
+        "alpha": alpha, "target_power": target_power,
+        "n_per_level": n_per, "se_in_sigma": se,
+        "detectable_effect_sigma": d_detect,
+        "detectable_effect_abs": (d_detect * sigma) if sigma else None,
+        "power_at_1sigma": _pw(1.0), "power_at_2sigma": _pw(2.0),
+        "basis": "两水平均值比较的正态近似（z 检验），未计检验的自由度损失，"
+                 "小样本下真实功效略低于此值",
+    }
+    out["note"] = (
+        "按 α=%.2f、功效 %.0f%% 计，本方案每水平 %g 次试验，"
+        "可检出的最小效应约为 %.2f 倍标准差%s。"
+        "效应小于此值的因子大概率检不出——那时\"不显著\"不等于\"没影响\"，只能说本次样本量看不见它"
+        % (alpha, target_power * 100, n_per, d_detect,
+           ("（约 %.4g）" % (d_detect * sigma)) if sigma else ""))
+    return out
+
+
+def design_structure(matrix, factor_names=None, n_replicates=1, n_blocks=1,
+                     seed=0, levels=2, alpha=0.05, target_power=0.80, sigma=None):
+    """把设计矩阵升级为可执行、可审计的试验结构（P1-7）。
+
+    返回 dict：runs_base / n_factors / total_runs / run_sheet / randomization /
+               replicates / blocks / alias / power / residual_df / caveats
+    run_sheet 是可直接打印带走的作业顺序表（seq / replicate / base_run / block）。
+    """
+    if not matrix:
+        return None
+    try:
+        rep = max(1, int(n_replicates))
+    except Exception:
+        rep = 1
+    try:
+        nb = max(1, int(n_blocks))
+    except Exception:
+        nb = 1
+    n = len(matrix)
+    k = len(matrix[0]) if matrix[0] else 0
+    if n <= 0 or k <= 0:
+        return None
+
+    rng = random.Random(seed)
+    run_sheet = []
+    block_sizes = {}
+    seq = 0
+    for r in range(1, rep + 1):
+        order = list(range(n))
+        rng.shuffle(order)      # 每个重复各自独立随机化，不复用同一顺序
+        per = max(1, n // nb) if nb > 1 else n
+        for pos, base in enumerate(order):
+            seq += 1
+            blk = min(nb, pos // per + 1) if nb > 1 else 1
+            run_sheet.append({"seq": seq, "replicate": r, "base_run": base + 1,
+                              "block": blk})
+            block_sizes[blk] = block_sizes.get(blk, 0) + 1
+
+    # 残差自由度：试验次数 - 1 - 主效应个数。正交表把列排满时它会归零，
+    # 那时没有独立的误差估计，ANOVA 的 F 检验无从谈起——这是最常见的"做了却下不了结论"。
+    residual_df = n - 1 - k
+
+    caveats = []
+    if rep <= 1:
+        caveats.append({"level": "high",
+                        "text": "未设重复（每号只做 1 次）：没有纯误差估计，"
+                                "显著性只能借用残差自由度，结论不稳。建议至少 2 次重复或增设中心点"})
+    if residual_df <= 0:
+        caveats.append({"level": "high",
+                        "text": "残差自由度为 %d（试验 %d 次 − 1 − 因子 %d ≤ 0）："
+                                "误差项无从估计，F 检验与 p 值不可用。"
+                                "必须增加重复数、加中心点，或减少因子数重排设计"
+                                % (residual_df, n, k)})
+    elif residual_df < 3:
+        caveats.append({"level": "info",
+                        "text": "残差自由度仅 %d，误差估计很粗糙，显著性结论请按趋势看待" % residual_df})
+    if nb > 1:
+        caveats.append({"level": "info",
+                        "text": "已划 %d 个区组（每区组 %s 次）：区组按随机化顺序切分，"
+                                "区组效应可能与时间漂移部分混杂。"
+                                "若噪声源明确（班次/机台/原料批），建议整区组内跑完一轮完整设计"
+                                % (nb, "、".join(str(block_sizes.get(b, 0)) for b in range(1, nb + 1)))})
+
+    alias = alias_structure(matrix, factor_names)
+    if alias.get("applicable") and alias.get("resolution") == "III":
+        caveats.append({"level": "high",
+                        "text": "该设计分辨度 III：主效应与二因子交互混杂。"
+                                "只能用于筛选，选出的因子需经确认试验才能作为调参依据"})
+    if not alias.get("applicable"):
+        caveats.append({"level": "info", "text": alias.get("reason") or "未提供别名结构"})
+
+    power = power_analysis(n * rep, levels=levels, alpha=alpha,
+                           target_power=target_power, sigma=sigma)
+
+    return {
+        "runs_base": n, "n_factors": k, "n_replicates": rep, "n_blocks": nb,
+        "total_runs": n * rep, "residual_df": residual_df,
+        "run_sheet": run_sheet,
+        "randomization": {
+            "enabled": True, "seed": seed,
+            "note": "随机化不是为了好看：设备漂移、班次、环境温湿度这类未知干扰若不被打散，"
+                    "会系统性地落在某些水平上，冒充成因子效应。"
+                    "执行时必须按 run_sheet 的顺序做，不要为了省事把同一水平的点连着做",
+        },
+        "replicates": {
+            "n": rep,
+            "note": "重复提供纯误差估计：没有重复就无法区分\"因子真的有影响\""
+                    "与\"这次碰巧测成这样\"",
+        },
+        "blocks": {
+            "n": nb, "sizes": block_sizes,
+            "note": "区组用于隔离已知噪声源（班次 / 机台 / 原料批），"
+                    "让区组内的比较不受该噪声污染",
+        },
+        "alias": alias,
+        "power": power,
+        "caveats": caveats,
+    }
 
 
 # ------------------------------------------------------------------ 效应分析
