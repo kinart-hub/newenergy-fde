@@ -650,6 +650,9 @@ AUDIT_FILES = [
     # 规则 49 要读降级台账确认"护栏失败会转发到可观测性"，
     # 不复制过去副本里就没有这个文件，基线直接判不过
     os.path.join("lib", "degrade.py"),
+    # 规则 56：原生 Word/PDF 导出。判据同时读 export_doc.py 与 pipeline.py，
+    # 变异要注入这两个文件——缺了 export_doc.py 会静默 SKIP（不是 FAIL）
+    os.path.join("lib", "export_doc.py"),
     os.path.join("knowledge", "process_specs.json"),
 ]
 
@@ -1107,6 +1110,7 @@ TENANCY_FILE = os.path.join("lib", "tenancy.py")
 EIGHTD_FILE = os.path.join("lib", "eightd.py")
 PIPELINE_FILE = os.path.join("lib", "pipeline.py")
 MSA_FILE = os.path.join("lib", "msa.py")
+EXPORT_FILE = os.path.join("lib", "export_doc.py")
 PREPROCESS_FILE = os.path.join("lib", "preprocess.py")
 SPCPy = os.path.join("lib", "spc.py")
 CONTRACT_FILE = os.path.join("lib", "contract.py")
@@ -2205,6 +2209,64 @@ def rule_autocorrelation_chart():
     return _r(True, "", {"n_checks": 4})
 
 
+def rule_export_native():
+    """原生 Word/PDF 导出必须是「真文件」，且导出失败必须出声。
+
+    判据一律落在**写入动作**，不停在"有没有这个函数"：
+      * .docx 必须写 `[Content_Types].xml` 与图片部件——只查入口的话，
+        把 HTML 换个扩展名照样判过，而对面的 8D 系统根本吃不下；
+      * .pdf 的 xref 偏移必须来自累加的写入位置（offsets[i]），
+        写死偏移的话文件生成得出来、所有阅读器都打不开；
+      * 导出失败必须同时进 warnings 与 degraded_sections——
+        少了交付形态却不出声，使用者会以为导出过、只是没找到文件。
+    """
+    t = _read(EXPORT_FILE) or ""
+    p = _read(PIPELINE_FILE) or ""
+    if not t:
+        return _r(False, "读不到 lib/export_doc.py")
+    for fn in ("def render_docx(", "def write_docx(",
+               "def render_pdf(", "def write_pdf("):
+        if fn not in t:
+            return _r(False, "缺导出入口 %s（lib/export_doc.py）" % fn)
+    # 1) docx 必须是 OOXML 包；没有 Content_Types 就只是换后缀的文件
+    if 'z.writestr("[Content_Types].xml"' not in t:
+        return _r(False, "docx 未写 [Content_Types].xml：那不是 Word 包")
+    # 2) 图表必须真的作为部件进包。报告里的图是证据，丢图＝丢证据
+    if 'z.writestr("word/media/"' not in t:
+        return _r(False, "docx 未写入图片部件：图表在 Word 版里被丢掉了")
+    # 3) PDF：标准头 + startxref，且 xref 偏移来自实际写入位置
+    if 'out.write(b"%PDF-1.4' not in t or "startxref" not in t:
+        return _r(False, "PDF 缺标准头或 startxref，阅读器打不开")
+    if "offsets.append(out.tell())" not in t \
+            or not re.search(r'"%010d 00000 n[^"]*"\s*%\s*offsets\[i\]', t):
+        return _r(False, "PDF 的 xref 偏移不是来自实际写入位置："
+                         "文件能生成但谁都打不开")
+    # 4) 中文不能变成方框/乱码
+    if "STSong-Light" not in t or "UniGB-UCS2-H" not in t:
+        return _r(False, "PDF 未挂中文预定义字体与 UniGB-UCS2-H 编码：正文会成乱码")
+    # 5) 复杂 SVG 元素不硬猜——画一张错的图比不画更糟
+    if "图见同名 SVG" not in t:
+        return _r(False, "复杂 SVG 元素没有原位标注兜底：画错的图会让人误读")
+    # 6) 两个导入分支都要登记，只改一套会在另一种调用方式下 NameError
+    if p.count("import export_doc as EX") < 2:
+        return _r(False, "两个导入分支没有都登记 export_doc："
+                         "只改一套会在另一条调用路径上 NameError")
+    # 7) 导出失败必须出声：判据按"块内有没有两处登记"，删任一段都会被抓
+    _i = p.find("if export_docx and EX is not None:")
+    _j = p.find("if export_pdf and EX is not None:")
+    _k = p.find("if export_xlsx:")
+    if _i < 0 or _j < 0 or _k < 0 or not (_i < _j < _k):
+        return _r(False, "管线未按 docx / pdf 分块导出")
+    _bx, _bp = p[_i:_j], p[_j:_k]
+    for _nm, _blk in (("docx", _bx), ("pdf", _bp)):
+        if "导出失败" not in _blk \
+                or 'setdefault("warnings"' not in _blk \
+                or 'setdefault("degraded_sections"' not in _blk:
+            return _r(False, "%s 导出失败未同时进 warnings 与 degraded_sections："
+                             "少了交付形态却没人知道" % _nm)
+    return _r(True, "", {"n_checks": 7})
+
+
 def rule_msa_gate():
     """测量系统能力必须真能限制结论，而不是报告末尾的一句免责。
 
@@ -3118,6 +3180,36 @@ AUDIT_RULES = [
                       'if c in work.columns else None) \\\n'
                       '                    not in ("measure", "count"):\n'
                       '                continue\n', ""),
+                  PIPELINE_FILE)]),
+    Rule("原生 Word/PDF 导出必须是真文件，且导出失败必须出声", rule_export_native,
+         "（1）lib/export_doc.py 有 render/write 的 docx 与 pdf 四入口；"
+         "（2）docx 写 [Content_Types].xml 与 word/media/ 图片部件（不写图＝丢证据）；"
+         "（3）PDF 写 %PDF-1.4 头与 startxref，且 xref 偏移来自 offsets[i]"
+         "（写死偏移＝生成得出来、谁都打不开）；"
+         "（4）PDF 挂 STSong-Light + UniGB-UCS2-H（中文不成乱码）；"
+         "（5）复杂 SVG 不硬猜、原位标注『图见同名 SVG』；"
+         "（6）pipeline 两个导入分支都登记 export_doc（只改一套会 NameError）；"
+         "（7）docx/pdf 导出失败都同时进 warnings 与 degraded_sections",
+         EXPORT_FILE,
+         [_mutant("docx 不写 Content_Types（只是换后缀的文件）",
+                  _sub('    z.writestr("[Content_Types].xml", "".join(ct))\n', ""),
+                  EXPORT_FILE),
+          _mutant("docx 丢掉图片部件（Word 版只剩文字）",
+                  _sub('            z.writestr("word/media/" + n, d)\n',
+                       "            pass\n"),
+                  EXPORT_FILE),
+          _mutant("PDF 的 xref 偏移写死（文件生成得出来、打不开）",
+                  _sub('out.write(("%010d 00000 n \\n" % offsets[i]).encode("latin-1"))',
+                       'out.write(("0000000000 00000 n \\n").encode("latin-1"))'),
+                  EXPORT_FILE),
+          _mutant("导出失败静默吞掉（少了交付形态却没人知道）",
+                  _re_sub(r'^\s*result\.setdefault\("warnings", \[\]\)\.append\('
+                          r'\n\s*"Word\(\.docx\) 导出失败.*?\n'
+                          r'\s*result\.setdefault\("degraded_sections", \[\]\)\.append\('
+                          r'.*?\n', "            pass\n",
+                          flags=re.M | re.S), PIPELINE_FILE),
+          _mutant("两个导入分支只留一个（另一条路径 NameError）",
+                  _sub("        from . import export_doc as EX\n", ""),
                   PIPELINE_FILE)]),
 ]
 

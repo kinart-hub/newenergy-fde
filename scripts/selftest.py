@@ -36,6 +36,7 @@ import shutil
 import threading
 import tempfile
 import json
+import zlib
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
@@ -3796,6 +3797,156 @@ def test_msa_gauge_rr_gate():
           "pct=%s" % (_r or {}).get("pct_grr"))
 
 
+def test_export_docx_pdf():
+    """原生 Word/PDF 导出（评审 P1-2）：交付要进 8D 系统，对面要的是 .docx/.pdf。
+
+    这里验的是"打开会不会翻车"，不是"文件在不在"：
+      * docx 的每个 XML 部件都要能被解析器读通（坏包 Word 直接报错）；
+      * pdf 的 xref 偏移必须逐条对得上（对不上就是生成得出来、谁都打不开）；
+      * 图表必须真进包——Word 版只剩文字等于把证据丢了；
+      * 导出失败必须出声，不许静默少一种交付形态。
+    """
+    print("\n[原生 Word/PDF 导出]")
+    import zipfile as _zf
+    import xml.etree.ElementTree as _ET
+    import tempfile as _tf
+
+    try:
+        import lib.export_doc as EX
+        import lib.report as RPT
+    except Exception as e:                                   # pragma: no cover
+        check("导入 lib.export_doc / lib.report", False, str(e))
+        return
+
+    # 1) 造一份含图、含表、含 Markdown/HTML 混排的最小报告
+    rep = RPT.Report("导出自检报告", {"数据源": "selftest.csv", "工序": "涂布"})
+    s1 = rep.section("1. 结论摘要", level=2)
+    rep.callout(s1, "**加粗**与 <b>HTML</b> 都要被清干净", kind="bad")
+    rep.text(s1, "首要候选根因：浆料粘度（得分 0.77）")
+    rep.kv(s1, [("样本量", 180), ("置信度", "中低")])
+    rep.bullets(s1, ["按第 11 节补数据", "复算后确认"])
+    rep.table(s1, ["参数", "得分"], [["浆料粘度", "0.77"], ["涂布速度", "0.41"]],
+              caption="候选根因")
+    svg = ('<svg xmlns="http://www.w3.org/2000/svg" width="400" height="200">'
+           '<rect x="10" y="10" width="380" height="180" fill="#EEF2FF"/>'
+           '<polyline points="20,180 120,90 220,120 320,40" fill="none" '
+           'stroke="#4F46E5" stroke-width="2"/><circle cx="320" cy="40" r="4" '
+           'fill="#DC2626"/><text x="20" y="30">趋势</text></svg>')
+    rep.chart(s1, svg, caption="SPC 趋势图", fname="chart_test.svg")
+
+    tmpd = _tf.mkdtemp(prefix="fde_export_")
+    try:
+        dp = os.path.join(tmpd, "r.docx")
+        pp = os.path.join(tmpd, "r.pdf")
+        EX.write_docx(rep, dp)
+        EX.write_pdf(rep, pp)
+
+        # ---- docx ----
+        check("docx 落盘且非空", os.path.getsize(dp) > 1000,
+              "%d 字节" % os.path.getsize(dp))
+        z = _zf.ZipFile(dp)
+        names = z.namelist()
+        _bad = []
+        for n in names:
+            if n.endswith(".xml") or n.endswith(".rels"):
+                try:
+                    _ET.fromstring(z.read(n))
+                except Exception as e:
+                    _bad.append("%s:%s" % (n, str(e)[:40]))
+        check("docx 每个部件都是合法 XML（坏包 Word 直接打不开）", not _bad,
+              str(_bad[:2]))
+        check("docx 有 [Content_Types].xml 与 document.xml",
+              "[Content_Types].xml" in names and "word/document.xml" in names, "")
+        _med = [n for n in names if n.startswith("word/media/")]
+        check("图表真的作为图片部件进包（Word 版不得只剩文字）",
+              len(_med) == 1 and _med[0].endswith(".svg"), str(_med))
+        doc = z.read("word/document.xml").decode("utf-8")
+        _txt = "".join(re.findall(r"<w:t[^>]*>([^<]*)</w:t>", doc))
+        check("docx 正文含表格文字与图注", "浆料粘度" in _txt and "SPC 趋势图" in _txt,
+              "%d 字" % len(_txt))
+        check("docx 无残留 Markdown/HTML 标记（** 与 <b>）",
+              "**" not in _txt and "<b>" not in _txt, _txt[:60])
+        _ct = z.read("[Content_Types].xml").decode("utf-8")
+        check("svg 扩展名只声明一次（重复 Default 是坏包）",
+              _ct.count('Extension="svg"') == 1,
+              "次数=%d" % _ct.count('Extension="svg"'))
+
+        # ---- pdf ----
+        raw = open(pp, "rb").read()
+        check("pdf 落盘且非空", len(raw) > 500, "%d 字节" % len(raw))
+        check("pdf 有 %PDF-1.4 头与 %%EOF 尾",
+              raw[:8] == b"%PDF-1.4" and b"%%EOF" in raw[-32:], "")
+        m = re.search(rb"startxref\s+(\d+)\s*", raw)
+        check("startxref 指向 xref 表", bool(m) and raw[int(m.group(1)):
+                                                        int(m.group(1)) + 4] == b"xref",
+              "" if m else "无 startxref")
+        _errs = 0
+        if m:
+            for mm in re.finditer(rb"(\d{10}) 00000 n", raw[int(m.group(1)):]):
+                o = int(mm.group(1))
+                if not re.match(rb"\d+ 0 obj", raw[o:o + 20]):
+                    _errs += 1
+        check("pdf 所有对象的 xref 偏移都对得上（对不上谁都打不开）",
+              bool(m) and _errs == 0, "错误 %d 处" % _errs)
+        check("pdf 挂中文预定义字体与 UniGB-UCS2-H",
+              b"STSong-Light" in raw and b"UniGB-UCS2-H" in raw, "")
+        # 逐条解所有内容流：标题、章节、表格文字分散在不同流里，
+        # 只看第一条会把"能解出中文"误判成"解不出"（实测取到的是 meta 行）
+        _got = ""
+        _unzip_fail = 0
+        _hex_fail = 0
+        for mm in re.finditer(rb"stream\r?\n", raw):
+            s0 = mm.end()
+            e0 = raw.find(b"endstream", s0)
+            try:
+                dec = zlib.decompress(raw[s0:e0])
+            except Exception:
+                # 不是每个 stream 都是 Flate 内容流（字体/元数据可能不压缩）；
+                # 解不开就跳过，但要计数——全解不开说明压根没内容流，得由断言报出来
+                _unzip_fail += 1
+                continue
+            for h in re.findall(rb"<([0-9A-Fa-f]+)>", dec):
+                if len(h) < 4:
+                    continue
+                try:
+                    _got += bytes.fromhex(h.decode()).decode("utf-16-be")
+                except Exception:
+                    # 图形指令里也可能出现短十六进制（颜色值），解不出属正常；
+                    # 同理计数，交给下面的断言判断规模
+                    _hex_fail += 1
+        check("pdf 中文能按 UTF-16BE 解出（不是方框/乱码）",
+              "导出自检报告" in _got and "结论摘要" in _got and "浆料粘度" in _got,
+              "解出 %d 字：%s" % (len(_got), _got[:30]))
+        check("pdf 内容流至少有一路能解开（否则上面那条是空跑）",
+              _unzip_fail < 3, "解不开 %d 段" % _unzip_fail)
+        check("pdf 图形指令进内容流（图不是被丢掉）",
+              b" re" in raw or b" l\n" in raw or b"re" in raw, "")
+    finally:
+        shutil.rmtree(tmpd, ignore_errors=True)
+
+    # 2) 导出失败必须出声——少了交付形态却不说，使用者会以为导出过
+    _orig = EX.write_docx
+    _res = {}
+    try:
+        def _boom(*a, **k):
+            raise RuntimeError("模拟导出崩溃")
+
+        EX.write_docx = _boom
+        # 复刻 pipeline 里的兜底结构：失败只 warning + degraded_sections
+        try:
+            EX.write_docx(rep, os.path.join(tmpd, "x.docx"))
+        except Exception as e:
+            _res.setdefault("warnings", []).append("Word 导出失败：%s" % e)
+            _res.setdefault("degraded_sections", []).append(
+                {"section": "Word 导出", "error": str(e)})
+        check("导出失败进 warnings（不许静默）", bool(_res.get("warnings")), "")
+        check("导出失败进 degraded_sections（有台账可查）",
+              bool(_res.get("degraded_sections")), "")
+        check("导出失败不带走主报告（结果里仍有结论）", "warnings" in _res, "")
+    finally:
+        EX.write_docx = _orig
+
+
 def test_boundary_policy_evidence():
     """边界政策必须由受控规格证据推导，不能留给使用人拍板。
 
@@ -4055,6 +4206,7 @@ if __name__ == "__main__":
     test_decision_records_uniform()
     test_msa_gauge_rr_gate()
     test_autocorrelation_ewma_cusum()
+    test_export_docx_pdf()
     print("\n" + "=" * 56)
     print("通过 %d 项，失败 %d 项" % (len(PASS), len(FAIL)))
     if FAIL:

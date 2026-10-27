@@ -64,6 +64,10 @@ if __package__ in (None, ""):
         from lib import msa as MSA
     except Exception:
         MSA = None
+    try:                    # P1-2 原生 Word/PDF 导出；失败只少两种交付形态
+        from lib import export_doc as EX
+    except Exception:
+        EX = None
     try:                    # v1.13 8D 引擎
         from lib import eightd as EV8D
         _HAS_8D = True
@@ -87,6 +91,10 @@ else:
         from . import msa as MSA
     except Exception:
         MSA = None
+    try:                    # P1-2 原生 Word/PDF 导出（两个分支都要，只改一套会 NameError）
+        from . import export_doc as EX
+    except Exception:
+        EX = None
     try:
         from . import events as EV
         _HAS_EVENTS = True
@@ -113,7 +121,7 @@ if EV is not None and EV.__name__ != "lib.events":
 KB = PP.load_knowledge()
 _fmt = RPT._fmt
 
-ANALYZER_VERSION = "2.7.0"
+ANALYZER_VERSION = "2.8.0"
 
 
 # 空数据排查清单。
@@ -368,8 +376,8 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
             spc_exclusion_mode=None,
             doe_replicates=None, doe_blocks=None, doe_seed=None, boundary_policy=None,
             role=None, controlled_spec=None,
-            msa_spec=None, export_xlsx=True, d2_card=None, emit_d2_card=True,
-            verbose=False, views=None):
+            msa_spec=None, export_xlsx=True, export_docx=True, export_pdf=True,
+            d2_card=None, emit_d2_card=True, verbose=False, views=None):
     """
     auto_adapt —— 字段认不出来时，把"新别名/新参数"自动登记到**租户层**并当场生效。
                   默认关闭：知识库条目还是应该过一遍人。开了也不会碰到基线。
@@ -379,6 +387,9 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
     rules      —— 启用的 Nelson 判异规则，如 "1,2,3,5" / "basic" / "all"。
                   默认只开基本集：八条全开会误报泛滥，现场很快就不看报警了。
     export_xlsx—— 额外导出可在 Excel 打开的结果表（判异明细含源文件与行号）。
+    export_docx/export_pdf —— 原生 Word/PDF 导出（零第三方依赖，自写 OOXML 与 PDF 1.4）。
+                  报告要进 8D 系统或发客户时用它，省掉一次手工转换。
+                  默认都开；PDF 不嵌入字体（见 lib/export_doc.py 的说明）。
     d2_card    —— 已填写的 8D D2 录入卡路径。给了就把 5W2H 与数据做交叉校验，
                   并据此渲染完整 D1–D8；不给则 D2 全空并在报告中标记「不具备对外条件」。
     emit_d2_card—— 是否随报告生成空白 D2 录入卡（默认生成）。
@@ -1861,6 +1872,33 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
     rep = build_report(result, work, spc_res, corr, assoc, pare, root, gaps, conf,
                        doe_plan, gcomp, lags, strong, tcol, times, max_charts)
     files = RPT.save_report(rep, outdir, "工艺分析报告")
+    # Word 原生导出：报告要进 8D 系统、要发客户、要走签核，对面要的是 .docx。
+    # 以前只有 HTML 可打印，使用者得自己转一遍——多一次手工转换就多一次
+    # "报告版本和实际结论对不上"的机会。
+    if export_docx and EX is not None:
+        try:
+            _dp = EX.write_docx(rep, os.path.join(outdir, "工艺分析报告.docx"),
+                                chart_dir=os.path.join(outdir, "charts"))
+            files["Word"] = _dp
+        except Exception as _dx_e:
+            # 导出失败不带走主报告，但必须出声：少了交付形态而不说明，
+            # 使用者会以为导出过、只是没找到文件
+            degrade.note("pipeline.export@docx", _dx_e)
+            result.setdefault("warnings", []).append(
+                "Word(.docx) 导出失败：%s。HTML/Markdown 已正常生成，"
+                "Word 版请先用 HTML 打印转换" % _dx_e)
+            result.setdefault("degraded_sections", []).append(
+                {"section": "Word 导出", "error": str(_dx_e)})
+    if export_pdf and EX is not None:
+        try:
+            _pp = EX.write_pdf(rep, os.path.join(outdir, "工艺分析报告.pdf"))
+            files["PDF"] = _pp
+        except Exception as _pf_e:
+            degrade.note("pipeline.export@pdf", _pf_e)
+            result.setdefault("warnings", []).append(
+                "PDF 导出失败：%s。HTML/Markdown 已正常生成" % _pf_e)
+            result.setdefault("degraded_sections", []).append(
+                {"section": "PDF 导出", "error": str(_pf_e)})
     if export_xlsx:
         try:
             xp = export_result_xlsx(result, work, outdir)
@@ -3312,6 +3350,11 @@ def main():
                     help="登记已有的区分类别数 ndc（<5 判分辨力不足）")
     ap.add_argument("--msa-tolerance", dest="msa_tolerance", type=float, default=None,
                     help="公差带宽 USL-LSL；给了就额外算 %%%%Tolerance")
+    ap.add_argument("--no-docx", action="store_true",
+                    help="不导出原生 Word(.docx)。默认导出：报告要进 8D 系统或发客户")
+    ap.add_argument("--no-pdf", action="store_true",
+                    help="不导出 PDF。默认导出（PDF 不嵌入字体，中文用标准 Adobe-GB1 "
+                         "字体；要字体嵌入保真请用 docx 再转）")
     ap.add_argument("--no-xlsx", action="store_true",
                     help="不导出 Excel 结果表")
     ap.add_argument("--d2-card", default=None,
@@ -3351,7 +3394,9 @@ def main():
                       "pct_grr": args.msa_pct_grr, "ndc": args.msa_ndc,
                       "tolerance": args.msa_tolerance,
                   } if args.msa_data or args.msa_pct_grr is not None else None,
-                  export_xlsx=not args.no_xlsx, d2_card=args.d2_card,
+                  export_xlsx=not args.no_xlsx,
+                  export_docx=not args.no_docx, export_pdf=not args.no_pdf,
+                  d2_card=args.d2_card,
                   emit_d2_card=not args.no_d2_card,
                   verbose=args.verbose, views=args.view)
 

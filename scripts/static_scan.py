@@ -486,6 +486,11 @@ def scan_param_chain():
         "msa_spec": "--msa-data / --msa-part / --msa-appraiser / --msa-value / "
                     "--msa-pct-grr / --msa-ndc / --msa-tolerance（一个 dict 由这组参数"
                     "组装；不收单个 JSON 串，免得现场在命令行里手写转义过的 JSON）",
+        # 反向开关：默认导出、要关才传。写成 --no-xxx 是因为"默认给全"才符合
+        # 现场习惯（报告本来就该带 Word/PDF），不写 --export-docx 那种正向开关
+        # 免得多一次"忘了传就没有"的踩坑。
+        "export_docx": "--no-docx（反向开关：默认导出 Word，传了才不导）",
+        "export_pdf": "--no-pdf（反向开关：默认导出 PDF，传了才不导）",
     }
     for p in sig:
         flag = "--" + p.replace("_", "-")

@@ -212,9 +212,17 @@ python scripts/fde_run.py analyze --input 本工序数据.csv 上游数据.csv -
 工序 key：`battery_coating` `battery_calendering` `battery_winding`
 `battery_filling` `battery_formation` `pv_wafer` `pv_cell_el` `pv_module_iv`
 
-输出：`<outdir>/工艺分析报告.md`、`.html`（自包含、可打印为 PDF）、`charts/*.svg`、
-`分析结果表.xlsx`（判异明细 / 过程能力 / Pareto / 根因候选 / 清洗记录 / DOE 方案，
-判异点带源文件与原始行号，可直接用 Excel 打开），以及 stdout 的 JSON 摘要。
+输出：`<outdir>/工艺分析报告.md`、`.html`（自包含、可打印为 PDF）、`.docx`（Word
+原生，图表以 SVG 矢量原样嵌入）、`.pdf`（自写 PDF 1.4，中文走 Adobe-GB1 预定义
+字体）、`charts/*.svg`、`分析结果表.xlsx`（判异明细 / 过程能力 / Pareto / 根因候选 /
+清洗记录 / DOE 方案，判异点带源文件与原始行号，可直接用 Excel 打开），以及 stdout
+的 JSON 摘要。Word/PDF 默认都出，不要时用 `--no-docx` / `--no-pdf` 关掉。
+
+**Word/PDF 是原生文件，不是 HTML 转出来的**：报告要进 8D 系统、要发客户、要走
+签核，对面要的是能直接打开编辑的 .docx。零第三方依赖——docx 直接写 OOXML 包，
+PDF 直接写对象与 xref 表。图表在 Word 里是矢量 SVG（放大不糊）；PDF 只认
+line/rect/polyline/polygon/circle/text 这几种图元，认不出的不硬猜，会在原位置
+标注"图见同名 SVG"，画不出来或部分没画出来都会写明——画一张错的图比不画更糟。
 
 **SPC 的两条统计前提，不要绕开：**
 
