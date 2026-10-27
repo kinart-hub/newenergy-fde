@@ -262,7 +262,7 @@
     "scripts/upgrade_process_chain.py"
   ],
   "license_url": "https://www.elastic.co/licensing/elastic-license",
-  "license_note": "源码可得（source-available），非 OSI 开源。允许免费自用与内部商业使用、允许修改与内部分发；禁止对外提供托管/管理服务，禁止规避许可密钥功能。",
+  "license_note": "源码可得（source-available），非 OSI 开源。允许免费自用与内部商业使用、允许修改与内部分发；禁止对外提供托管/管理服务。本仓库不含任何许可密钥或授权校验代码，故 LICENSE 已删除官方文本中的「许可密钥功能」条款（见 LICENSE 末尾 Modification notice）。",
   "deployment": {
     "required": [
       ".gitattributes",

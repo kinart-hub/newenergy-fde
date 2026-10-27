@@ -676,10 +676,67 @@ def _git_add_secret(unused_text):
         return None
 
 
+def _drop_license_section(head, nxt):
+    """变异：删掉 LICENSE 里 head 到 nxt 之间的条款**正文**，保留标题。
+
+    为什么删正文不删标题：这就是要防的那种破坏——留下标题让"查标题在不在"
+    的判据照样通过，而实际条款内容已经没了。注入失败返回 None，自检会暴露成 SKIP。
+    """
+    def f(t):
+        i = t.find("\n" + head + "\n")
+        j = t.find("\n" + nxt + "\n")
+        if i < 0 or j < 0 or j <= i:
+            return None
+        return t[:i + 1] + head + "\n\n（正文已删除）\n" + t[j + 1:]
+    return f
+
+
 def rule_license():
+    """LICENSE 必须与代码事实对齐：正文是 Elastic 2.0，但不许出现许可密钥条款。
+
+    为什么这条规则从"看首行"变成了"看条款全集"：
+    原判据只查首行是不是 'Elastic License 2.0'，于是任何人删掉中间某整段条款
+    （Patents、Termination、No Liability…）都照样判过——LICENSE 看着在，
+    实际已经被人掏空了一半。这对一个"条款即合约"的文件是最坏的失效形态。
+
+    同时要把"许可密钥条款"反向锁死：本仓库没有任何许可密钥/授权校验代码，
+    那条限制描述的是不存在的功能（外部评审第 4 节点名"条款与代码事实不符"）。
+    删掉它是对的，但**悄悄删**是另一回事——所以要求末尾写明改了什么、为什么，
+    让改许可这件事本身可被审计。
+    """
     t = _read("LICENSE") or ""
-    return _r(t.startswith("Elastic License 2.0"),
-              "LICENSE 首行不是 Elastic License 2.0（会被 GitHub 判为 Other）")
+    if not t.startswith("Elastic License 2.0"):
+        return _r(False, "LICENSE 首行不是 Elastic License 2.0（会被 GitHub 判为 Other）")
+    # 判据落在**条款正文的关键句**而不是标题子串：
+    # 只查标题的话，标题留着、正文被掏空照样判过——标题在≠条款还在。
+    _need = [
+        ("Acceptance", "you agree to all of the terms and conditions below"),
+        ("Copyright License", "royalty-free, worldwide"),
+        ("Limitations", "You may not provide the software to third parties as a hosted"),
+        ("Patents", "under any patent claims the licensor can"),
+        ("Notices", "anyone who gets a copy of any part of the software"),
+        ("Termination", "your licenses will automatically terminate"),
+        ("No Liability", "the software comes as is"),
+        ("Definitions", "the licensor is the entity offering these terms"),
+    ]
+    _low = t.lower()
+    miss = [k for k, _probe in _need if _probe.lower() not in _low]
+    if miss:
+        return _r(False, "Elastic 2.0 正文缺条款或被掏空：%s（只留标题也不算数）"
+                 % "、".join(miss), {"missing": miss})
+    # 自我指涉防护（踩过的坑）：末尾 Modification notice 里为了说明"删了什么"，
+    # 必然要引用那句条款原文。若拿全文去做子串匹配，会把**说明中的引用**判成
+    # "条款还在"。条款是否成立只看 notice 之前的正文 Parte。
+    _body = t.split("## Modification notice")[0]
+    if "You may not move, change, disable, or circumvent the license key" in _body:
+        return _r(False,
+                  "LICENSE 仍含『许可密钥功能』条款，但代码中不存在任何授权校验——"
+                  "条款描述了一件不存在的事（评审点名的「条款与代码不符」）")
+    if "Modification notice" not in t:
+        return _r(False,
+                  "LICENSE 相对官方文本有删减，但末尾没有 Modification notice 标明改了什么——"
+                  "改许可这种事必须留痕，否则下次谁再删一条也看不出来")
+    return _r(True, "", {"n_clauses": len(_need)})
 
 
 def rule_notice():
@@ -2212,11 +2269,26 @@ def rule_boundary_policy_evidence():
 
 
 AUDIT_RULES = [
-    Rule("LICENSE 为 Elastic 2.0 官方纯文本", rule_license,
-         "LICENSE 首行必须是裸文本 'Elastic License 2.0'（前面有 # 或 ## 即判不过）",
+    Rule("LICENSE 与代码事实对齐：Elastic 2.0 正文齐全且无许可密钥条款", rule_license,
+         "（1）首行必须是裸文本 'Elastic License 2.0'（带 # 判不过）；"
+         "（2）正文八个关键条款（Acceptance/Copyright License/Limitations/Patents/"
+         "Notices/Termination/No Liability/Definitions）缺一即判不过——防止整段被掏空；"
+         "（3）不得出现 'license key functionality'（代码无授权校验，留条款即条款与事实不符）；"
+         "（4）有删减则必须有 Modification notice 写明删了什么、为什么",
          "LICENSE",
          [_mutant("首行加 Markdown 标题标记",
-                  lambda t: ("## " + t) if t.startswith("Elastic") else None)]),
+                  lambda t: ("## " + t) if t.startswith("Elastic") else None),
+          _mutant("Patents 条款正文被掏空、标题还留着（查标题的规则会判过）",
+                  _drop_license_section("Patents", "Notices")),
+          _mutant("把许可密钥条款加回去（条款描述的又是不存在的东西）",
+                  _sub("You may not alter, remove, or obscure any licensing",
+                       "You may not move, change, disable, or circumvent the license key "
+                       "functionality in the software.\n\n"
+                       "You may not alter, remove, or obscure any licensing")),
+          _mutant("删了条款却不留修改说明（偷偷改许可）",
+                  _re_sub(r'## Modification notice\n\n[\s\S]*$', "")),
+          _mutant("Termination 条款正文被掏空、标题还留着",
+                  _drop_license_section("Termination", "No Liability"))]),
 
     Rule("NOTICE 含版权署名", rule_notice,
          "NOTICE 正文中必须出现 '蒋崇利'",

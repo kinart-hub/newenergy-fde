@@ -19,10 +19,6 @@ You may not provide the software to third parties as a hosted or managed
 service, where the service provides users with access to any substantial set of
 the features or functionality of the software.
 
-You may not move, change, disable, or circumvent the license key functionality
-in the software, and you may not remove or obscure any functionality in the
-software that is protected by the license key.
-
 You may not alter, remove, or obscure any licensing, copyright, or other notices
 of the licensor in the software. Any use of the licensor’s trademarks is subject
 to applicable law.
@@ -91,3 +87,15 @@ these terms.
 use means anything you do with the software requiring one of your licenses.
 
 trademark means trademarks, service marks, and similar rights.
+
+## Modification notice
+
+This license text is Elastic License 2.0 (https://www.elastic.co/licensing/elastic-license)
+with exactly one deletion: the "license key functionality" limitation
+("You may not move, change, disable, or circumvent the license key functionality ...")
+has been removed. The software contains no license-key or license-checking
+functionality whatsoever; keeping a clause about it would make the license text
+describe something that does not exist. Every other clause is reproduced verbatim.
+本许可文本为 Elastic License 2.0，仅删除其中"许可密钥功能"一条限制条款。
+原因：本软件不含任何许可密钥/授权校验代码，保留该条款会导致条款与代码事实不符。
+除此之外，其余条款与官方文本逐字一致。
