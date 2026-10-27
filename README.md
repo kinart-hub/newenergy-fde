@@ -9,7 +9,7 @@
 ![License](https://img.shields.io/badge/license-Elastic--2.0-blue)
 ![Python](https://img.shields.io/badge/python-3.8%2B-blue)
 ![Dependencies](https://img.shields.io/badge/dependencies-0-brightgreen)
-![Self-test](https://img.shields.io/badge/selftest-583%20passing-brightgreen)
+![Self-test](https://img.shields.io/badge/selftest-591%20passing-brightgreen)
 
 ![newenergy-fde](assets/social-preview.png)
 
@@ -24,7 +24,7 @@
 git clone https://github.com/kinart-hub/newenergy-fde.git
 cd newenergy-fde
 
-python scripts/selftest.py          # 583 项端到端自检，应全部通过
+python scripts/selftest.py          # 591 项端到端自检，应全部通过
 python scripts/fde_run.py analyze -i examples/01_涂布工艺数据.csv -o output/try
 ```
 
@@ -193,7 +193,7 @@ newenergy-fde/
 │       ├── kb_manage.py              知识库管理台（status/list/propose/intake/harvest/
 │   │                             review/sync/verify/cases/devices/industries/update/rollback/patch）
 │   ├── make_device_samples.py    生成多厂商版式的对照样例（同一真值、不同导出）
-│   └── selftest.py               583 项端到端自检（含设备适配层、跨工序追溯、多企业隔离、行业作用域、基线热更新、设备记忆与知识库演进）
+│   └── selftest.py               591 项端到端自检（含设备适配层、跨工序追溯、多企业隔离、行业作用域、基线热更新、设备记忆与知识库演进）
 └── examples/
     ├── *.csv                     七类示例数据（含一个私有列名导出样例）
     └── devices/*.csv             六类设备导出样例（竖表/双行表头/单位行/合计行/未知设备)

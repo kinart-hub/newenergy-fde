@@ -1049,13 +1049,31 @@ def controlled_boundaries(factor_specs, spec_overrides=None, kb_control=None):
     return out
 
 
-def boundary_gate(bounds, plan_name="DOE 方案"):
+# 推断边界的政策旋钮（P2 遗留项）。
+# 同样的"边界是推断出来的、没有受控出处"，有两种合理处置：
+#   warn  —— 出方案 + 警告 + 要求工艺工程师书面确认（默认）
+#   block —— 直接不出方案，逼出那份受控规格文件
+# 默认 warn 不是"不敢拦"，是因为一刀切硬拦会让没带规格文件的用户完全用不了；
+# 但"只能 warn、拦不住"同样是缺陷——企业侧一旦有受控规格，就该能收紧成硬阻断。
+BOUNDARY_POLICIES = ("warn", "block")
+
+
+def boundary_gate(bounds, plan_name="DOE 方案", policy="warn"):
     """P1-8 门禁：缺少有效边界、边界冲突、单位不明，一律阻断方案生成。
 
     报告原话：「缺少有效边界、边界冲突或单位不明时应阻断方案生成，不能默认放行。」
     所以这里必须是 blocker 而不是 warning——warning 会被人顺手关掉，
     blocker 才会逼出那份受控规格文件。
+
+    policy —— "warn"（默认）："边界无受控来源"只警告并要求书面确认；
+              "block"：把这类警告一并提升为阻断，不出方案。
+              传其他值直接抛错，不静默回落成 warn——政策旋钮静默回落，
+              等于使用者以为收紧了其实没收紧。
     """
+    policy = (policy or "warn")
+    if policy not in BOUNDARY_POLICIES:
+        raise ValueError("未知边界政策 %r，可选：%s"
+                         % (policy, "、".join(BOUNDARY_POLICIES)))
     if bounds is None:
         return {"ok": False, "plan_name": plan_name, "n_factors": 0,
                 "blockers": ["没有收到任何因子的边界数据（bounds=None）。"
@@ -1089,5 +1107,14 @@ def boundary_gate(bounds, plan_name="DOE 方案"):
                          "仅按 %s 推断，须由工艺工程师书面确认后方可试跑"
                          % (name, rec.get("confidence"),
                             "、".join(s["kind"] for s in rec.get("sources", [])) or "无来源"))
+    # 政策收紧：warn 级的"边界无受控来源"在 block 政策下升级为阻断。
+    # 升级后 warnings 必须清空并留下 escalated 计数——
+    # 否则调用方会一边看到 ok=False，一边还打印"须书面确认"的放行口吻。
+    escalated = 0
+    if policy == "block" and warns:
+        blockers = blockers + ["【已按 block 政策收紧】" + w for w in warns]
+        escalated = len(warns)
+        warns = []
     return {"ok": not blockers, "blockers": blockers, "warnings": warns,
-            "plan_name": plan_name, "n_factors": len(bounds)}
+            "plan_name": plan_name, "n_factors": len(bounds),
+            "policy": policy, "escalated": escalated}

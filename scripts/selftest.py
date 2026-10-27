@@ -16,6 +16,7 @@ selftest.py —— newenergy-fde 端到端自检
 
 import os
 import sys
+import subprocess
 
 # Windows 上 stdout 一旦被重定向（CI 写日志就是这种），Python 会改用系统
 # ANSI 编码输出；英文版 runner 是 cp1252，打印中文直接 UnicodeEncodeError。
@@ -3387,6 +3388,64 @@ def test_p2_observability():
         shutil.rmtree(_tmp, ignore_errors=True)
 
 
+def test_boundary_policy_knob():
+    """推断边界政策旋钮（warn/block）：默认不变，但收紧时真拦得住。
+
+    台账原话：推断边界仍会出方案，暂时【警告 + 要求书面确认】，没有默认阻断；
+    默认一刀切会让没带规格文件的用户完全用不了，是否收紧成硬阻断需产品决策。
+
+    所以这条测的不是"加了个参数"，是四件事：
+      - 默认仍 warn（不因新增旋钮改变现状，没带规格文件的用户照样能用）；
+      - block 政策下同一份输入真被拦下（不是只写了个 if 不生效）；
+      - 收紧后 warnings 必须清空，否则会一边 ok=False 一边还写着放行口吻；
+      - 非法政策值直接拒绝，不静默回落——静默回落等于"以为收紧了其实没收紧"。
+    """
+    _b = {"温度": {"min": 20, "max": 80, "controlled": False,
+                   "confidence": "inferred",
+                   "sources": [{"kind": "kb_typical"}], "blockers": []}}
+    # ① 默认 warn：放行 + 警告（向后兼容）
+    _d = DOE.boundary_gate(_b)
+    check("边界政策默认仍为 warn（不因新增旋钮改变现状）",
+          _d.get("policy") == "warn" and _d.get("ok") is True
+          and len(_d.get("warnings") or []) == 1,
+          "policy=%r ok=%r warns=%r" % (_d.get("policy"), _d.get("ok"),
+                                        len(_d.get("warnings") or [])))
+    # ② block：同一份输入必须被拦下
+    _k = DOE.boundary_gate(_b, policy="block")
+    check("block 政策下推断边界被真拦下",
+          _k.get("ok") is False and len(_k.get("blockers") or []) == 1,
+          "ok=%r blockers=%r" % (_k.get("ok"), _k.get("blockers")))
+    check("收紧后 warnings 清空（不留放行口吻）",
+          not (_k.get("warnings") or []) and _k.get("escalated") == 1,
+          "warns=%r escalated=%r" % (_k.get("warnings"), _k.get("escalated")))
+    check("收紧后的阻断项说明来自哪条警告",
+          "没有受控来源" in (_k.get("blockers") or [""])[0],
+          (_k.get("blockers") or [""])[0][:40])
+    # ③ 合法政策都可用，互不串台
+    _w2 = DOE.boundary_gate(_b, policy="warn")
+    check("warn 与 block 互不串台", _w2.get("ok") is True and _k.get("ok") is False)
+    # ④ 非法政策值：拒绝，不静默回落
+    _rejected = None
+    try:
+        DOE.boundary_gate(_b, policy="loose")
+    except ValueError as _e:
+        _rejected = _e
+    check("非法政策值被拒绝（不静默回落成 warn）", _rejected is not None,
+          "静默回落会让使用者以为收紧了其实没收紧")
+    # ⑤ 政策旋钮不得削弱已有硬门禁：缺上下限在 warn 下也必须阻断
+    _bad = {"压力": {"min": None, "max": 10, "controlled": True, "blockers": []}}
+    _hb = DOE.boundary_gate(_bad, policy="warn")
+    check("硬缺陷（缺上下限）在 warn 政策下依然阻断", _hb.get("ok") is False,
+          "ok=%r" % _hb.get("ok"))
+    # ⑥ 旋钮必须可达：CLI 要能真的指定它，否则只是库里的死参数
+    _help = subprocess.run([sys.executable, "lib/pipeline.py", "--help"],
+                           capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", timeout=120)
+    check("CLI 暴露 --boundary-policy（旋钮可达，不是死参数）",
+          "--boundary-policy" in (_help.stdout or ""),
+          "pipeline --help 里找不到 --boundary-policy")
+
+
 if __name__ == "__main__":
     print("newenergy-fde 自检开始")
     test_table()
@@ -3423,6 +3482,7 @@ if __name__ == "__main__":
     test_p1_doe_structure()
     test_p2_knowledge_lifecycle()
     test_p2_observability()
+    test_boundary_policy_knob()
     print("\n" + "=" * 56)
     print("通过 %d 项，失败 %d 项" % (len(PASS), len(FAIL)))
     if FAIL:

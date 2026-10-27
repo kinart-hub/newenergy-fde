@@ -344,7 +344,7 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
             sheet=None, spec_overrides=None, do_doe=True, max_charts=12,
             auto_adapt=False, tenant=None, industry=None, rules=None,
             spc_exclusion_mode="auto",
-            doe_replicates=1, doe_blocks=1, doe_seed=0,
+            doe_replicates=1, doe_blocks=1, doe_seed=0, boundary_policy="warn",
             export_xlsx=True, d2_card=None, emit_d2_card=True, verbose=False,
             views=None):
     """
@@ -1466,7 +1466,7 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
             try:
                 _bounds = DOE.controlled_boundaries(
                     factors, spec_overrides=spec_overrides, kb_control=_kb_ctl)
-                _gate = DOE.boundary_gate(_bounds)
+                _gate = DOE.boundary_gate(_bounds, policy=boundary_policy)
             except Exception as _bg_e:
                 degrade.note("pipeline.analyze@boundary_gate", _bg_e)
                 _bounds, _gate = {}, {"ok": False,
@@ -2806,6 +2806,11 @@ def main():
     ap.add_argument("--doe-seed", dest="doe_seed", type=int, default=0,
                     help="DOE 运行顺序随机化种子（默认 0，保证顺序可复现；"
                          "现场排产时可另指定）")
+    ap.add_argument("--boundary-policy", dest="boundary_policy", default="warn",
+                    choices=["warn", "block"],
+                    help="推断边界（缺受控出处）的处置政策：warn=出方案+警告+要求"
+                         "工艺工程师书面确认（默认）；block=直接不出方案，"
+                         "逼出那份受控规格文件")
     ap.add_argument("--no-xlsx", action="store_true",
                     help="不导出 Excel 结果表")
     ap.add_argument("--d2-card", default=None,
@@ -2836,7 +2841,7 @@ def main():
                   tenant=args.tenant, industry=args.industry, rules=args.rules,
                   spc_exclusion_mode=args.spc_exclusion_mode,
                   doe_replicates=args.doe_replicates, doe_blocks=args.doe_blocks,
-                  doe_seed=args.doe_seed,
+                  doe_seed=args.doe_seed, boundary_policy=args.boundary_policy,
                   export_xlsx=not args.no_xlsx, d2_card=args.d2_card,
                   emit_d2_card=not args.no_d2_card,
                   verbose=args.verbose, views=args.view)

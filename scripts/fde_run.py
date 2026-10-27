@@ -1984,6 +1984,47 @@ def rule_p2_observability():
     return _r(True, "", {"observability": True})
 
 
+def rule_boundary_policy_knob():
+    """推断边界政策旋钮（warn/block）：默认不变，但收紧时真拦得住。
+
+    台账原话：推断边界仍会出方案，暂时【警告 + 要求书面确认】，没有默认阻断；
+    是否收紧成硬阻断需产品决策。
+
+    判据落在三处真正的执行点上：政策值被接收、非法值被拒绝、block 分支真升级。
+    只查"有 BOUNDARY_POLICIES 这个常量"是不够的——常量在、分支不生效，
+    等于给了个假旋钮。
+    """
+    t = _read(DOE_FILE) or ""
+    if not t:
+        return _r(False, "读不到 " + DOE_FILE)
+    # 1) 政策集合存在，且 warn 与 block 都在
+    if "BOUNDARY_POLICIES" not in t:
+        return _r(False, "缺 BOUNDARY_POLICIES：推断边界无政策旋钮")
+    if '"warn"' not in t or '"block"' not in t:
+        return _r(False, "政策集合缺 warn 或 block")
+    # 2) 传入的政策值必须被真正接收（不能焊死成常量）
+    if not re.search(r'policy\s*=\s*\(policy or "warn"\)', t):
+        return _r(False, "boundary_gate 未接收传入的 policy：旋钮被焊死")
+    # 3) 非法政策值必须拒绝，不静默回落
+    if not re.search(r"if\s+policy\s+not\s+in\s+BOUNDARY_POLICIES\s*:", t):
+        return _r(False, "非法政策值未校验：静默回落等于以为收紧了其实没收紧")
+    # 4) block 政策必须真的把警告升级为阻断
+    if not re.search(r'if\s+policy\s*==\s*"block"\s+and\s+warns\s*:', t):
+        return _r(False, "block 政策分支不存在：收紧后拦不住")
+    if "escalated" not in t:
+        return _r(False, "收紧后未输出 escalated：无从得知升级了几条")
+    # 5) 升级后必须清空 warnings，否则一边 ok=False 一边还写着放行口吻
+    if not re.search(r'^\s+blockers = blockers \+ \[', t, re.M):
+        return _r(False, "警告未并入 blockers：block 政策下仍会出方案")
+    # 6) 管线必须接线且 CLI 可达，否则旋钮是库里的死参数
+    tp = _read(PIPELINE_FILE) or ""
+    if "policy=boundary_policy" not in tp:
+        return _r(False, "pipeline 未把 boundary_policy 传给 boundary_gate：旋钮未接线")
+    if "--boundary-policy" not in tp:
+        return _r(False, "CLI 未暴露 --boundary-policy：使用者无法收紧")
+    return _r(True, "", {"boundary_policy": True})
+
+
 AUDIT_RULES = [
     Rule("LICENSE 为 Elastic 2.0 官方纯文本", rule_license,
          "LICENSE 首行必须是裸文本 'Elastic License 2.0'（前面有 # 或 ## 即判不过）",
@@ -2618,6 +2659,22 @@ AUDIT_RULES = [
           _mutant("失败不进统计（模块成功率恒为 1.0 的假象）",
                   _re_sub(r'^\s+st\["ok" if ok else "fail"\]\s*\+=\s*1',
                           '            st["ok"] += 1', flags=re.M), OBS_FILE)]),
+    Rule("推断边界必须有政策旋钮：默认 warn，但 block 时真拦得住",
+         rule_boundary_policy_knob,
+         "台账遗留项。boundary_gate 必须定义 BOUNDARY_POLICIES（含 warn 与 block）、"
+         "真正接收传入的 policy、拒绝非法值（不静默回落）、"
+         "在 block 政策下把「边界无受控来源」的警告并入 blockers 并输出 escalated；"
+         "pipeline 必须传 policy=boundary_policy 且 CLI 必须暴露 --boundary-policy。",
+         DOE_FILE,
+         [_mutant("block 分支失效（收紧了却拦不住）",
+                  _re_sub(r'if policy == "block" and warns:',
+                          "if False and warns:", flags=re.M), DOE_FILE),
+          _mutant("非法政策值静默回落（以为收紧了其实没收紧）",
+                  _re_sub(r"    if policy not in BOUNDARY_POLICIES:",
+                          "    if False:", flags=re.M), DOE_FILE),
+          _mutant("旋钮被焊死成 warn（传什么都当 warn 处理）",
+                  _re_sub(r'    policy = \(policy or "warn"\)',
+                          '    policy = "warn"', flags=re.M), DOE_FILE)]),
 ]
 
 
