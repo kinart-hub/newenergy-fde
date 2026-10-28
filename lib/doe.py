@@ -649,6 +649,16 @@ def _coded_to_engineering(x, factor_specs):
 
 # 安全包络：设备与工艺的物理/安全硬限。企业规格可以收紧，不能放宽。
 # 化成、高压、高温这类参数越界，代价不是"良率差一点"，是安全事故。
+#
+# 【重要】下面这张表只是**无外部输入时的参考兜底**，不是通用真理：
+#   1) 数值取自动力电池/涂布这类行业的常见做法。换一个产品线、换一台设备，
+#      真实上限可能更高也可能更低——所以调用方应当通过
+#      build_constraints(spec_overrides={参数名: {"safety": {...}}}
+#      传入自己档案里的安全限，**调用方给的优先于本表**。
+#   2) 调用方给的值若比本表更松，不会静默覆盖：会在结果里挂
+#      looser_than_default 标记并写进报告，让人确认依据。
+#   3) "更严的一侧取胜、但不许悄悄放宽"这条规则本身与行业无关，属于安全推理逻辑，
+#      这部分才是不该被覆盖的东西。
 _SAFETY_RULES = [
     (re.compile(r"化成.*电压|充电.*电压|截止电压|上限电压", re.I), "max", 4.5, "V",
      "锂电芯充电/化成电压上限，越界有析锂与热失控风险"),
@@ -663,15 +673,21 @@ _SAFETY_RULES = [
 ]
 
 
-def safety_envelope(param_name):
-    """按参数名匹配安全硬限，返回 {"min"/"max": v, "unit":.., "note":..} 或 None"""
+def safety_envelope(param_name, rules=None):
+    """按参数名匹配安全硬限，返回 {"min"/"max": v, "unit":.., "note":..} 或 None。
+
+    rules 非空时按其匹配而不查内置表——调用方比通用库更清楚自己设备的极限。
+    """
     if not param_name:
         return None
     s = str(param_name)
-    for pat, kind, val, unit, note in _SAFETY_RULES:
-        if pat.search(s):
+    for pat, kind, val, unit, note in (_SAFETY_RULES if rules is None else rules):
+        _pat = pat if hasattr(pat, "search") else re.compile(str(pat), re.I)
+        if _pat.search(s):
+            src = "内置安全包络（行业参考值，应以本机/本产品档案为准）" \
+                if rules is None else "调用方提供的安全包络"
             return {"limit": kind, "value": val, "unit": unit, "note": note,
-                    "source": "内置安全包络"}
+                    "source": src}
     return None
 
 
@@ -709,7 +725,7 @@ def build_constraints(factor_specs, spec_overrides=None, kb_control=None):
             for kk in ("usl", "max"):
                 if ctl.get(kk) is not None and c["max"] is None:
                     c["max"] = float(ctl[kk])
-        sf = safety_envelope(name)
+        sf = _safety_from_override(ov, name)
         if sf:
             c["safety"] = sf
             # 安全边界只能比工艺窗口更紧，企业填的宽松值不能覆盖它
@@ -717,9 +733,44 @@ def build_constraints(factor_specs, spec_overrides=None, kb_control=None):
                 c["max"] = sf["value"] if c["max"] is None else min(c["max"], sf["value"])
             else:
                 c["min"] = sf["value"] if c["min"] is None else max(c["min"], sf["value"])
-            c["sources"].append("安全包络（不可放宽）")
+            c["sources"].append(sf.get("source") or "安全包络（不可放宽）")
+            if sf.get("looser_than_default"):
+                # 放宽是调用方的权利（只有他知道自家设备的实际极限），
+                # 但放宽必须留痕：报告里要能看出这一步是人拍的，不是工具替他选的。
+                c["safety_warning"] = (
+                    "调用方给出的安全%s %.4g%s 松于内置行业参考值 %.4g%s；"
+                    "已按调用方的值执行，但请确认有设备/产品档案依据。"
+                    % ("上限" if sf["limit"] == "max" else "下限",
+                       sf["value"], sf.get("unit") or "",
+                       sf["looser_than_default"]["builtin"],
+                       sf["looser_than_default"].get("unit") or ""))
         out[name] = c
     return out
+
+
+def _safety_from_override(ov, name):
+    """从调用方的参数明细里读安全包络；读不到就回落到内置参考表。"""
+    _ovsf = ov.get("safety") if isinstance(ov, dict) else None
+    if not (isinstance(_ovsf, dict) and _ovsf.get("value") is not None):
+        return safety_envelope(name)
+    try:
+        _lim = _ovsf.get("limit") or "max"
+        if _lim not in ("max", "min"):
+            return safety_envelope(name)
+        sf = {"limit": _lim, "value": float(_ovsf["value"]),
+              "unit": _ovsf.get("unit") or "",
+              "note": _ovsf.get("note") or "调用方提供的安全限",
+              "source": "调用方提供的安全包络"}
+    except (TypeError, ValueError):
+        return safety_envelope(name)
+    _bi = safety_envelope(name)
+    if _bi and _bi["limit"] == sf["limit"]:
+        _looser = ((sf["value"] > _bi["value"]) if sf["limit"] == "max"
+                   else (sf["value"] < _bi["value"]))
+        if _looser:
+            sf["looser_than_default"] = {"builtin": _bi["value"],
+                                         "unit": _bi.get("unit") or ""}
+    return sf
 
 
 def check_point(point, constraints):

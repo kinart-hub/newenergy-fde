@@ -465,7 +465,12 @@ def scan_param_chain():
     sig = [p for p in sig if p and p not in ("self",)]
 
     # 2) pipeline CLI 注册的参数（去掉 -- 前缀与 - 短名）
+    #    **必须连 fde_run.py 一起取**：编排器才是 SKILL.md 固化的第一入口，
+    #    使用者手里的命令是 `python scripts/fde_run.py analyze --xxx`。
+    #    只认 pipeline.py 会把"编排器有、库 CLI 没有"误判成漏暴露，逼人去改
+    #    一个使用者根本不用的入口（2026-10-29 修 --device 时实测撞到）。
     cli = set(re.findall(r'add_argument\(\s*["\'](--[a-z][a-z0-9-]+)', pipe))
+    cli |= set(re.findall(r'add_argument\(\s*["\'](--[a-z][a-z0-9-]+)', run))
     # 3) fde_run 透传给子进程的参数
     passed = set()
     for mm in re.finditer(r'cmd \+?= \["(--[a-z][a-z0-9-]+)"\]', run):
@@ -565,6 +570,13 @@ def scan_doc_promise():
     run = _read(os.path.join("scripts", "fde_run.py"))
     registered = set(re.findall(r'add_argument\(\s*["\'](--[a-z][a-z0-9-]+)', pipe))
     registered |= set(re.findall(r'add_argument\(\s*["\'](--[a-z][a-z0-9-]+)', run))
+    # 仓库里所有脚本的参数都算"真实存在"。只认 pipeline+fde_run 会把别的脚本
+    # 里堂堂正正注册的参数（如 gen_enterprise_data.py 的 --seed）误判成悬空。
+    for fn in sorted(os.listdir(os.path.join(ROOT, "scripts"))):
+        if fn.endswith(".py"):
+            registered |= set(re.findall(
+                r'add_argument\(\s*["\'](--[a-z][a-z0-9-]+)',
+                _read(os.path.join("scripts", fn))))
     # 编排器子命令。两种实现都要认：argparse 子解析器 add_parser，
     # 以及位置参数 + choices（fde_run.py 实际用的是后者）。
     subs = set(re.findall(r'add_parser\(\s*["\']([a-z][a-z0-9_-]+)', run))
@@ -575,8 +587,23 @@ def scan_doc_promise():
         text = _read(doc)
         if not text:
             continue
+        seen = set()
         for i, line in enumerate(text.splitlines(), 1):
-            if ".py" not in line and "python" not in line:
+            has_py = (".py" in line or "python" in line)
+            # 反引号包裹的参数：写作者用反引号就是在示范一条命令，
+            # **与本行提不提脚本名无关**（盲区①）。
+            for m in re.finditer(r"`(--[a-z][a-z0-9-]+)`", line):
+                key = (i, m.group(1))
+                if m.group(1) in registered or key in seen:
+                    continue
+                seen.add(key)
+                out.append(Finding(
+                    "S5", "HIGH", doc, i,
+                    "文档示范的参数「%s」在代码里不存在" % m.group(1),
+                    "使用者的第一动作就是照文档抄这条命令，抄到不存在的参数"
+                    "会卡死在第一步，并连带怀疑整份文档的可信度。",
+                    "补上参数实现，或改掉文档"))
+            if not has_py:
                 continue
             # 跨脚本引用（README 里的 kb_manage.py --file 之类）不归本检查管：
             # 那是另一个脚本的参数，在本文档里出现是正常的。
@@ -584,13 +611,16 @@ def scan_doc_promise():
                     and "lib.pipeline" not in line:
                 continue
             for m in re.finditer(r"(--[a-z][a-z0-9-]+)", line):
-                if m.group(1) not in registered:
-                    out.append(Finding(
-                        "S5", "HIGH", doc, i,
-                        "文档提到的参数「%s」在代码里不存在" % m.group(1),
-                        "使用者的第一动作是照文档抄命令，抄到不存在的参数就卡死在第一步，"
-                        "还会连带怀疑整份文档的可信度。",
-                        "补上参数实现，或改掉文档"))
+                key = (i, m.group(1))
+                if m.group(1) in registered or key in seen:
+                    continue
+                seen.add(key)
+                out.append(Finding(
+                    "S5", "HIGH", doc, i,
+                    "文档提到的参数「%s」在代码里不存在" % m.group(1),
+                    "使用者的第一动作是照文档抄命令，抄到不存在的参数就卡死在第一步，"
+                    "还会连带怀疑整份文档的可信度。",
+                    "补上参数实现，或改掉文档"))
             for m in re.finditer(r"fde_run\.py\s+([a-z][a-z0-9_-]+)", line):
                 if m.group(1) not in subs:
                     out.append(Finding(
@@ -599,6 +629,27 @@ def scan_doc_promise():
                         "SKILL.md 把编排器固化为第一动作，"
                         "第一动作指向一个空入口等于整条链路断在起点。",
                         "补上子命令，或改掉文档"))
+
+    # 盲区②：真正把参数教给使用者的，常常是**运行时的告警/报错文案**，而不是文档。
+    # 例：kbstore 校验设备档案时写「只能用 --device 手动指定」，可当时并没有
+    # --device 这个参数——读 README 的人还没抄，读报错的人已经动手了。
+    for rel in _py_files():
+        if not rel.startswith("lib" + os.sep) and not rel.startswith("lib/"):
+            continue
+        src = _read(rel)
+        for i, line in enumerate(src.splitlines(), 1):
+            if "add_argument" in line:
+                continue
+            for m in re.finditer(r"(--[a-z][a-z0-9-]{2,})", line):
+                if m.group(1) in registered:
+                    continue
+                out.append(Finding(
+                    "S5", "HIGH", rel, i,
+                    "运行库里提到的参数「%s」从未在 CLI 注册" % m.group(1),
+                    "这段代码大概率是提示/告警文案，会把它当成一条可用命令教给使用者；"
+                    "参数若不存在，使用者一定会撞上去。",
+                    "若只是描述性的，改成反引号以外的写法；"
+                    "若本意是可用开关，就把 add_argument 补上"))
     return out
 
 
@@ -801,6 +852,61 @@ def scan_call_signature():
     return out
 
 
+def scan_encoding():
+    """编码完整性：全库文本文件里不允许出现乱码。
+
+    乱码的阴险之处在于它**不产生任何错误信号**：中文注释里掉一两个字节，
+    文件照样能存、能跑、能过语法检查，直到有人读到那一段，
+    才发现工具在跟他说胡话。靠 Code Review 抓等于没抓。
+
+    而且它的影响面是偏的：偏偏落在最容易被人读的地方——
+    交付给客户的报告、给质量经理看的入门文档、变更记录。
+    """
+    out = []
+    exts = (".py", ".md", ".json", ".txt", ".yaml", ".yml", ".csv")
+    skip_dirs = {".git", "__pycache__", "output", "dist", ".workbuddy",
+                 "node_modules", "promotion", "examples"}
+    # (正则, 名称, 说明)
+    checks = [
+        (r"\ufffd", "U+FFFD 替换符",
+         "字节被解码成占位符，说明原文件此处已经损坏，原文不可恢复"),
+        (r"[\ue000-\uf8ff]", "私用区字符",
+         "正常中文、标点、符号都不会落在这个区间，出现即说明编码被破坏过"),
+        (r"[\u0080-\u009f]", "C1 控制符",
+         "肉眼不可见，但会让换行判定与文本比对出错，常伴随乱粘贴导入"),
+    ]
+    for root, dirs, files in os.walk(ROOT):
+        dirs[:] = [d for d in dirs if d not in skip_dirs]
+        for fn in sorted(files):
+            if not fn.endswith(exts):
+                continue
+            fp = os.path.join(root, fn)
+            rel = os.path.relpath(fp, ROOT)
+            try:
+                with open(fp, "rb") as f:
+                    raw = f.read()
+                raw.decode("utf-8")
+            except UnicodeDecodeError as e:
+                out.append(Finding(
+                    "S9", "HIGH", rel, 0,
+                    "文件不是合法 UTF-8：%s" % str(e)[:60],
+                    "读取方要么报错要么用占位符替换，两种情况都拿不到原文；"
+                    "而在多台机器之间流转后，往往再看不出它原本想写什么。",
+                    "以 UTF-8 重新保存；若原始内容已丢，宁可重写一句通顺的话，"
+                    "也不要留下占位符"))
+                continue
+            text = raw.decode("utf-8")
+            for pat, name, why in checks:
+                m = re.search(pat, text)
+                if not m:
+                    continue
+                out.append(Finding(
+                    "S9", "HIGH", rel, text[:m.start()].count("\n") + 1,
+                    "出现%s" % name, why,
+                    "回到该处按原意重写这段话；写完后读一遍确认通顺"))
+    return out
+
+
 CHECKS = [
     ("S1", "静默吞异常", scan_silent_except),
     ("S2", "定义未调用（死代码）", scan_dead_code),
@@ -809,7 +915,7 @@ CHECKS = [
     ("S5", "文档承诺不存在的入口", scan_doc_promise),
     ("S6", "不可达分支/死循环", scan_unreachable),
     ("S7", "清单型硬编码副本", scan_hardcoded_duplicate),
-    ("S8", "跨模块调用签名不匹配", scan_call_signature),
+    ("S9", "编码完整性（乱码）", scan_encoding),
 ]
 
 

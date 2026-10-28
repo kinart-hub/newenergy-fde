@@ -152,14 +152,32 @@ _UNIT_TOKEN = re.compile(
 _TIME_TOKEN = re.compile(r"^(时间|日期|timestamp|date|time|datetime|取样时间|测试时间|记录时间)$", re.I)
 
 
-def identify_device(table, path=None, head_text=None):
+def identify_device(table, path=None, head_text=None, force=None):
     """
     综合元信息、列名、文件名三路证据打分识别设备。
     返回 {"device": key, "name": str, "score": float, "confidence": str,
           "evidence": [str], "runner_up": (key, score) or None}
+
+    force 非空时跳过识别，直接采用调用方指定的设备档案。
+    这是给「设备档案没写识别特征」这种情况留的手动通道：
+    一台特征不够独特的设备，自动识别本不该只靠运气；而回过头去补写
+    signature 要改档案，现场临时分析往往等不及。两边都要留门，
+    缺哪一侧都会退回到猜版式。
     """
     profiles = load_profiles()
     devices = profiles.get("devices", {})
+    if force:
+        prof = devices.get(force)
+        if prof is None:
+            return {"device": None, "name": "手动指定的设备档案不存在", "score": 0.0,
+                    "confidence": "无", "runner_up": None,
+                    "evidence": ["--device %s 不在设备档案里；"
+                                 "已登记的档案可用 python scripts/kb_manage.py devices 查看" % force],
+                    "runner_up": None}
+        return {"device": force, "name": prof.get("name", force), "score": 0.0,
+                "confidence": "手动指定", "runner_up": None,
+                "evidence": ["由调用方手动指定，未做自动识别"],
+                "manually_specified": True}
     if not devices:
         return {"device": None, "name": "无设备档案", "score": 0.0,
                 "confidence": "无", "evidence": [], "runner_up": None}
@@ -785,7 +803,7 @@ def apply_attr_maps(table, profile, col_map=None):
 
 # ---------------------------------------------------------------- 统一入口
 
-def ingest(path, sheet=None, prefer_process=None, verbose=False):
+def ingest(path, sheet=None, prefer_process=None, verbose=False, device=None):
     """
     读一个文件 -> 识别设备 -> 归一版式 -> 单位换算 -> 列名映射。
     返回 dict，任何一步失败都降级并记 note，绝不抛异常中断主流程。
@@ -800,7 +818,7 @@ def ingest(path, sheet=None, prefer_process=None, verbose=False):
         out["warnings"].append("读取失败：%s" % e)
         return out
 
-    ident = identify_device(tb, path=path)
+    ident = identify_device(tb, path=path, force=device)
     out["device"] = ident.get("device")
     out["device_info"] = ident
     prof_key = ident.get("device")

@@ -169,7 +169,7 @@ if EV is not None and EV.__name__ != "lib.events":
 KB = PP.load_knowledge()
 _fmt = RPT._fmt
 
-ANALYZER_VERSION = "2.19.2"
+ANALYZER_VERSION = "2.19.3"
 
 
 # 空数据排查清单。
@@ -436,6 +436,7 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
             msa_spec=None, spec_date_col=None,
             input_dir=None, dedup_key=None, on_conflict="last", cursor=None,
             lot_pattern=None,
+            device=None,
             exclude_status_col=None, exclude_status_values=None,
             exclude_recovery=0, exclude_enabled=True,
             timezone=None, shift_boundary=None,
@@ -751,7 +752,7 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
     times = None
     for p in paths:
         try:
-            ing = DEV.ingest(p, sheet=sheet)
+            ing = DEV.ingest(p, sheet=sheet, device=device)
             tb = ing["table"]
             if tb is None or len(tb.rows) == 0:
                 # 归一后端到零行 -> 退回裸读一次。某些版式只有裸读能读出内容。
@@ -4015,38 +4016,37 @@ def _render_cross(rep, res):
         if xr.get("upstream_processes"):
             rep.text(s14, "本工序的上游链：%s。"
                      % " ← ".join(xr["upstream_processes"]))
-        return
+    else:
+        al = xr.get("alignment") or {}
+        rep.kv(s14, [("对齐方式", "%s（%s）" % (al.get("mode"), al.get("reason") or "")),
+                     ("对齐后样本", "%s 行" % al.get("rows")),
+                     ("目标列", res.get("target") or "—")])
+        rep.callout(s14, "**归属判定：%s**（置信度 %s）"
+                    % (xr.get("verdict"), xr.get("confidence")),
+                    "bad" if "上游" in str(xr.get("verdict")) else "info")
+        for why in (xr.get("verdict_reason") or []):
+            rep.text(s14, "- " + why)
 
-    al = xr.get("alignment") or {}
-    rep.kv(s14, [("对齐方式", "%s（%s）" % (al.get("mode"), al.get("reason") or "")),
-                 ("对齐后样本", "%s 行" % al.get("rows")),
-                 ("目标列", res.get("target") or "—")])
-    rep.callout(s14, "**归属判定：%s**（置信度 %s）"
-                % (xr.get("verdict"), xr.get("confidence")),
-                "bad" if "上游" in str(xr.get("verdict")) else "info")
-    for why in (xr.get("verdict_reason") or []):
-        rep.text(s14, "- " + why)
-
-    rows = []
-    for c in (xr.get("contributions") or [])[:8]:
-        cr = c.get("corr") or {}
-        pr = c.get("probe") or {}
-        rows.append(["本工序" if c["role"] == "current" else "上游", c["column"],
-                     _fmt(cr.get("r"), 3), _fmt(cr.get("p"), 4),
-                     {"upstream_violating": "坏件侧已超规格",
-                      "upstream_marginal": "合格但边缘",
-                      "no_spec_cannot_clear": "缺规格无法定性",
-                      "not_discriminating": "无区分力"}.get(pr.get("verdict"), "—")])
-    if rows:
-        rep.table(s14, ["归属", "参数", "r", "p", "裕度探针"], rows,
-                  caption="各参数与目标的关联，以及它在好坏两组间是否越界")
-    for p in (xr.get("upstream_probes") or []):
-        if p.get("verdict") in ("upstream_violating", "upstream_marginal",
-                                "no_spec_cannot_clear"):
-            rep.text(s14, "- **%s**：%s" % (p["param"], p.get("reason")))
-    if (xr.get("carry_over") or {}).get("clearing_evidence"):
-        rep.text(s14, "排除上游带入嫌疑还需看：%s"
-                 % "；".join(xr["carry_over"]["clearing_evidence"]))
+        rows = []
+        for c in (xr.get("contributions") or [])[:8]:
+            cr = c.get("corr") or {}
+            pr = c.get("probe") or {}
+            rows.append(["本工序" if c["role"] == "current" else "上游", c["column"],
+                         _fmt(cr.get("r"), 3), _fmt(cr.get("p"), 4),
+                         {"upstream_violating": "坏件侧已超规格",
+                          "upstream_marginal": "合格但边缘",
+                          "no_spec_cannot_clear": "缺规格无法定性",
+                          "not_discriminating": "无区分力"}.get(pr.get("verdict"), "—")])
+        if rows:
+            rep.table(s14, ["归属", "参数", "r", "p", "裕度探针"], rows,
+                      caption="各参数与目标的关联，以及它在好坏两组间是否越界")
+        for p in (xr.get("upstream_probes") or []):
+            if p.get("verdict") in ("upstream_violating", "upstream_marginal",
+                                    "no_spec_cannot_clear"):
+                rep.text(s14, "- **%s**：%s" % (p["param"], p.get("reason")))
+        if (xr.get("carry_over") or {}).get("clearing_evidence"):
+            rep.text(s14, "排除上游带入嫌疑还需看：%s"
+                     % "；".join(xr["carry_over"]["clearing_evidence"]))
 
     # 15 横向排查
     s15 = rep.section("15. 横向排查（别处会不会也有）")

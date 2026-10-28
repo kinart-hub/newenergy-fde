@@ -98,7 +98,9 @@ python scripts/prepublish_audit.py
 ## 测试
 
 ```bash
-python scripts/selftest.py          # 主自检，279 项
+python scripts/selftest.py          # 主自检；项数以实际输出的「通过 N 项」为准
+                                    # （不写死数字：每加一条 check 它就会变，写下来的
+                                    #  数字三个月后必然失真，比不写更误导）
 python scripts/selftest_guard.py    # 护栏自检（工序判定/选目标/8D/性能）
 python scripts/eval_enterprise.py --sweep 4   # 企业端回归
 python scripts/prepublish_audit.py  # 上架前隐私面审计

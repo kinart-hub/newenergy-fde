@@ -2993,7 +2993,7 @@ def test_tenant_path_guard():
 
         # kbstore 是真正的写入入口。这里验的是两件事而不是"有没有抛异常"：
         # 写一条基线路径上的记录，必须①落到租户层②基线文件一字未改。
-        # 只读��筌有没有异常是不够的——抛异常解决不了"私有知识混进共享库"。
+        # 只读断言有没有异常是不够的——抛异常解决不了"私有知识混进共享库"。
         try:
             before = io.open(outside, encoding="utf-8").read()
             KBS._write_json(outside, {"x": 1, "_probe_": True})
@@ -4960,6 +4960,16 @@ def test_quality_manager_guide():
     check("文档引用的章节在报告里都真实存在", not bad,
           "不存在的章节：%s" % bad if bad
           else "引用 %d 个章节（报告共 %d 节）" % (len(refs), len(have)))
+
+    # report.py 的模块头不许再写死段数：那里曾经写着「固定 12 段」并列出 1–12 的
+    # 标题，而报告实际已增补到十几节。注释一旦抄了清单副本就必然失真，
+    # 失真后读代码的人还把它当真——所以改为指向唯一真源，并在这里守着不许回退。
+    _rp = io.open(os.path.join(ROOT, "lib", "report.py"),
+                  encoding="utf-8").read()[:1500]
+    _fixed = re.search(r"固定\s*(\d+)\s*段", _rp)
+    check("report.py 模块头不再写死报告段数", _fixed is None,
+          "写死为「固定 %s 段」，而实际注册 %d 节" % (_fixed.group(1), len(have))
+          if _fixed else "已改为指向 pipeline 的 section 调用（当前 %d 节）" % len(have))
 
     # 2) 置信度档位口径必须与代码一致：四档、最高只到「中高」
     from lib import rootcause as RC

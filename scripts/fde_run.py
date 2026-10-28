@@ -5133,6 +5133,10 @@ def main(argv=None):
     ap.add_argument("--spec", help="analyze：企业规格 JSON")
     ap.add_argument("--tenant", help="analyze：租户 id")
     ap.add_argument("--d2-card", help="analyze：D2 录入卡路径")
+    ap.add_argument("--device",
+                    help="analyze：手动指定设备档案 key（该设备未登记识别特征、"
+                         "自动识别认不出来时用；已登记的 key 可用 "
+                         "python scripts/kb_manage.py devices 查看）")
     ap.add_argument("--industry", nargs="+", help="analyze：行业作用域")
     ap.add_argument("--no-doe", action="store_true", help="analyze：跳过 DOE")
     ap.add_argument("--selftest", action="store_true",

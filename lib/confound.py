@@ -176,14 +176,17 @@ def _effect_change(table, param_col, target_col, by):
     try:
         base = levels[0]
         X0 = [[xx] for xx in x]
+        # 键名必须与生产者对齐：stats.linear_regression 返回的是 "coef"（单数）。
+        # 写成 "coefs" 会让 .get 恒为 None -> b0/b1 恒 None -> 本函数恒返回
+        # "系数不可解"，协变量控制整条链路失效却不报错，报告照样写出结论。
         m0 = S.linear_regression(X0, y)
-        b0 = (m0.get("coefs") or [None])[0]
+        b0 = (m0.get("coef") or [None])[0]
         X1 = []
         for xx, k in zip(x, keys):
             row = [xx] + [1.0 if k == lv else 0.0 for lv in levels[1:]]
             X1.append(row)
         m1 = S.linear_regression(X1, y)
-        b1 = (m1.get("coefs") or [None])[0]
+        b1 = (m1.get("coef") or [None])[0]
     except Exception as exc:
         return None, "回归失败：%s" % exc
     if b0 is None or b1 is None:
@@ -294,8 +297,21 @@ def check(table, param_col, target_col, exclude=None, alpha=0.05):
             item["verdict"] = "未见该列对本次关系构成混杂"
         res["confounders"].append(item)
 
-    if len(res["confounders"]) and "协变量控制（哑变量回归）" not in res["technique"]:
-        pass
+    # 有混杂候选，却一次都没做成协变量控制：说明每个候选都卡在样本量/水平数/奇异上。
+    # 这是**结论强度的限制**，必须写进报告的 limitation，不能静默略过——
+    # 否则读报告的人看到一长串混杂候选，会误以为它们都被控制过了。
+    if res["confounders"] and "协变量控制（哑变量回归）" not in res["technique"]:
+        _rows = [c for c in res["confounders"] if c.get("column")]
+        _what = "、".join(str(c["column"]) for c in _rows[:3]) or "这些分组维度"
+        _errs = [c.get("effect_change_note") for c in res["confounders"]
+                 if c.get("effect_change_note")]
+        res["limitations"].append(
+            "列出 %d 个混杂候选，但均未完成协变量控制（哑变量回归）%s。"
+            "因此本节只能提示混杂方向，不能量化「控制后效应到底变了多少」——"
+            "这两件事的强度不同，不要当同等强度使用。需按 %s 分层补足样本后重算。"
+            % (len(res["confounders"]),
+               "；最近一次中止原因：%s" % _errs[-1] if _errs else "",
+               _what))
     res["limitations"].append(
         "以上基于观察性数据，只能提示或排除混杂，不能确立因果。"
         "未采集的潜在因素（环境条件、原材料的未记录批次等）无从检查。")

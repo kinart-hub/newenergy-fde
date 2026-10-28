@@ -687,7 +687,9 @@ def validate_candidate(ctype, payload):
             degrade.note("kbstore.validate_candidate@L674", _dg_e)
         sig = payload.get("signature") or {}
         if not (sig.get("meta_regex") or sig.get("col_any") or sig.get("filename_regex")):
-            warns.append("未登记任何识别特征，该设备永远不会被自动匹配到（只能用 --device 手动指定）")
+            warns.append("未登记任何识别特征，该设备永远不会被自动匹配到，"
+                         "每次使用只能由调用方用 --device 手动指定"
+                         "（补上 meta_regex/col_any/filename_regex 任一条即可自动命中）")
         if fmt.get("layout") == "long":
             if not (fmt.get("long_key_col") and fmt.get("long_value_col")):
                 errs.append("竖表档案必须同时指定 long_key_col 与 long_value_col，否则无法转成宽表")

@@ -18,7 +18,19 @@ import re
 import copy
 
 EVIDENCE_GATE = 0.20      # 根因证据门槛（evidence_score）
-STC_GAMMA = 0.0035        # 晶硅组件 Pmax 温度系数默认值 -0.35 %/℃（应由设备档案/规格书覆盖）
+
+# 组件 Pmax 温度系数 γ 的**默认值**（-0.35 %/℃）。
+# 它只是兜底：不同技术路线的组件该系数不同（晶硅约 -0.35%/℃，部分薄膜产品明显更小），
+# 判不合格时差这一点就可能翻结论。因此 stc_normalize() 接受 gamma 实参覆盖，
+# 调用方应优先从设备档案/组件规格书取值，取不到才回落到本常量。
+STC_GAMMA = 0.0035
+
+# STC 线性温度修正 P_stc = P_meas / (1 - γ(T-25)) 是围绕 25℃ 的一阶近似，
+# 只有当温度修正量远小于 1 时才成立。|γ(T-25)| 一旦达到这个比例，继续做除法
+# 就不再是"修得更准"，而是把测量值放大成天文数字（或越过因子零点变成负功率）。
+# 届时正确做法是**不做温度修正并出声**，让人核查测温通道。
+# 该阈值来自模型本身的适用前提，与具体产品无关，因此不做成可配参数。
+_STC_MAX_CORRECTION = 0.5
 
 _ID_RE = re.compile(r"(编号|编码|序号|卷号|批号|批次|流水|工位号|lot|slot|serial|^sn$|^id$|no$|号$)", re.I)
 # 时间戳类才算「时间列」；「搁置时间」「静置时间」这类持续时长是测量值，不能排除
@@ -201,8 +213,12 @@ def collapse_longform(table):
 
 # ------------------------------------------------------------------ STC
 
-def stc_normalize(table, col_map, target):
-    """组件 Pmax 按辐照度/温度做 STC 归一化。返回 (table, col_map, note, new_target)。"""
+def stc_normalize(table, col_map, target, gamma=None):
+    """组件 Pmax 按辐照度/温度做 STC 归一化。返回 (table, col_map, note, new_target)。
+
+    gamma 为 None 时用 STC_GAMMA 兜底；调用方应传设备档案/规格书里的真实温度系数，
+    不同组件该系数差异足以翻转合格判定，不该在通用库里写死成行业常数。
+    """
     col_map = dict(col_map or {})
     pmax_col = next((c for c, k in col_map.items() if k == "pmax" and table.col_index(c) is not None), None)
     if not pmax_col:
@@ -222,7 +238,11 @@ def stc_normalize(table, col_map, target):
     P = [_to_float(v) for v in table.column(pmax_col)]
     G = [_to_float(v) for v in table.column(irr_col)]
     T = [_to_float(v) for v in table.column(temp_col)] if temp_col else [None] * len(P)
-    out, skipped = [], 0
+    try:
+        _gamma = STC_GAMMA if gamma is None else float(gamma)
+    except (TypeError, ValueError):
+        _gamma = STC_GAMMA
+    out, skipped, bad_t = [], 0, 0
     for p, g, t in zip(P, G, T):
         if p is None or g is None or g < 600 or g > 1200:
             out.append(None)
@@ -231,17 +251,35 @@ def stc_normalize(table, col_map, target):
         # 实测值 P_meas = P_stc · (G/1000) · (1 - γ(T-25))，故 STC 值需除以温度因子
         val = p * (1000.0 / g)
         if t is not None:
-            val /= (1 - STC_GAMMA * (t - 25.0))
+            # 温度修正量超过阈值时，线性近似已不成立：继续除下去会把测量值
+            # 放大成天文数字（或越过因子零点变成负功率），而这不是"修得更准"。
+            # 此时只出声、不做温度修正（仍保留辐照修正），把行标出来让人核查。
+            if abs(_gamma * (t - 25.0)) >= _STC_MAX_CORRECTION:
+                out.append(None)
+                skipped += 1
+                bad_t += 1
+                continue
+            val /= (1.0 - _gamma * (t - 25.0))
         out.append(round(val, 3))
     new_name = "Pmax_STC(W)"
     table.add_column(new_name, out)
     col_map[pmax_col] = None
     col_map[new_name] = "pmax"
     note = ("检测到辐照度列「%s」%s，已把 Pmax 归一化到 STC（1000 W/m²%s）作为分析目标「%s」。"
-            "原始列「%s」保留但不参与判定；无法归一的行 %d 条（辐照度不在 600–1200 W/m² 或缺失）。"
-            "温度系数 γ 采用默认值 -0.35%%/℃，应以组件规格书或设备档案为准。"
+            "原始列「%s」保留但不参与判定；无法归一的行 %d 条%s。"
+            "温度系数 γ=%s%s。"
             % (irr_col, "" if not temp_col else "与组件温度「%s」" % temp_col,
-               "，并做温度修正" if temp_col else "，仅做辐照修正", new_name, pmax_col, skipped))
+               "，并做温度修正" if temp_col else "，仅做辐照修正", new_name, pmax_col, skipped,
+               "" if not temp_col else
+               "（辐照度不在 600–1200 W/m² / 读数缺失 / 温度读数异常）",
+               "%.4f" % _gamma,
+               "（来自调用方，非默认值）" if gamma is not None
+               else "（通用默认值，应以组件规格书或设备档案为准）"))
+    if bad_t:
+        note += ("其中有 %d 行的组件温度读数使修正量超出线性近似的适用范围"
+                 "（|γ(T-25)| ≥ %.2f），按公式归一会让结果发散或变成负功率，"
+                 "已单独剔除而不是给出一个荒谬的数值——这类读数通常是测温通道故障，建议一并核查。"
+                 % (bad_t, _STC_MAX_CORRECTION))
     return table, col_map, note, new_name
 
 
