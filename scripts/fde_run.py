@@ -2399,6 +2399,52 @@ def rule_scope_declaration():
     return _r(True, "", {"n_checks": 7})
 
 
+def rule_baseline_stability():
+    """基线稳定性必须显式结论，不稳时判异降级，且与判异结果分开呈现。
+
+    phase1_limits 早就有 stable 标志，但一度只作为 Cpk 的 caveat 间接出现——
+    读者在 SPC 段看不到"这条序列稳不稳"，只能看到控制图和判异结果。
+    评审 P1-2 要的是：稳定性检查是**一等结论**，与判异结果并列、且不稳时
+    判异结论要降级（因为控制限本身都被异常撑宽了，判异结论的灵敏度是失真的）。
+
+    判据落在"显式字段"（baseline 摘要）与"报告呈现"（基线稳定性字样）上，
+    以及"不稳时降级"的动作（那句"判异结论因此降级"）。
+    """
+    p = _read(PIPELINE_FILE) or ""
+    g = _read(os.path.join("lib", "spc.py")) or ""
+    if not p or not g:
+        return _r(False, "读不到 lib/pipeline.py 或 lib/spc.py")
+    # 1) spc_res 带 baseline 摘要（独立字段，不是埋在 caveats 里）
+    if '"baseline": {' not in p:
+        return _r(False, "SPC 结果没有独立的 baseline 摘要字段：稳定性结论丢了")
+    if '"stable": (p1 or {}).get("stable")' not in p:
+        return _r(False, "baseline 摘要没有透传 phase1 的 stable：字段成了空壳")
+    # 2) 报告正文出现「基线稳定性」呈现，且不稳定分支必须存在
+    if "**基线稳定性：未受控**" not in p:
+        return _r(False, "报告里没有「基线稳定性：未受控」的呈现："
+                         "不稳定过程和受控过程在报告里变得无法区分")
+    if "**基线稳定性**：%s" not in p:
+        return _r(False, "报告里没有「基线稳定性」的稳定分支呈现："
+                         "稳定性结论没有一等呈现")
+    # 3) 不稳时必须声明判异降级（这是"区分稳定性与判异"的关键动作）
+    if "下方判异结论因此降级" not in p:
+        return _r(False, "不稳定时没有声明「判异结论降级」："
+                         "读者会把失真的判异当成可靠信号")
+    # 4) phase1_limits 对整体不受控数据返回 stable=False（不谎报稳定）。
+    #    必须锚定到 capped 分支那一条路径：把 stable=False 写死成"只要出现这个字面
+    #    就算"的话，别的 stable=False（如样本不足路径）会替它兜底、变异就永远抓不到。
+    #    capped 分支里 stable=False 之前隔着 base_positions/excluded_positions 两行
+    #    代码（不是紧随 elif），所以正则要允许中间的任意非 stable 行。
+    if not re.search(r"elif capped:\s*\n"
+                     r"(?:[ \t]*(?:#[^\n]*|[A-Za-z_][^=\n]*=[^\n]*)\n){0,8}"
+                     r"[ \t]*stable = False", g):
+        return _r(False, "phase1_limits 的 capped 路径没有置 stable=False："
+                         "整体不受控时会被当成稳定基线")
+    if "stable = True" not in g:
+        return _r(False, "phase1_limits 没有 stable=True 的判定路径：stable 成了常量")
+    return _r(True, "", {"n_checks": 5})
+
+
 def rule_lot_segment():
     """批号里提取的分组维度，不能是流水号。
 
@@ -3660,6 +3706,31 @@ AUDIT_RULES = [
                   _sub('rep.text(s2, "**口径声明（单位 / 时区 / 班次）**")',
                        "pass"),
                   PIPELINE_FILE)]),
+    Rule("基线稳定性必须显式结论，不稳时判异要降级，且与判异结果分开呈现",
+         rule_baseline_stability,
+         "（1）SPC 结果带 baseline 摘要（stable/note 独立成字段，不是埋在 caveats）；"
+         "（2）报告正文出现「基线稳定性」呈现；"
+         "（3）不稳时呈现为告警并声明「判异结论降级」，不得与受控并列；"
+         "（4）phase1_limits 对整体不受控数据返回 stable=False（不谎报稳定）",
+         PIPELINE_FILE,
+         [_mutant("SPC 结果不带 baseline 摘要（稳定性结论丢失）",
+                  _sub('                "baseline": {',
+                       '                "_baseline_gone": {'),
+                  PIPELINE_FILE),
+          _mutant("报告不呈现基线稳定性（读者不知道过程稳不稳）",
+                  _sub('rep.text(s4, "**基线稳定性**：%s"',
+                       'rep.text(s4, "**（基线稳定性已省略）**：%s"'),
+                  PIPELINE_FILE),
+          _mutant("不稳时不声明判异降级（稳定与判异混为一谈）",
+                  _sub('下方判异结论因此降级，',
+                       '下方判异结论正常，'),
+                  PIPELINE_FILE),
+          _mutant("整体不受控却谎报稳定（把异常撑宽的控制限当基线）",
+                  _sub("        elif capped:\n"
+                       "            # 关键：封顶中断时必须如实说\"不稳\"",
+                       "        elif capped and False:\n"
+                       "            # 关键：封顶中断时必须如实说\"不稳\""),
+                  SPCPy)]),
 ]
 
 

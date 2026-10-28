@@ -161,7 +161,7 @@ if EV is not None and EV.__name__ != "lib.events":
 KB = PP.load_knowledge()
 _fmt = RPT._fmt
 
-ANALYZER_VERSION = "2.14.0"
+ANALYZER_VERSION = "2.15.0"
 
 
 # 空数据排查清单。
@@ -1801,6 +1801,17 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
                 "spec_versioning": (cap or {}).get("spec_versioning"),
                 "autocorrelation": _acd, "ewma": _ewma_out, "cusum": _cusum_out,
                 "phase1": p1, "rules_used": list(_rules),
+                # 基线稳定性结论（评审 P1-2）：把 phase1 的 stable/note 单独拎出来，
+                # 报告 S4 段要区分「稳定性检查」与「判异结果」——过程不稳时，
+                # 判异结论本身就要降级，不能和"过程受控"的表态并列。
+                "baseline": {
+                    "stable": (p1 or {}).get("stable"),
+                    "note": (p1 or {}).get("note"),
+                    "n_total": (p1 or {}).get("n_total"),
+                    "n_used": (p1 or {}).get("n_used"),
+                    "n_excluded": len((p1 or {}).get("excluded") or []),
+                    "iterations": (p1 or {}).get("iterations"),
+                },
                 "exclusion_review": {
                     "mode": spc_exclusion_mode,
                     "excluded_detail": (p1 or {}).get("exclusion_detail", []),
@@ -3300,6 +3311,19 @@ def build_report(res, work, spc_res, corr, assoc, pare, root, gaps, conf,
         rep.text(s4, "有效数值列不足（每列需 ≥8 个有效点），未执行 SPC 分析。")
     for d in spc_res:
         title = "%s %s" % (d["param_name"] or d["column"], ("(%s)" % d["unit"]) if d["unit"] else "")
+        # 基线稳定性检查（评审 P1-2）：判异之前先说清"这条序列本身稳不稳"。
+        # 不稳时的判异结果要降级——否则报告一边报"连续 9 点同侧"、一边让人以为
+        # 这是建立在稳定基线之上的可靠信号，实际控制限本身都被异常撑宽了。
+        _bl = d.get("baseline") or {}
+        if _bl.get("stable") is True:
+            rep.text(s4, "**基线稳定性**：%s" % (_bl.get("note") or "过程受控。"))
+        elif _bl.get("stable") is False:
+            rep.callout(s4, "**基线稳定性：未受控**——%s。下方判异结论因此降级，"
+                            "不得与「过程受控」混为一谈。"
+                        % (_bl.get("note") or "异常点过多，控制限由全段估计、偏宽。"),
+                        "warn")
+        elif _bl.get("stable") is None:
+            rep.text(s4, "**基线稳定性**：样本不足，未做稳定性检查。")
         add_chart(s4, CH.control_chart(d["values"], d["center"], d["lcl"], d["ucl"],
                                        title=title + " X-MR 控制图",
                                        ylabel="测量值 %s" % d["unit"],

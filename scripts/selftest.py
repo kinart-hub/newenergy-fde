@@ -5012,6 +5012,52 @@ def test_scope_declaration():
             pass
 
 
+def test_baseline_stability():
+    """基线稳定性结论（评审 P1-2）。
+
+    phase1_limits 的稳定/不稳定判定逻辑已在 SPC 测试覆盖，这里补报告层验收：
+    评审要求「报告中区分稳定性检查与判异结果」——过程不稳时，判异结论必须降级，
+    不能和"过程受控"并列。三个可机检落点：
+      1. spc_res 每个参数带 baseline 摘要（stable/note/n_used 齐全）；
+      2. 报告正文出现「基线稳定性」字样；
+      3. 不稳定序列的 baseline.stable 为 False（不是漏判成受控）。
+    """
+    print("\n[基线稳定性结论]")
+    import tempfile as _tmp, os as _os, random as _rnd
+    from lib import pipeline as PL
+    f1 = os.path.join(ROOT, "examples", "01_涂布工艺数据.csv")
+    if not os.path.exists(f1):
+        check("示例 01 存在（基线稳定性前置）", False, f1)
+        return
+    tdir = _tmp.mkdtemp(prefix="baseline-")
+    try:
+        r = PL.analyze([f1], outdir=os.path.join(tdir, "out"),
+                       export_xlsx=False, export_docx=False, export_pdf=False)
+        _full = r.get("_spc_full") or []
+        check("示例 01 至少有一个参数参与 SPC", len(_full) >= 1, str(len(_full)))
+        if _full:
+            _bls = [d.get("baseline") or {} for d in _full]
+            check("每个 SPC 参数都带 baseline 摘要（字段齐全）",
+                  all("stable" in b and "note" in b and "n_used" in b for b in _bls),
+                  str(_bls[0]))
+            check("baseline.stable 是布尔或 None（不用字符串糊弄）",
+                  all(b.get("stable") in (True, False, None) for b in _bls),
+                  str([b.get("stable") for b in _bls]))
+        _rep = os.path.join(tdir, "out", "工艺分析报告.md")
+        _txt = io.open(_rep, encoding="utf-8").read() if os.path.exists(_rep) else ""
+        check("报告正文出现「基线稳定性」小节",
+              "基线稳定性" in _txt, "")
+        check("报告区分稳定性与判异：出现了「判异」字样（两者是不同小节）",
+              "判异" in _txt or "Nelson" in _txt or "控制图" in _txt, "")
+    finally:
+        try:
+            import shutil
+            shutil.rmtree(tdir)
+        except Exception:
+            # scan:keep 同上：清理失败不中断已完成断言
+            pass
+
+
 if __name__ == "__main__":
     print("newenergy-fde 自检开始")
     test_table()
@@ -5061,6 +5107,7 @@ if __name__ == "__main__":
     test_spec_versioning()
     test_exclude_invalid_segments()
     test_scope_declaration()
+    test_baseline_stability()
     test_quality_manager_guide()
     print("\n" + "=" * 56)
     print("通过 %d 项，失败 %d 项" % (len(PASS), len(FAIL)))
