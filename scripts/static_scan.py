@@ -907,6 +907,314 @@ def scan_encoding():
     return out
 
 
+def _mod_name(rel):
+    """lib/contract.py -> contract；scripts/fde_run.py -> fde_run。"""
+    return os.path.basename(rel)[:-3]
+
+
+def _keep_module_reason(text):
+    """模块级豁免：文件里出现 `# scan:keep-module <理由与启用条件>` 则不算未接线。
+
+    与函数级 `# scan:keep` 分开，是因为两者的语义不同：
+    函数级说的是「这个函数暂时没人调」，模块级说的是「整个模块现在不进主流程」，
+    后者必须有明确的启用条件，否则就是永久的死代码。
+    """
+    m = re.search(r"#\s*scan:keep-module\s+(.+)", text)
+    return m.group(1).strip() if m else ""
+
+
+def _build_callgraph():
+    """构建模块间调用图。
+
+    返回 (defs, edges, roots)
+      defs  : {(module, funcname): rel}
+      edges  : {(module, func): {(module, func), ...}}
+      roots  : [(module, func), ...] 主流程入口
+
+    三个必须做对的地方（做错了就会得出假的"已接线"）：
+    1. 嵌套函数里的调用要归到**最外层**顶层函数，否则链条在嵌套层断掉，
+       外层明明调了下游却被算成没调。
+    2. import 别名要按 `from . import x as y` / `from lib import x as y` /
+       `import x as y` 三种写法都收。pipeline.py 里两套导入分支混着写，
+       只认一种会漏掉另一半。
+    3. `X.f()` 里的 X 必须能解析到模块；解析不到就当作"调用目标未知"，
+       不计边——宁可漏报一条边（报出来人还能看），
+       也不要随便认个同名模块（那会直接把未接线判成已接线）。
+    """
+    defs = {}
+    edges = {}
+    for rel in _py_files():
+        text = _read(rel)
+        try:
+            tree = ast.parse(text)
+        except SyntaxError as _se:
+            # 解析不了的文件不会进调用图/冲突表，它的内容等于没被这一项检查过；
+            # 静默 continue 会让"全库扫描 0 条"变成一句空话——必须留痕。
+            sys.stderr.write("[S10/S11] 跳过无法解析的文件 %s：%r\n" % (rel, _se))
+            continue
+        mod = _mod_name(rel)
+        # 该文件内所有 import 别名 -> 模块名
+        alias2mod = {}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom):
+                base = (node.module or "")
+                for a in node.names:
+                    real = a.name
+                    asname = a.asname or a.name
+                    # from . import contract  -> module=""，real="contract"
+                    # from lib import contract as C
+                    alias2mod[asname] = real if real else base.split(".")[-1]
+                    if base and not real:
+                        alias2mod[asname] = real
+                    if base.startswith("lib."):
+                        alias2mod[asname] = real
+            elif isinstance(node, ast.Import):
+                for a in node.names:
+                    asname = a.asname or a.name.split(".")[0]
+                    alias2mod[asname] = a.name.split(".")[-1]
+        local_funcs = set()
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                local_funcs.add(node.name)
+                defs[(mod, node.name)] = rel
+
+        stack = []      # 函数嵌套栈，stack[0] 是最外层顶层函数
+
+        def visit(node):
+            for ch in ast.iter_child_nodes(node):
+                if isinstance(ch, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    stack.append(ch.name)
+                    visit(ch)
+                    stack.pop()
+                    continue
+                if isinstance(ch, ast.Call):
+                    owner = stack[0] if stack else "<module>"
+                    src = (mod, owner)
+                    fn = ch.func
+                    if isinstance(fn, ast.Name) and fn.id in local_funcs:
+                        edges.setdefault(src, set()).add((mod, fn.id))
+                # 光看 Call 不够：模块常量（如 status.SUCCESS）不是函数调用，
+                # 只统计 Call 会把"用了该模块常量"的模块判成没接线——
+                # 第一版就因此把 status 误报为未接线（实际全库在用它的枚举）。
+                if isinstance(ch, ast.Attribute) and isinstance(ch.value, ast.Name):
+                    owner = stack[0] if stack else "<module>"
+                    tgt_mod = alias2mod.get(ch.value.id)
+                    if tgt_mod:
+                        edges.setdefault((mod, owner), set()).add(
+                            (tgt_mod, ch.attr))
+                visit(ch)
+
+        visit(tree)
+
+    # 主流程入口：pipeline 编排 + fde_run 命令行，两个都是顶层函数
+    roots = []
+    for rel in _py_files():
+        if _mod_name(rel) not in ("pipeline", "fde_run"):
+            continue
+        text = _read(rel)
+        try:
+            tree = ast.parse(text)
+        except SyntaxError as _se:
+            # 解析不了的文件不会进调用图/冲突表，它的内容等于没被这一项检查过；
+            # 静默 continue 会让"全库扫描 0 条"变成一句空话——必须留痕。
+            sys.stderr.write("[S10/S11] 跳过无法解析的文件 %s：%r\n" % (rel, _se))
+            continue
+        mod = _mod_name(rel)
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                roots.append((mod, node.name))
+    return defs, edges, roots
+
+
+def scan_wiring():
+    """主流程接线：lib 下的模块，是否被 pipeline/fde_run 的调用链走到。
+
+    这一类漏洞长得和"已完成"一模一样，是本项目最难自查的一处：
+      - 模块写完了、函数签名对得上、单元测试也调用了它；
+      - `selftest` 全绿、`audit` 全绿、静态扫描"定义未调用"也不报
+        （因为测试里确实有一次调用）；
+      - 但 `analyze` 这条主流程里**没有任何一条路径走到它**，
+        于是使用者拿到的报告里根本没有这项能力。
+
+    实测第一例：`lib/contract.py`（数据契约校验，351 行，P0-1 要求的
+    "缺关键列出结构化缺口报告"）只有 selftest 调过，主流程从未接线——
+    也就是说验收清单里那条"缺列可解释"从来没真正生效过。
+
+    判据落在**可达性**而不是"名字出现过"：只认从 pipeline/fde_run 顶层函数
+    出发、沿真实调用边能走到的节点。
+    """
+    out = []
+    defs, edges, roots = _build_callgraph()
+    seen = set()
+    queue = list(roots)
+    while queue:
+        cur = queue.pop()
+        if cur in seen:
+            continue
+        seen.add(cur)
+        for nxt in edges.get(cur, ()):
+            if nxt not in seen:
+                queue.append(nxt)
+
+    def reachable(mod):
+        return any(m == mod for (m, _f) in seen)
+
+    for rel in _py_files():
+        if not rel.startswith("lib" + os.sep) and not rel.startswith("lib/"):
+            continue
+        mod = _mod_name(rel)
+        if mod in ("pipeline", "__init__"):
+            continue
+        if reachable(mod):
+            continue
+        text = _read(rel)
+        reason = _keep_module_reason(text)
+        if reason:
+            _KEPT.append({"id": "S10", "file": rel, "line": 1,
+                          "reason": reason})
+            continue
+        funcs = sorted(f for (m, f) in defs if m == mod and not f.startswith("_"))
+        out.append(Finding(
+            "S10", "HIGH", rel, 1,
+            "模块「%s」没有接进主流程：pipeline/fde_run 的调用链走不到它%s" % (
+                mod, "（对外函数 %d 个：%s）" % (
+                    len(funcs), "、".join(funcs[:8]) + (
+                        "…" if len(funcs) > 8 else "")) if funcs else ""),
+            "模块写了、测试也调了，但 analyze 这条主流程没有任何一条路径走到它。"
+            "使用者拿到的报告里不会有这项能力，而所有门禁照样全绿——"
+            "这是最难自查的一类漏洞：它长得和『已完成』一模一样。",
+            "要么把它接进 lib/pipeline.py 的 analyze 流程并补端到端验证；"
+            "要么确认它现在不进主流程，在文件头写 "
+            "`# scan:keep-module <理由与启用条件>` 留痕"))
+    return out
+
+
+def _keep_near(rel, ln, pad=6):
+    """某行上方（连续注释/空行块里）是否写了 `# scan:keep`，返回理由。"""
+    text = _read(rel)
+    if not text:
+        return ""
+    lines = text.split("\n")
+    # 从 ln 的**上一行**起：ln 自己就是 import 那行代码，从它开始会在第一格就 break，
+    # 上面的理由永远读不到（第一版就是这么失效的）。
+    i = max(0, ln - 2)
+    # import 常常写在 try: 里面，往上第一格撞到的是 `try:` 而不是注释。
+    # 块开头行不算"真正的代码行"，跳过去，否则理由永远读不到。
+    block_open = ("try:", "else:", "finally:", "except", "if ", "elif ",
+                  "with ", "for ", "while ")
+    for _ in range(pad):
+        if i < 0:
+            break
+        raw = lines[i].strip()
+        m = KEEP_RE.search(lines[i])
+        if m:
+            return m.group(1).strip()
+        if not raw or raw.startswith("#") or raw.startswith(block_open):
+            i -= 1
+            continue
+        break
+    return ""
+
+
+def scan_alias_conflict():
+    """导入别名冲突：同一个别名绑了两个模块，或同一个模块绑了两个别名。
+
+    2026-10-29 实测踩到的那一处，值得把经过写下来：
+    pipeline.py 顶部 `from lib import actions as AC`（横向展开/永久对策/预防），
+    后面 P2-1 那节又写了一句 `from . import actioncard as AC`（行动卡片）。
+    后一句把别名顶掉，于是 1500 行开外的 `AC.lateral_plan(...)` 打到了
+    actioncard 上 → AttributeError → 被跨工序的降级 except 吞掉 →
+    报告里永久对策、预防措施、横向展开三块**从来没有出现过**。
+    而 selftest 全绿：它是 `from lib import actions` 直接调函数，不走那条线。
+
+    这类 bug 有三个特点，决定了必须机器查：
+      1. 不崩（有 except）、不报（降级台账只记一句）、不留痕在结论里；
+      2. 单元测试测不到（测试绕过 pipeline）；
+      3. 修复时极易只改一套导入分支（本项目两套：lib.* 与相对导入），
+         改一半的现象是"我这台机器上好了"。
+
+    所以这里同时查两件事：
+      S11a 一个别名 → 多个模块：必错，后绑的一定顶掉先绑的；
+      S11b 一个模块 → 多个别名（顶层）：两套导入分支写法不一致的强信号。
+    """
+    out = []
+
+    def _walk(node, scope, bucket):
+        for ch in ast.iter_child_nodes(node):
+            if isinstance(ch, (ast.FunctionDef, ast.AsyncFunctionDef,
+                               ast.ClassDef)):
+                _walk(ch, scope + "/" + ch.name, bucket)
+                continue
+            if isinstance(ch, ast.ImportFrom):
+                base = ch.module or ""
+                style = "lib" if base.startswith("lib") else (
+                    "rel" if base.startswith(".") else "abs")
+                for a in ch.names:
+                    real = a.name or base.split(".")[-1]
+                    key = a.asname or a.name
+                    bucket.setdefault(scope, []).append(
+                        (key, real.split(".")[-1], ch.lineno, style))
+            elif isinstance(ch, ast.Import):
+                for a in ch.names:
+                    key = a.asname or a.name.split(".")[0]
+                    bucket.setdefault(scope, []).append(
+                        (key, a.name.split(".")[-1], ch.lineno, "abs"))
+            _walk(ch, scope, bucket)
+
+    for rel in _py_files():
+        text = _read(rel)
+        try:
+            tree = ast.parse(text)
+        except SyntaxError as _se:
+            sys.stderr.write("[S11] 跳过无法解析的文件 %s：%r\n" % (rel, _se))
+            continue
+        bucket = {}
+        _walk(tree, "<module>", bucket)
+        # 只查顶层作用域：函数内的 import 各有各的局部语义，混在一起必误报
+        items = bucket.get("<module>", [])
+        by_alias = {}
+        by_module = {}
+        for alias, mod, ln, style in items:
+            by_alias.setdefault(alias, []).append((mod, ln))
+            by_module.setdefault(mod, []).append((alias, ln, style))
+        for alias, got in sorted(by_alias.items()):
+            mods = sorted(set(m for m, _l in got))
+            if len(mods) < 2:
+                continue
+            out.append(Finding(
+                "S11", "HIGH", rel, got[0][1],
+                "别名 %s 在同一文件顶层被绑到 %d 个模块：%s" % (
+                    alias, len(mods), "、".join(mods)),
+                "Python 里后一句 import 会把先一句的绑定顶掉。"
+                "先绑进来的那个模块从此在这个文件里彻底消失，"
+                "而所有写着这个别名的调用全部打到后绑的模块上——"
+                "症状是 AttributeError 被 except 吞掉、能力静默消失、报告照样出结论。",
+                "给其中一个模块换别名，两套导入分支（lib.* 与相对导入）都要改，"
+                "只改一套等于没改"))
+        for mod, got in sorted(by_module.items()):
+            aliases = sorted(set(a for a, _l, _s in got))
+            styles = sorted(set(s for _a, _l, s in got))
+            # 有意保留双别名（如回灌包级模块实例）要在旁边写 `# scan:keep <理由>`
+            reasons = [_keep_near(rel, ln) for _a, ln, _s in got]
+            if any(reasons):
+                _KEPT.append({"id": "S11", "file": rel, "line": got[0][1],
+                              "reason": [r for r in reasons if r][0]})
+                continue
+            # 只报「两种导入风格 + 两种别名」：那正是"改了一套漏了另一套"的形状。
+            # 同一风格下起两个别名（如 QG 与 _QG_PKG）是人有意为之，不报。
+            if len(aliases) < 2 or len(styles) < 2:
+                continue
+            out.append(Finding(
+                "S11", "HIGH", rel, got[0][1],
+                "模块 %s 在两套导入分支里别名不一致：%s（风格 %s）" % (
+                    mod, "、".join(aliases), "/".join(styles)),
+                "两套导入分支（lib.* 与相对导入）改了一套、漏了另一套。"
+                "后果取决于运行时走哪条分支：一边是对的，另一边是旧的，"
+                "于是同一个 bug 在两台机器上表现不同，且极难复现。",
+                "把两套分支的别名改成一致；改完两边各搜一次确认都改到了"))
+    return out
+
+
 CHECKS = [
     ("S1", "静默吞异常", scan_silent_except),
     ("S2", "定义未调用（死代码）", scan_dead_code),
@@ -917,6 +1225,8 @@ CHECKS = [
     ("S7", "清单型硬编码副本", scan_hardcoded_duplicate),
     ("S8", "跨模块调用签名不匹配", scan_call_signature),
     ("S9", "编码完整性（乱码）", scan_encoding),
+    ("S10", "主流程接线（模块是否真的被 analyze 走到）", scan_wiring),
+    ("S11", "导入别名/分支不一致", scan_alias_conflict),
 ]
 
 

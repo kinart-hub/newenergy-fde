@@ -85,9 +85,13 @@ if __package__ in (None, ""):
     except Exception:
         CXF = None
     try:                    # P2-1 结构化行动卡片；失败只少一种导出形态，不拦 8D
-        from lib import actioncard as AC
+        # 别名不能叫 AC：顶部那批导入里 `actions as AC` 已经占了 AC，
+        # 这里再绑一次会把它顶掉，使 1528 行的 AC.lateral_plan 打到 actioncard 上，
+        # 抛 AttributeError 后被跨工序的降级 except 吞掉——
+        # 横向展开/永久对策/预防三块能力静默消失，报告却照常出结论。
+        from lib import actioncard as ACARD
     except Exception:
-        AC = None
+        ACARD = None
     try:                    # P1-2 原生 Word/PDF 导出；失败只少两种交付形态
         from lib import export_doc as EX
     except Exception:
@@ -136,9 +140,9 @@ else:
     except Exception:
         CXF = None
     try:                    # P2-1 结构化行动卡片（两个分支都要，只改一套会 NameError）
-        from . import actioncard as AC
+        from . import actioncard as ACARD
     except Exception:
-        AC = None
+        ACARD = None
     try:                    # P1-2 原生 Word/PDF 导出（两个分支都要，只改一套会 NameError）
         from . import export_doc as EX
     except Exception:
@@ -160,6 +164,8 @@ if EV is not None and EV.__name__ != "lib.events":
     # 以脚本方式（python lib/pipeline.py）运行时，events 会被加载成顶层模块
     # 而不是 lib 包的子模块。此时 quality_guard 存在两份实例，函数本身是纯函数
     # 不影响结果，但为了让流水线各层拿到同一个 QG，这里把 lib 版挂过去。
+    # scan:keep 有意保留 QG / _QG_PKG 两个别名——一个是包内导入，一个是回灌给
+    # events 的包级实例，合并成一个会让"两层拿到同一个 QG"这件事失效。
     try:
         import lib.quality_guard as _QG_PKG
         EV.QG = _QG_PKG
@@ -169,7 +175,7 @@ if EV is not None and EV.__name__ != "lib.events":
 KB = PP.load_knowledge()
 _fmt = RPT._fmt
 
-ANALYZER_VERSION = "2.19.3"
+ANALYZER_VERSION = "2.19.4"
 
 
 # 空数据排查清单。
@@ -3793,8 +3799,8 @@ def build_report(res, work, spc_res, corr, assoc, pare, root, gaps, conf,
     #      因为卡片是 8D 结论的结构化投影，8D 没产出就不该有卡片。
     #      8D 没装载时没有值得导出的对象，写卡片只能写空壳。
     try:
-        if AC is not None and res.get("eightd"):
-            _ac = AC.build(res, lead=None)
+        if ACARD is not None and res.get("eightd"):
+            _ac = ACARD.build(res, lead=None)
             res["action_cards"] = _ac["cards"]
             res["action_card_n"] = _ac["n"]
             for _n in (_ac.get("notes") or []):
@@ -3803,9 +3809,9 @@ def build_report(res, work, spc_res, corr, assoc, pare, root, gaps, conf,
             # 路径随报告走，不写死；导出失败只降级本节，不拖垮整轮。
             _outdir = res.get("outdir") or "output"
             try:
-                _jpath, _jn = AC.export(_ac["cards"], os.path.join(
+                _jpath, _jn = ACARD.export(_ac["cards"], os.path.join(
                     _outdir, "行动卡片.json"), fmt="json")
-                _cpath, _cn = AC.export(_ac["cards"], os.path.join(
+                _cpath, _cn = ACARD.export(_ac["cards"], os.path.join(
                     _outdir, "行动卡片.csv"), fmt="csv")
                 res["action_card_files"] = {"json": _jpath, "csv": _cpath}
             except Exception as _ace:

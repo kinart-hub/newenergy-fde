@@ -49,7 +49,7 @@ python scripts/fde_run.py config --init --input 数据.csv  # 按真实列名生
 python scripts/fde_run.py kb                          # 知识生命周期与出处覆盖率审计
 python scripts/fde_run.py ops                         # 可观测性运维视图（回读结构化日志）
 python scripts/fde_run.py config --products battery pv --role quality  # 多产品配置怎么合并的
-python scripts/static_scan.py                         # 全库静态扫描（8 类检查一次扫穿）
+python scripts/static_scan.py                         # 全库静态扫描（类数以脚本输出为准）
 python scripts/sync_install.py --check                # 核对仓库与安装目录是否一致
 ```
 
@@ -735,10 +735,14 @@ python scripts/sync_install.py              # 同步（只做仓库→安装目�
 全库排查（改任何 `lib/` 下的判定逻辑后必跑）：
 
 ```bash
-python scripts/static_scan.py               # 8 类检查一次扫穿：静默吞异常 / 死代码 /
-                                            # 知识库悬空 / 参数透传 / 文档承诺 / 不可达分支 /
-                                            # 硬编码副本 / 跨模块调用签名
-python scripts/static_scan.py --only S1     # 只看某一类
+python scripts/static_scan.py               # 一次扫穿（类数见脚本自检首行，不在此抄数字：
+                                            # 抄了就会失同步，S8 曾被整条误删也没人发现）
+                                            # 静默吞异常 / 死代码 / 知识库悬空 / 参数透传 /
+                                            # 文档承诺 / 不可达分支 / 硬编码副本 /
+                                            # 跨模块调用签名 / 编码乱码 /
+                                            # 主流程接线 / 导入别名与分支不一致
+python scripts/static_scan.py --only S10    # 只看某一类（S10=模块有没有真被 analyze 走到）
+python scripts/e2e_wiring_check.py          # 端到端：跑完 analyze，看 result 里那几块在不在
 ```
 
 报告里的「已豁免 N 条」是**决策**不是盲区：每条都在源码里写了

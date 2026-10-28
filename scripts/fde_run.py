@@ -2463,9 +2463,18 @@ def rule_action_cards():
     g = _read(ACTIONCARD_FILE) or ""
     if not p or not g:
         return _r(False, "读不到 lib/pipeline.py 或 lib/actioncard.py")
-    # 1) 两个导入分支都登记
-    if p.count("import actioncard as AC") < 2:
-        return _r(False, "两个导入分支没有都登记 actioncard")
+    # 1) 两个导入分支都登记 actioncard，且别名不得与 actions 的 AC 撞车
+    #    （历史 bug：actioncard 也叫 AC，把 actions 顶掉，D7 横向展开/永久措施/预防三块静默消失）
+    #    判据只认「不变量」——两处分支都登记、别名一致、且不是 AC——不钉死具体别名，
+    #    否则一旦有人把别名改成别的合法名字，审计会误红、逼人回退修复。
+    _ac_aliases = re.findall(r"import actioncard as (\w+)", p)
+    if len(_ac_aliases) < 2:
+        return _r(False, "actioncard 没有在两个导入分支都登记（当前 %d 处）" % len(_ac_aliases))
+    if any(a != _ac_aliases[0] for a in _ac_aliases):
+        return _r(False, "actioncard 两个导入分支别名不一致：%s" % "、".join(_ac_aliases))
+    if _ac_aliases[0] == "AC":
+        return _r(False, "actioncard 别名不能等于 AC：会与 actions 撞车，D7 三块会静默消失")
+    _ac_alias = _ac_aliases[0]
     # 2) 卡片含 6 个核心字段（评审点名的字段契约）。
     #    必须锚定到 CARD_FIELDS 那个列表块——字段字符串在 D5/D6 卡片里也重复出现，
     #    只查字面的话删掉 CARD_FIELDS 里那一行、卡片 body 里还留着，判据照样过。
@@ -2487,7 +2496,7 @@ def rule_action_cards():
     if "行动卡片导出失败" not in p:
         return _r(False, "导出失败没有出声：静默失败会让现场以为卡片已生成")
     # 6) 卡片只在 8D 产出后生成
-    if "if AC is not None and res.get(\"eightd\"):" not in p:
+    if ("if %s is not None and res.get(\"eightd\"):" % _ac_alias) not in p:
         return _r(False, "卡片不依赖 8D 产出就生成：8D 没算完，卡片是空壳")
     return _r(True, "", {"n_checks": 6})
 
@@ -4063,8 +4072,8 @@ AUDIT_RULES = [
          "（4）导出失败出声，不静默（否则现场以为拿到了卡片）；"
          "（5）卡片只在 8D 产出后生成（8D 没产出就没有值得导出的对象）",
          ACTIONCARD_FILE,
-         [_mutant("两个导入分支只留一个（另一条路径 NameError）",
-                  _sub("        from . import actioncard as AC\n", ""),
+         [         _mutant("两个导入分支只留一个（另一条路径 NameError）",
+                  _sub("        from . import actioncard as ACARD\n", ""),
                   PIPELINE_FILE),
           _mutant("卡片字段契约被删（MES 对接的键丢了一半）",
                   _sub('    "verification_batches",  # 验证批次建议（来自 MDD 表，样本量是产能决定的）\n',
@@ -4557,9 +4566,15 @@ def flow_verify(args):
         run_cmd("5. 静态全库扫描",
                 [PY, "scripts/static_scan.py", "--strict"],
                 timeout=args.timeout),
-        run_cmd("6. 上架前隐私审计", [PY, "scripts/prepublish_audit.py", "--strict"],
+        # 6. 主流程接线端到端 —— 2026-10-29 加。
+        #    静态扫描只能证明"调用链上存在这条边"，证明不了"跑完 result 里真有这块"；
+        #    而 AC 别名被覆盖那次，边是存在的、跑起来却是 AttributeError 被吞掉。
+        #    这一步直接跑 analyze 看结果键，补的正是静态扫描看不见的那一半。
+        run_cmd("6. 主流程接线端到端",
+                [PY, "scripts/e2e_wiring_check.py"], timeout=args.timeout),
+        run_cmd("7. 上架前隐私审计", [PY, "scripts/prepublish_audit.py", "--strict"],
                 timeout=args.timeout),
-        run_cmd("7. 打包完整性", [PY, "scripts/package.py"], timeout=args.timeout),
+        run_cmd("8. 打包完整性", [PY, "scripts/package.py"], timeout=args.timeout),
     ]
     return finish("质量闸门全套", steps, args.report, started=started)
 
