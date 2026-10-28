@@ -1,0 +1,19 @@
+{
+ "极片残水": [
+  {
+   "version": "A",
+   "effective_from": "2024-01-01",
+   "effective_to": "2024-06-30",
+   "lsl": 0,
+   "usl": 300,
+   "doc_id": "SPEC-R-01"
+  },
+  {
+   "version": "B",
+   "effective_from": "2024-07-01",
+   "lsl": 0,
+   "usl": 250,
+   "doc_id": "SPEC-R-02"
+  }
+ ]
+}

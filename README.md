@@ -9,7 +9,7 @@
 ![License](https://img.shields.io/badge/license-Elastic--2.0-blue)
 ![Python](https://img.shields.io/badge/python-3.8%2B-blue)
 ![Dependencies](https://img.shields.io/badge/dependencies-0-brightgreen)
-![Self-test](https://img.shields.io/badge/selftest-688%20passing-brightgreen)
+![Self-test](https://img.shields.io/badge/selftest-713%20passing-brightgreen)
 
 ![newenergy-fde](assets/social-preview.png)
 
@@ -24,7 +24,7 @@
 git clone https://github.com/kinart-hub/newenergy-fde.git
 cd newenergy-fde
 
-python scripts/selftest.py          # 688 项端到端自检，应全部通过
+python scripts/selftest.py          # 713 项端到端自检，应全部通过
 python scripts/fde_run.py analyze -i examples/01_涂布工艺数据.csv -o output/try
 ```
 
@@ -108,6 +108,9 @@ python scripts/fde_run.py analyze -i examples/01_涂布工艺数据.csv -o outpu
 
 - SPC：X-MR / Xbar-R / p / c 图，**Nelson 1-8 判异规则**（含 Western Electric 4 条）
 - 过程能力：Cp / Cpk / Pp / Ppk / Cpm / σ 水平 / 预期 ppm
+- **规格版本化**：规格改过版时按每行数据的时间取**当时生效**的那一版判，分段给 Cpk
+  （一份规格通吃历史数据，会把"当时合规"判成"超标"；实测改版后 Cpk 从 0.85 掉到 −0.57，
+  混算就完全看不出来）。空档/重叠/认不出时间列都会告警，不默认取最新版
 - 相关性：Pearson / Spearman + 显著性、**滞后相关**、分类变量 ANOVA η²、VIF 共线性
 - 不良分类：Pareto + ABC 分级（**自动区分"计数型缺陷"与"连续测量列"**）
 - 根因定位：**知识库先验 × 数据证据 × 时序吻合** 三权重融合排序 + 5Why
@@ -118,6 +121,9 @@ python scripts/fde_run.py analyze -i examples/01_涂布工艺数据.csv -o outpu
 
 - Markdown 报告（复制进邮件 / 8D 系统）
 - HTML 报告（**单文件自包含**，SVG 图表内嵌，离线可看，可直接打印为 PDF）
+- **Word (.docx) 与 PDF 原生文件**（零第三方依赖；图表以 SVG 矢量嵌入，放大不糊）。
+  进 8D 系统、发客户、走签核时直接给文件，不用再人工转一遍——
+  多一次手工转换就多一次"报告版本和实际结论对不上"的机会
 - 独立 SVG 图表（可放进 PPT）
 - JSON 结果（供二次开发）
 
@@ -141,7 +147,11 @@ python scripts/fde_run.py analyze --input data.xlsx --target "不良率(%)" \
 # 传入企业规格（强烈建议，Cpk 才有效力）
 python scripts/fde_run.py analyze --input data.csv --spec spec.json --outdir out
 
-# 自检（353 项，含设备适配层、跨工序追溯、多企业隔离、行业作用域、基线热更新、设备记忆与知识库演进）
+# 规格改过版：每行按它当时生效的那版判，分段给 Cpk
+python scripts/fde_run.py analyze --input 近两年数据.csv --spec 规格含版本.json \
+       --spec-date-col 生产日期 --outdir out
+
+# 自检（713 项，含设备适配层、跨工序追溯、多企业隔离、行业作用域、基线热更新、设备记忆与知识库演进）
 python scripts/selftest.py
 ```
 
@@ -175,6 +185,9 @@ newenergy-fde/
 │   ├── crossprocess.py           跨工序追溯：多表对齐 / 归属判定 / 裕度探针 / 横向排查
 │   ├── actions.py                永久措施候选与预防性参数建议
 │   ├── kbstore.py                知识库演进引擎（候选/审核/入库/版本/回滚）
+│   ├── msa.py                    测量系统门槛：Gauge R&R(ANOVA) / 重复性 / 判定分级 / 拦住结论
+│   ├── specver.py                规格版本化：版本登记 / 按生效期取版 / 空档与重叠体检 / 分段
+│   ├── export_doc.py             原生导出：Word(OOXML) + PDF 1.4（零依赖，中文用 GB1 预定义字体）
 │   └── pipeline.py               主流水线 + CLI
 ├── knowledge/
 │   ├── 锂电池工序知识库.md        涂布/辊压/卷绕/注液/化成的机理与判读
@@ -197,7 +210,7 @@ newenergy-fde/
 │       ├── kb_manage.py              知识库管理台（status/list/propose/intake/harvest/
 │   │                             review/sync/verify/cases/devices/industries/update/rollback/patch）
 │   ├── make_device_samples.py    生成多厂商版式的对照样例（同一真值、不同导出）
-│   └── selftest.py               688 项端到端自检（含设备适配层、跨工序追溯、多企业隔离、行业作用域、基线热更新、设备记忆与知识库演进）
+│   └── selftest.py               713 项端到端自检（含设备适配层、跨工序追溯、多企业隔离、行业作用域、基线热更新、设备记忆与知识库演进）
 └── examples/
     ├── *.csv                     七类示例数据（含一个私有列名导出样例）
     └── devices/*.csv             六类设备导出样例（竖表/双行表头/单位行/合计行/未知设备)

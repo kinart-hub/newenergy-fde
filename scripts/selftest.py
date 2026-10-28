@@ -47,6 +47,7 @@ from lib import kbstore as KBS
 from lib import observ as OBS
 from lib import profile as PF
 from lib import msa as MSA
+from lib import specver as SV
 from lib import degrade as DG
 
 PASS, FAIL = [], []
@@ -290,9 +291,16 @@ def test_doe():
 # ---------------------------------------------------------------- E 流水线
 def test_pipeline():
     print("\nE. 端到端流水线")
+    # 写死个数的坏处：每加一类示例都要改一次数字，且报不出到底缺哪个。
+    # 改成必需清单——缺哪类直接点名；多出来的样例不算错（不必逼每次新增都改断言）。
     files = sorted(glob.glob(os.path.join(ROOT, "examples", "*.csv")))
-    check("示例数据齐全（7 类：6 类工况 + 1 类私有列名）", len(files) == 7,
-          "%d 个" % len(files))
+    names = [os.path.basename(f) for f in files]
+    # 用编号前缀定位（不写客户代号：交付物里不该出现具体客户标识）
+    _need = ["01_涂布", "02_卷绕", "03_化成分容", "04_硅片", "05_EL",
+             "06_组件IV", "07_", "08_跨规格版本"]
+    _miss = [p for p in _need if not any(n.startswith(p) for n in names)]
+    check("示例数据齐全（%d 类：6 类工况 + 私有列名 + 跨规格版本）" % len(_need),
+          not _miss, "缺 %s｜现有 %d 个" % (_miss, len(names)))
     for f in files:
         name = os.path.basename(f)
         outdir = os.path.join(ROOT, "output", "_test", name[:2])
@@ -3947,6 +3955,124 @@ def test_export_docx_pdf():
         EX.write_docx = _orig
 
 
+def test_spec_versioning():
+    """规格版本化（评审 P1-3）：历史数据必须按**当时生效**的规格重判。
+
+    这条要防的错是方向性的：拿今天的尺子量去年的货，
+    规格收紧过 → 当时合格的批评成不合格；放宽过 → 当时超差的批评成合格。
+    两种都不是"数字差一点"，是 8D 报告的结论方向反了。
+    """
+    print("\n[规格版本化]")
+    import datetime as _dt
+
+    def _d(s):
+        return _dt.datetime.strptime(s, "%Y-%m-%d")
+
+    # 1) 按生效期取版本：A 版 2024 全年，B 版 2025 起收紧
+    raw = {"极片残水": [
+        {"version": "A", "effective_from": "2024-01-01", "effective_to": "2024-12-31",
+         "lsl": 0, "usl": 300, "doc_id": "S-01"},
+        {"version": "B", "effective_from": "2025-01-01",
+         "lsl": 0, "usl": 250, "doc_id": "S-02"}]}
+    reg = SV.load(raw)
+    check("登记了 2 个版本", len(reg.versions_of("极片残水")) == 2, "")
+    a = reg.resolve("极片残水", _d("2024-06-01"))
+    b = reg.resolve("极片残水", _d("2025-06-01"))
+    check("2024 年的数据按 A 版（USL 300）",
+          a["status"] == SV.OK and (a["spec"] or {}).get("usl") == 300,
+          "%s/%s" % (a["status"], a["spec"]))
+    check("2025 年的数据按 B 版（USL 250）——不是拿旧尺子量新货",
+          b["status"] == SV.OK and (b["spec"] or {}).get("usl") == 250,
+          "%s/%s" % (b["status"], b["spec"]))
+    check("受控文件号随版本走（能回溯到依据）",
+          a.get("doc_id") == "S-01" and b.get("doc_id") == "S-02", "")
+
+    # 2) 规格收紧的经典场景：同一批实测值，按旧版合格、按新版不合格。
+    #    这正是"不版本化就会把真因抹掉"的原型——反向也必须成立。
+    # 注意别用一串相同值：σ=0 时 Cpk 根本算不出来（除零），
+    # 断言会拿到 None 而看不出到底是"算不出"还是"没翻转"
+    vals = [268.0, 272.0, 269.0, 271.0, 270.0, 267.0, 273.0, 270.0, 269.0, 271.0]
+    cpk_a = SPC.process_capability(vals, 0, 300)
+    cpk_b = SPC.process_capability(vals, 0, 250)
+    check("规格收紧后同一批数据的判定会翻转（这是本层存在的意义）",
+          (cpk_a or {}).get("Cpk", 0) > 0 > (cpk_b or {}).get("Cpk", 1),
+          "旧版 Cpk=%s / 新版 Cpk=%s" % ((cpk_a or {}).get("Cpk"),
+                                         (cpk_b or {}).get("Cpk")))
+
+    # 3) 定位不了时间时**不默认取最新版**：默认取新版＝拿今天的尺子量
+    unk = reg.resolve("极片残水", None)
+    check("无时间可定位时不猜、不默认取最新版",
+          unk["status"] == SV.UNKNOWN_DATE and unk["spec"] is None,
+          "%s" % unk["status"])
+    check("且把原因说清楚（不是干巴巴一个状态）", bool(unk.get("note")), "")
+
+    # 4) 落在空档 / 早于首版 / 晚于末版：都不能拿一个规格糊过去
+    g_raw = {"X": [{"version": "A", "effective_from": "2024-01-01",
+                    "effective_to": "2024-06-30", "usl": 10},
+                   {"version": "B", "effective_from": "2024-09-01", "usl": 8}]}
+    g = SV.load(g_raw)
+    check("相邻版本确有空档时如实报 gap（不拿任一版代判）",
+          g.resolve("X", _d("2024-07-15"))["status"] == SV.GAP, "")
+    check("首版之前报 before_all",
+          g.resolve("X", _d("2023-01-01"))["status"] == SV.BEFORE_ALL, "")
+    check("最后一版无失效日时不算 after_all（现行规格继续有效）",
+          g.resolve("X", _d("2025-06-01"))["status"] == SV.OK, "")
+    check("空档体检能查出来（否则那段数据只是『没算 Cpk』看不出原因）",
+          len(g.audit()["gaps"]) == 1, str(g.audit()["gaps"])[:80])
+
+    # 5) 首尾相接不是空档：失效 6-30 / 生效 7-01 是连续的。
+    #    把相邻端点报成空档，会让使用者去补一个根本不存在的洞（实测误报过）。
+    c_raw = {"Y": [{"version": "A", "effective_from": "2024-01-01",
+                    "effective_to": "2024-06-30", "usl": 10},
+                   {"version": "B", "effective_from": "2024-07-01", "usl": 8}]}
+    c = SV.load(c_raw)
+    check("首尾相接不算空档（含端点，失效日当天仍属旧版）",
+          not c.audit()["gaps"] and not c.audit()["overlaps"],
+          str(c.audit())[:80])
+    check("失效日当天按旧版", c.resolve("Y", _d("2024-06-30"))["version"] == "A", "")
+    check("生效日当天按新版", c.resolve("Y", _d("2024-07-01"))["version"] == "B", "")
+
+    # 6) 重叠 = 谁赢不能由代码猜，必须交人
+    o_raw = {"Z": [{"version": "A", "effective_from": "2024-01-01",
+                    "effective_to": "2024-12-31", "usl": 10},
+                   {"version": "B", "effective_from": "2024-06-01", "usl": 8}]}
+    o = SV.load(o_raw)
+    amb = o.resolve("Z", _d("2024-07-01"))
+    check("生效期重叠时报 ambiguous，不给规格（不替使用人选一版）",
+          amb["status"] == SV.AMBIGUOUS and amb["spec"] is None, amb["status"])
+    check("重叠被体检列出", len(o.audit()["overlaps"]) == 1, "")
+
+    # 7) 旧扁平规格必须继续能用：升级后老配置不该突然判不过
+    fl = SV.load({"极片残水": {"lsl": 0, "usl": 300}})
+    fr = fl.resolve("极片残水", None)
+    check("旧扁平格式（无生效期）行为不变",
+          fr["status"] == SV.OK and (fr["spec"] or {}).get("usl") == 300, "")
+    check("柔性匹配：规格书带单位、列名不带也能对上",
+          SV.load(raw).resolve("极片残水(ppm)", _d("2024-06-01"))["version"] == "A", "")
+
+    # 8) 分段：跨版本的数据必须切开，且每段只用自己的数据
+    dts = [_d("2024-03-01"), _d("2024-09-01"), _d("2025-03-01"), _d("2025-09-01")]
+    sp = reg.split("极片残水", [1.0, 2.0, 3.0, 4.0], dts)
+    check("按版本切成 2 段", len(sp["segments"]) == 2, str(len(sp["segments"])))
+    check("分段的行下标正确（A 段 0/1，B 段 2/3）",
+          [s["indexes"] for s in sp["segments"]] == [[0, 1], [2, 3]],
+          str([s["indexes"] for s in sp["segments"]]))
+    check("每段带自己的规格（A=300 / B=250）",
+          [(s["spec"] or {}).get("usl") for s in sp["segments"]] == [300, 250], "")
+    check("无未定位行", sp["n_unlocated"] == 0, str(sp["n_unlocated"]))
+
+    # 9) 给了版本化规格但数据没有可解析时间列：不切、不给规格、说明原因
+    sp2 = reg.split("极片残水", [1.0, 2.0], None)
+    check("无时间列时切不出段，且明说原因（不默认取最新版）",
+          not sp2["segments"] and sp2["status"] == SV.UNKNOWN_DATE
+          and bool(sp2.get("note")), str(sp2["status"]))
+
+    # 10) 未登记的参数：no_spec 而不是返回空规格（空规格会让下游算出假 Cpk）
+    ns = reg.resolve("未登记参数", _d("2024-06-01"))
+    check("未登记参数返回 no_spec 而非空规格",
+          ns["status"] == SV.NO_SPEC and ns["spec"] is None, ns["status"])
+
+
 def test_boundary_policy_evidence():
     """边界政策必须由受控规格证据推导，不能留给使用人拍板。
 
@@ -4207,6 +4333,7 @@ if __name__ == "__main__":
     test_msa_gauge_rr_gate()
     test_autocorrelation_ewma_cusum()
     test_export_docx_pdf()
+    test_spec_versioning()
     print("\n" + "=" * 56)
     print("通过 %d 项，失败 %d 项" % (len(PASS), len(FAIL)))
     if FAIL:

@@ -2267,6 +2267,62 @@ def rule_export_native():
     return _r(True, "", {"n_checks": 7})
 
 
+def rule_spec_version_effective():
+    """历史数据必须按**当时生效**的那一版规格判定，不能拿今天的尺子量去年的货。
+
+    判据落在赋值与写入动作上，不停在"有没有这个模块"：
+      * 能力计算的数据必须来自主段自己的 values——配主段规格却喂全段数据，
+        等于把别的版本时期的行也算进来，那把尺子在那些行上根本没生效过；
+      * 登记读取失败 / 认不出时间列 / 版本之间有空档，三种情况都必须进 warnings。
+        规格一旦"按错的版"静默算完，Cpk → 过程能力 → 根因排序整条链跟着错，
+        而使用人手里那份报告看起来完全正常。
+    """
+    p = _read(PIPELINE_FILE) or ""
+    if not p:
+        return _r(False, "读不到 lib/pipeline.py")
+    # 1) 两个导入分支都登记（只改一套会在另一条调用路径上 NameError）
+    if p.count("import specver as SV") < 2:
+        return _r(False, "两个导入分支没有都登记 specver："
+                         "只改一套会在另一条调用路径上 NameError")
+    # 2) 规格表不是直接当扁平 dict 用，而是先建版本注册表
+    if not re.search(r"_spec_reg = SV\.load\(", p):
+        return _r(False, "未把规格登记读成版本注册表：多版本的生效期无从判断，"
+                         "只能退回一份规格通吃")
+    # 3) 配不出来必须出声：locate except 块，三样登记缺一不可
+    _i = p.find("            _spec_reg = SV.load(spec_overrides, col_map=col_map)")
+    _j = p.find("        if _spec_reg is not None", _i)
+    if _i < 0 or _j < 0:
+        return _r(False, "找不到规格注册表的读取与容错结构")
+    _blk = p[_i:_j]
+    if 'degrade.note("pipeline.specver@load"' not in _blk \
+            or 'result.setdefault("warnings", []).append(' not in _blk \
+            or 'result.setdefault("degraded_sections", []).append(' not in _blk:
+        return _r(False, "规格版本登记读取失败时没有同时进降级台账与告警："
+                         "使用者会以为已按当时生效版本重判")
+    # 4) 能力计算必须吃该段自己的数据（不是全段配主段规格）
+    if '_cap_vals = _main_seg["values"]' not in p \
+            or "SPC.process_capability(_cap_vals," not in p:
+        return _r(False, "能力计算用的是全段数据：别的规格版本时期的行被算了进来，"
+                         "这把尺子在那些行上没生效过")
+    # 5) 版本之间的空档 / 重叠必须体检并出声（否则那段数据只是"没算 Cpk"）
+    for _k in ('for _g in (_aud.get("gaps") or []):',
+               'for _o in (_aud.get("overlaps") or []):'):
+        _b = p.find(_k)
+        if _b < 0 or 'setdefault("warnings"' not in p[_b:_b + 220]:
+            return _r(False, "版本登记体检（%s）结果未进告警："
+                             "空档/重叠的锅会静默落到数据头上" % _k[:24])
+    # 6) 认不出时间列必须出声，且不许回头替使用者选一版
+    _t = p.find("            if not _time_col:")
+    if _t < 0 or 'setdefault("warnings"' not in p[_t:_t + 400]:
+        return _r(False, "登记了多版却定位不了时间列时没有出声："
+                         "静默按单一规格判，正是要防的那件事")
+    # 7) 分段明细要真出现在报告里（算出来不给使用者＝白算）
+    if 'for sg in (c.get("spec_segments") or []):' not in p:
+        return _r(False, "分段能力结果没有渲染进报告："
+                         "使用者看不到换版前后各段各自的 Cpk")
+    return _r(True, "", {"n_checks": 7})
+
+
 def rule_msa_gate():
     """测量系统能力必须真能限制结论，而不是报告末尾的一句免责。
 
@@ -3210,6 +3266,42 @@ AUDIT_RULES = [
                           flags=re.M | re.S), PIPELINE_FILE),
           _mutant("两个导入分支只留一个（另一条路径 NameError）",
                   _sub("        from . import export_doc as EX\n", ""),
+                  PIPELINE_FILE)]),
+    Rule("历史数据按当时生效的规格重判，认不出/有空档必须出声",
+         rule_spec_version_effective,
+         "（1）pipeline 两个导入分支都登记 specver；"
+         "（2）规格登记读成版本注册表 _spec_reg = SV.load(...)；"
+         "（3）读取失败同时进降级台账/warnings/degraded_sections；"
+         "（4）能力计算吃主段自己的 values，不是全段配主段规格；"
+         "（5）空档与重叠体检结果进告警；"
+         "（6）认不出时间列时出声而非静默按单一规格判；"
+         "（7）分段 Cpk 明细真的渲染进报告",
+         PIPELINE_FILE,
+         [_mutant("不建版本注册表（退回一份规格通吃全部历史数据）",
+                  _sub("            _spec_reg = SV.load(spec_overrides, col_map=col_map)\n",
+                       "            _spec_reg = None\n"),
+                  PIPELINE_FILE),
+          _mutant("能力计算用全段数据配主段规格（跨版本的行被算进来）",
+                  _sub('                _cap_vals = _main_seg["values"]\n',
+                       "                _cap_vals = vals\n"),
+                  PIPELINE_FILE),
+          _mutant("规格版本登记读取失败静默吞掉（使用者以为已按版本重判）",
+                  _sub('            degrade.note("pipeline.specver@load", _sv_e)\n'
+                       '            result.setdefault("warnings", []).append(\n'
+                       '                "规格版本登记读取失败（%s），本次按单一规格判定，'
+                       '未按当时生效版本重判" % _sv_e)\n'
+                       '            result.setdefault("degraded_sections", []).append(\n'
+                       '                {"section": "规格版本化", "error": str(_sv_e)})\n',
+                       "            _spec_reg = None\n"),
+                  PIPELINE_FILE),
+          _mutant("版本空档体检结果不上报（那段只是『没算 Cpk』看不出原因）",
+                  _sub('            for _g in (_aud.get("gaps") or []):\n'
+                       '                result.setdefault("warnings", []).append(\n'
+                       '                    "规格版本空档：%s" % _g.get("issue"))\n',
+                       "            pass\n"),
+                  PIPELINE_FILE),
+          _mutant("两个导入分支只留一个（另一条路径 NameError）",
+                  _sub("        from . import specver as SV\n", ""),
                   PIPELINE_FILE)]),
 ]
 

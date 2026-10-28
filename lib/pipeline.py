@@ -64,6 +64,10 @@ if __package__ in (None, ""):
         from lib import msa as MSA
     except Exception:
         MSA = None
+    try:                    # P1-3 规格版本化；失败只退化成"一份规格通吃"，不拖垮主流程
+        from lib import specver as SV
+    except Exception:
+        SV = None
     try:                    # P1-2 原生 Word/PDF 导出；失败只少两种交付形态
         from lib import export_doc as EX
     except Exception:
@@ -91,6 +95,10 @@ else:
         from . import msa as MSA
     except Exception:
         MSA = None
+    try:                    # P1-3 规格版本化（两个分支都要，只改一套会 NameError）
+        from . import specver as SV
+    except Exception:
+        SV = None
     try:                    # P1-2 原生 Word/PDF 导出（两个分支都要，只改一套会 NameError）
         from . import export_doc as EX
     except Exception:
@@ -121,7 +129,7 @@ if EV is not None and EV.__name__ != "lib.events":
 KB = PP.load_knowledge()
 _fmt = RPT._fmt
 
-ANALYZER_VERSION = "2.8.0"
+ANALYZER_VERSION = "2.9.0"
 
 
 # 空数据排查清单。
@@ -376,7 +384,8 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
             spc_exclusion_mode=None,
             doe_replicates=None, doe_blocks=None, doe_seed=None, boundary_policy=None,
             role=None, controlled_spec=None,
-            msa_spec=None, export_xlsx=True, export_docx=True, export_pdf=True,
+            msa_spec=None, spec_date_col=None,
+            export_xlsx=True, export_docx=True, export_pdf=True,
             d2_card=None, emit_d2_card=True, verbose=False, views=None):
     """
     auto_adapt —— 字段认不出来时，把"新别名/新参数"自动登记到**租户层**并当场生效。
@@ -390,6 +399,10 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
     export_docx/export_pdf —— 原生 Word/PDF 导出（零第三方依赖，自写 OOXML 与 PDF 1.4）。
                   报告要进 8D 系统或发客户时用它，省掉一次手工转换。
                   默认都开；PDF 不嵌入字体（见 lib/export_doc.py 的说明）。
+    spec_date_col—— 哪一列是日期/时间列（规格版本化用：按每行自己的时间取当时生效的
+                  那一版规格）。不指定时自动识别；识别不出来会明说并按"无法按版本
+                  重判"处理，**不默认取最新版本**——默认取最新版就是拿今天的尺子
+                  量去年的货，正是这一层要防的事。
     d2_card    —— 已填写的 8D D2 录入卡路径。给了就把 5W2H 与数据做交叉校验，
                   并据此渲染完整 D1–D8；不给则 D2 全空并在报告中标记「不具备对外条件」。
     emit_d2_card—— 是否随报告生成空白 D2 录入卡（默认生成）。
@@ -933,6 +946,63 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
                        "编号/时间/坐标、分档标签与派生合计列均不作为目标。" % y_col})
     groups = pick_groups(work)
     result["groups"] = groups
+
+    # 4b. 规格版本化：把"一份规格通吃全部数据"换成"每行按它当时生效的那版判"。
+    #     拿今天的尺子量去年的货，会把当时合格的批判成不合格（或反过来），
+    #     而 Cpk 一错，过程能力、Pareto、根因排序全部跟着错。
+    _spec_reg = None
+    _time_col, _times = None, None
+    if SV is not None and spec_overrides:
+        try:
+            _spec_reg = SV.load(spec_overrides, col_map=col_map)
+        except Exception as _sv_e:
+            # 配不出来必须出声：静默回落"一份规格通吃"会让使用人以为已按版本重判
+            degrade.note("pipeline.specver@load", _sv_e)
+            result.setdefault("warnings", []).append(
+                "规格版本登记读取失败（%s），本次按单一规格判定，未按当时生效版本重判" % _sv_e)
+            result.setdefault("degraded_sections", []).append(
+                {"section": "规格版本化", "error": str(_sv_e)})
+        if _spec_reg is not None and _spec_reg.audit().get("n_versioned"):
+            try:
+                _time_col, _times = PP.parse_time_column(work, col=spec_date_col)
+            except Exception as _tc_e:
+                degrade.note("pipeline.specver@time", _tc_e)
+                _time_col, _times = None, None
+            if spec_date_col and not _time_col:
+                # 指了却认不出，必须点名：静默退回自动识别会让使用者以为指定生效了
+                result.setdefault("warnings", []).append(
+                    "用 --spec-date-col 指定的「%s」没能解析成日期/时间，"
+                    "已退回自动识别。请确认该列名与内容格式。" % spec_date_col)
+                try:
+                    _time_col, _times = PP.parse_time_column(work)
+                except Exception as _tc_e2:
+                    degrade.note("pipeline.specver@time2", _tc_e2)
+                    _time_col, _times = None, None
+            _aud = _spec_reg.audit()
+            for _g in (_aud.get("gaps") or []):
+                result.setdefault("warnings", []).append(
+                    "规格版本空档：%s" % _g.get("issue"))
+            for _o in (_aud.get("overlaps") or []):
+                result.setdefault("warnings", []).append(
+                    "规格版本重叠（需人工确认以哪个为准）：%s" % _o.get("issue"))
+            for _n in (_aud.get("no_effective") or []):
+                result.setdefault("warnings", []).append(
+                    "规格版本缺生效日：%s" % _n.get("issue"))
+            if not _time_col:
+                # 登记了多版却定位不了时间：不默认用最新版——那正是要防的事
+                result.setdefault("warnings", []).append(
+                    "规格书登记了 %d 个参数的历史版本，但本批数据没有可解析的时间列，"
+                    "无法按当时生效的规格重判。请提供含日期/时间的列（或在命令行用 "
+                    "--spec-date-col 指定）后重跑。"
+                    % _aud.get("n_versioned"))
+            result["spec_versioning"] = {
+                "n_versioned": _aud.get("n_versioned"),
+                "n_flat": _aud.get("n_flat"),
+                "time_col": _time_col,
+                "gaps": _aud.get("gaps") or [],
+                "overlaps": _aud.get("overlaps") or [],
+                "no_effective": _aud.get("no_effective") or [],
+            }
     # 列名几乎全对不上时，工序判定和根因都是猜的，必须明说——
     # 最危险的不是算错，是算错了还给出一个很自信的结论。
     if work.columns:
@@ -1123,8 +1193,48 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
             sd = S.stdev([v for v in vals if v is not None])
             # 企业规格书优先。以前这一步根本没接 spec_overrides，企业给了规格书也白给，
             # Cpk 全用数据分布兜底算——数字失真且毫无提示。
+            #
+            # 规格版本化（P1-3）：该参数登记了多个历史版本时，按每行自己的时间
+            # 取当时生效的那一版，并**分段**算 Cpk。把跨版本的数据混进一个 Cpk，
+            # 等于拿一把根本不存在的尺子量两种货。
             _ov = PP.match_spec_key(c, col_map, spec_overrides) if spec_overrides else None
-            if _ov:
+            _seg = None
+            if _spec_reg is not None and _spec_reg.is_versioned(c):
+                try:
+                    _seg = _spec_reg.split(c, vals, _times)
+                except Exception as _sp_e:
+                    degrade.note("pipeline.specver@split", _sp_e)
+                    _seg = None
+            if _seg is not None and _seg.get("segments"):
+                # 主口径取覆盖行数最多的一段：报告里的 Cpk 要有个确定的数，
+                # 但不能假装全段同规格——分段明细同时给出，跨版本必须点名。
+                _main = max(_seg["segments"], key=lambda s: len(s["indexes"]))
+                lsl = (_main["spec"] or {}).get("lsl")
+                usl = (_main["spec"] or {}).get("usl")
+                tgt = (_main["spec"] or {}).get("target")
+                _spec_src = "企业规格书"
+                if len(_seg["segments"]) > 1:
+                    result.setdefault("warnings", []).append(
+                        "「%s」本批数据跨越 %d 个规格版本（%s），已按版本分段判定；"
+                        "整段 Cpk 不可跨段比较，请以分段结果为准。"
+                        % (c, len(_seg["segments"]),
+                           "、".join(str(s["version"]) for s in _seg["segments"])))
+                if _seg.get("n_unlocated"):
+                    _rs = _seg.get("unlocated_reasons") or {}
+                    result.setdefault("warnings", []).append(
+                        "「%s」有 %d 行没能定位到生效规格（%s），这些行未纳入能力计算，"
+                        "不得按合格处理。"
+                        % (c, _seg["n_unlocated"],
+                           "、".join("%s×%d" % (k, v) for k, v in sorted(_rs.items()))))
+            elif _seg is not None and _seg.get("status") not in (None, "no_spec"):
+                # 切不出来：不许退回"整段用一版"——那正是要防的拿错尺子
+                lsl, usl, tgt = None, None, None
+                _spec_src = None
+                result.setdefault("warnings", []).append(
+                    "「%s」登记了多个规格版本但本批数据无法定位生效版本（%s），"
+                    "本次不给 Cpk，不按单一版本代判。"
+                    % (c, _seg.get("note") or _seg.get("status")))
+            elif _ov:
                 lsl, usl, tgt = _ov.get("lsl"), _ov.get("usl"), _ov.get("target")
                 _spec_src = "企业规格书"
             else:
@@ -1245,8 +1355,48 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
                     "detail": "「%s」自相关显著（%s）：已自动追加 EWMA 与 CUSUM，"
                               "常规 X-MR 报警仅供参考" % (spec.get("name", c),
                                                     (_acd.get("reason") or "")[:60])})
-            cap = SPC.process_capability(vals, lsl, usl, tgt,
-                                         sigma_within=(xc.sigma_within if xc else None))
+            # 规格版本化时，能力计算必须用**该段自己的数据**配该段的规格。
+            # 拿全段数据配主段规格看似省事，实际是把别的版本时期的数据也算进来
+            # ——那把尺子在那些行上根本没生效过，算出来的 Cpk 没有任何意义。
+            _cap_vals = vals
+            _main_seg = None
+            if _seg is not None and _seg.get("segments"):
+                _main_seg = max(_seg["segments"], key=lambda s: len(s["indexes"]))
+                _cap_vals = _main_seg["values"]
+            _cap_sw = xc.sigma_within if xc else None
+            cap = SPC.process_capability(_cap_vals, lsl, usl, tgt, sigma_within=_cap_sw)
+            if cap and _seg is not None and _seg.get("segments"):
+                # 逐段能力：跨版本的数据只有一个总 Cpk 是不够的，
+                # 现场要回答的是"换版前后能力变好了还是变坏了"
+                _segs_out = []
+                for s in _seg["segments"]:
+                    _sv = [v for v in (s.get("values") or []) if v is not None]
+                    if len(_sv) < 2:
+                        continue
+                    _sc = SPC.process_capability(_sv, (s["spec"] or {}).get("lsl"),
+                                                 (s["spec"] or {}).get("usl"),
+                                                 (s["spec"] or {}).get("target"))
+                    if not _sc:
+                        continue
+                    _sc["version"] = s.get("version")
+                    _sc["doc_id"] = s.get("doc_id")
+                    _sc["from"] = (s.get("from").date().isoformat()
+                                   if getattr(s.get("from"), "date", None) else None)
+                    _sc["to"] = (s.get("to").date().isoformat()
+                                 if getattr(s.get("to"), "date", None) else None)
+                    _sc["lsl"] = (s["spec"] or {}).get("lsl")
+                    _sc["usl"] = (s["spec"] or {}).get("usl")
+                    _segs_out.append(_sc)
+                if _segs_out:
+                    cap["spec_segments"] = _segs_out
+                    cap["spec_versioning"] = {
+                        "n_segments": len(_segs_out),
+                        "main_version": (_main_seg or {}).get("version"),
+                        "main_n": len(_cap_vals),
+                        "total_n": len(vals),
+                        "unlocated": _seg.get("n_unlocated") or 0,
+                        "note": "该参数有多个生效版本，Cpk 按版本分段给出；"
+                                "主值为覆盖行数最多的一段，跨段不可直接比较"}
             if cap and p1:
                 cap["baseline_note"] = p1["note"]
                 # Cpk 的前提条件必须写明：样本量不足、规格来源、过程是否受控
@@ -1254,6 +1404,10 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
                 if cap.get("n", 0) < 25:
                     cap["caveats"].append("样本量 n=%d < 25，Cpk 估计不稳定，仅供方向参考"
                                           % cap["n"])
+                if _main_seg is not None and (_seg.get("n_unlocated") or 0):
+                    cap["caveats"].append(
+                        "另有 %d 行未能定位生效规格，未计入本 Cpk；该值不代表全批"
+                        % _seg["n_unlocated"])
                 if not p1.get("stable"):
                     cap["caveats"].append("过程未达统计受控状态，Cpk 的前提（稳定）不成立，"
                                           "该值不代表长期能力")
@@ -1268,6 +1422,7 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
                 "sigma_overall": sd, "mean": mu,
                 "violations": vios, "capability": cap,
                 "lsl": lsl, "usl": usl, "target_value": tgt, "spec_source": _spec_src,
+                "spec_versioning": (cap or {}).get("spec_versioning"),
                 "autocorrelation": _acd, "ewma": _ewma_out, "cusum": _cusum_out,
                 "phase1": p1, "rules_used": list(_rules),
                 "exclusion_review": {
@@ -2624,6 +2779,36 @@ def build_report(res, work, spc_res, corr, assoc, pare, root, gaps, conf,
                      c.get("verdict", "无规格")])
     rep.table(s5, ["参数", "单位", "均值", "σ(整体)", "LSL", "USL", "Cp", "Cpk",
                    "Ppk", "预期ppm", "σ水平", "判定"], rows)
+    # 规格版本化：跨版本的数据只给一个总 Cpk 是不够的——
+    # 现场真正要回答的是"换版前后能力是变好还是变坏"，而总 Cpk 会把这个变化抹平。
+    _ver_rows = []
+    _ver_seg = []
+    for d in spc_res:
+        c = d.get("capability") or {}
+        for sg in (c.get("spec_segments") or []):
+            _ver_seg.append([d["param_name"] or d["column"], sg.get("version"),
+                             sg.get("doc_id") or "—",
+                             "%s ~ %s" % (sg.get("from") or "—", sg.get("to") or "—"),
+                             _fmt(sg.get("lsl")), _fmt(sg.get("usl")),
+                             _fmt(sg.get("n")), _fmt(sg.get("Cpk")),
+                             _fmt(sg.get("Ppk")), _fmt(sg.get("ppm_total"), 1)])
+        sv = d.get("spec_versioning")
+        if sv and sv.get("n_segments", 0) > 1:
+            _ver_rows.append([d["param_name"] or d["column"], sv.get("n_segments"),
+                              sv.get("main_version"), sv.get("main_n"),
+                              sv.get("total_n"), sv.get("unlocated") or 0])
+    if _ver_seg:
+        rep.table(s5, ["参数", "规格版本", "受控文件号", "数据区间", "LSL", "USL",
+                       "n", "Cpk", "Ppk", "预期ppm"], _ver_seg,
+                  caption="按生效规格版本分段的过程能力（跨段不可直接比较）")
+        rep.callout(s5, "本批数据跨越了规格版本变更：上表按各版本生效期分段给出能力指数。"
+                        "整段混合计算的 Cpk 不具工程意义——它相当于用一把从未在任何"
+                        "时点存在过的尺子量两种货。判断「换版前后有没有变好」请逐段对比。",
+                    "warn")
+    if _ver_rows:
+        rep.table(s5, ["参数", "跨越版本数", "主值取用版本", "主段样本", "总样本",
+                       "未定位行数"], _ver_rows,
+                  caption="跨版本参数的取用说明")
     for d in spc_res[:6]:
         c = d.get("capability") or {}
         vals = d["values"]
@@ -3285,7 +3470,15 @@ def main():
     ap.add_argument("--process", "-p", default=None, help="指定工序 key，如 battery_coating")
     ap.add_argument("--defect", "-d", default=None, help="指定缺陷类型，如 针孔气泡")
     ap.add_argument("--sheet", default=None, help="XLSX 工作表名")
-    ap.add_argument("--spec", default=None, help="企业规格 JSON 文件 {列名:{lsl,usl,target}}")
+    ap.add_argument("--spec", default=None,
+                    help="企业规格 JSON 文件。两种写法都接受——"
+                         "扁平：{列名:{lsl,usl,target}}；"
+                         "版本化：{列名:[{version,effective_from,effective_to,"
+                         "lsl,usl,target,doc_id}]}。给版本化写法时，每行数据按它"
+                         "自己时间列上生效的那一版判定，并分段给出 Cpk")
+    ap.add_argument("--spec-date-col", default=None,
+                    help="指定哪一列是日期/时间列（用于按生效期取规格版本）。"
+                         "不指定时自动识别；自动识别不出来会明说，不会默认取最新版")
     ap.add_argument("--no-doe", action="store_true", help="跳过 DOE 方案")
     ap.add_argument("--json", default=None, help="额外输出 JSON 结果到指定文件")
     ap.add_argument("--tenant", default=os.environ.get("FDE_TENANT"),
@@ -3381,6 +3574,7 @@ def main():
 
     res = analyze(args.input, outdir=args.outdir, target=args.target, process=args.process,
                   defect=args.defect, sheet=args.sheet, spec_overrides=spec,
+                  spec_date_col=args.spec_date_col,
                   do_doe=not args.no_doe, auto_adapt=args.auto_adapt,
                   tenant=args.tenant, industry=args.industry, rules=args.rules,
                   spc_exclusion_mode=args.spc_exclusion_mode,
