@@ -2488,6 +2488,40 @@ def rule_action_cards():
     return _r(True, "", {"n_checks": 6})
 
 
+def rule_process_fallback():
+    """工序判定失败必须显式降级，未知模式不做强因果，页脚记录模式。
+
+    判定失败曾被当成"顺带的结果"：chosen_proc=None 就往下跑，下游拿 None 当工序，
+    等于静默进入无工序模式却没人知道。评审 P0-4 要的是升成一等状态 + 三档降级路径。
+    判据落在"一等状态"（process_mode）、"降级动作"（根因不用机理先验）、
+    以及"报告声明"（页脚写模式）三件事上。
+    """
+    p = _read(PIPELINE_FILE) or ""
+    if not p:
+        return _r(False, "读不到 lib/pipeline.py")
+    # 1) process_mode 是一等状态，不是顺带结果
+    if 'result["process_mode"] = _proc_mode' not in p:
+        return _r(False, "判定失败没有登记 process_mode：仍会静默拿 None 当工序跑")
+    # 2) 有 --process-mode 入口（使用者能显式选降级路径）
+    if '"--process-mode"' not in p:
+        return _r(False, "没有 --process-mode 入口：使用者无法显式选降级路径")
+    # 3) unknown/descriptive 模式不用工序机理先验（强因果降级）
+    if "_no_process_prior = (_proc_mode in (\"unknown\", \"descriptive\"))" not in p:
+        return _r(False, "没有把 unknown/descriptive 标成 _no_process_prior："
+                         "强因果没被降级")
+    if "if defect_name and not _no_process_prior:" not in p:
+        return _r(False, "根因没有依据 _no_process_prior 跳过工序机理："
+                         "未知工序却仍查了工序知识库先验")
+    if 'root["_no_process_prior"] = True' not in p:
+        return _r(False, "根因结果没有标注 _no_process_prior：读者看不出这是降级结论")
+    # 4) 报告页脚声明模式
+    if '("工序判定模式", {' not in p:
+        return _r(False, "报告页脚没有声明工序判定模式：读者不知道结论是按什么口径出的")
+    if "本次处于**未知工序通用模式**" not in p:
+        return _r(False, "unknown 模式没有在页脚出醒目的「不得当工序结论」声明")
+    return _r(True, "", {"n_checks": 5})
+
+
 def rule_lot_segment():
     """批号里提取的分组维度，不能是流水号。
 
@@ -3800,6 +3834,28 @@ AUDIT_RULES = [
                        '                    "行动卡片导出失败：%s" % _ace)\n',
                        '            except Exception as _ace:\n'
                        '                pass\n'),
+                  PIPELINE_FILE)]),
+    Rule("工序判定失败必须显式降级，未知模式不做强因果，页脚记录模式",
+         rule_process_fallback,
+         "（1）判定失败不再是静默 None，而是一等状态 process_mode（recognized/"
+         "manual/unknown/descriptive）；"
+         "（2）有 --process-mode 让使用者显式选降级路径；"
+         "（3）unknown/descriptive 模式根因不用工序知识库机理先验（强因果降级）；"
+         "（4）报告页脚（17 节）声明工序判定模式",
+         PIPELINE_FILE,
+         [          _mutant("判定失败仍静默 None（不登记 process_mode）",
+                  _sub('    result["process_mode"] = _proc_mode\n', ''),
+                  PIPELINE_FILE),
+          _mutant("没有 --process-mode 入口（使用者只能干瞪眼）",
+                  _sub('    ap.add_argument("--process-mode", default=None,', ''),
+                  PIPELINE_FILE),
+          _mutant("unknown 模式仍用工序机理先验（强因果没降级）",
+                  _sub('        if defect_name and not _no_process_prior:',
+                       '        if defect_name:'),
+                  PIPELINE_FILE),
+          _mutant("报告页脚不声明模式（读者不知道结论是什么口径）",
+                  _sub('        ("工序判定模式", {',
+                       '        ("工序判定模式省略", {'),
                   PIPELINE_FILE)]),
 ]
 

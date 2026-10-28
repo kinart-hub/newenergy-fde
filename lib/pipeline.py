@@ -169,7 +169,7 @@ if EV is not None and EV.__name__ != "lib.events":
 KB = PP.load_knowledge()
 _fmt = RPT._fmt
 
-ANALYZER_VERSION = "2.16.0"
+ANALYZER_VERSION = "2.17.0"
 
 
 # 空数据排查清单。
@@ -430,6 +430,7 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
             sheet=None, spec_overrides=None, do_doe=True, max_charts=12,
             auto_adapt=False, tenant=None, industry=None, rules=None,
             spc_exclusion_mode=None,
+            process_mode=None,
             doe_replicates=None, doe_blocks=None, doe_seed=None, boundary_policy=None,
             role=None, controlled_spec=None,
             msa_spec=None, spec_date_col=None,
@@ -998,11 +999,25 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
     proc_scores = PP.detect_process(main, col_map)
     if process and process in KB["processes"]:
         chosen_proc = process
+        _proc_mode = "manual"
+    elif (process_mode or "").lower() in ("unknown", "descriptive"):
+        # 使用者显式要求不走工序假设：要么通用模式、要么仅描述性统计。
+        # 这不是"判定失败"，是"主动声明本数据不适合做工序化结论"。
+        chosen_proc = None
+        _proc_mode = (process_mode or "").lower()
     else:
         # 护栏：证据不足或存在歧义时不静默选定工序（v1.10）
         chosen_proc, _proc_note = QG.pick_process(proc_scores)
+        _proc_mode = "recognized" if chosen_proc else "unknown"
         if _proc_note:
             result.setdefault("warnings", []).append(_proc_note)
+    # 判定失败的显式登记（评审 P0-4）：chosen_proc=None 不再是一个"顺带的结果"，
+    # 而是一个一等状态。下游根因/DOE/8D 据此决定要不要降级，报告页脚据此声明。
+    if chosen_proc is None and _proc_mode == "unknown":
+        result.setdefault("warnings", []).append(
+            "工序判定失败，已进入「未知工序通用模式」：本次只做通用统计与数据质量报告，"
+            "不输出依赖工序假设的强因果/强判异结论。可用 --process 指定工序，"
+            "或 --process-mode descriptive 仅要描述性统计。")
     # 二次精化：用判定的工序重做列名匹配，避免跨行业误匹配
     if chosen_proc:
         col_map = PP.map_columns(main, chosen_proc)
@@ -1042,6 +1057,7 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
                ", ".join(sorted({x["source"] for x in _low_conf})) or "未知"))
     result["process_detected"] = proc_scores[:3]
     result["process"] = chosen_proc
+    result["process_mode"] = _proc_mode
     result["process_name"] = KB["processes"].get(chosen_proc, {}).get("name", "未知工序")
 
     _v("[2/6] 编码与工序识别：判定列=%s；工序=%s；列名映射 %d/%d 项" % (
@@ -1914,10 +1930,14 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
     try:  # 护栏：根因 环节失败只降级本节，不中断整轮
         # 10. 根因
         root = None
+        # 工序降级门（评审 P0-4）：unknown / descriptive 模式下没有工序先验，
+        # 知识库驱动的根因（rank_root_causes 用 process_specs 的机理）没有依据。
+        # 只保留纯数据驱动的参关联——那属于"这批数据长什么样"，不属于工序结论。
+        _no_process_prior = (_proc_mode in ("unknown", "descriptive"))
         # 首要缺陷按"正在恶化"选，而不是按总量最大选：
         # 总量最大的往往是长期老问题，真正要处理的是增量
         defect_name = defect or RC.pick_primary_defect(defects, work)
-        if defect_name:
+        if defect_name and not _no_process_prior:
             root = RC.rank_root_causes(defect_name, work, y_col, col_map=col_map, process=chosen_proc,
                                        exclude_cols=result.get("stc_replaced_cols"))
             if root:
@@ -1928,6 +1948,11 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
                                          recog=result.get("column_recognition_rate"),
                                          corr=corr,
                                          exclude_cols=result.get("stc_replaced_cols"))
+        if _no_process_prior and root:
+            root["_no_process_prior"] = True
+            root.setdefault("notes", []).append(
+                "运行时处于「%s」模式，本根因结论只用数据统计、未用工序知识库机理先验；"
+                "它描述这批数据的关联，不是该工序的工艺结论。" % _proc_mode)
         # 单元级热点：16 个通道里只有 CH-07 坏、两家供应商只有 B 差 ——
         # 这种"个别单元跑偏"是产线最常见的根因形态，但单因素 ANOVA 抓不到
         # （效应被正常单元摊薄，η² 0.05、p=0.41 判不显著），只能逐水平比较。
@@ -3866,7 +3891,21 @@ def _render_disclaimer(rep, res):
         ("分析时间", res.get("generated_at") or "—"),
         ("行级追溯", "%s（%s）" % ((res.get("trace_meta") or {}).get("file") or "—",
                                  (res.get("trace_meta") or {}).get("row_tracing") or "—")),
+        ("工序判定模式", {
+            "recognized": "已识别工序", "manual": "手动指定工序",
+            "unknown": "未知工序通用模式", "descriptive": "仅描述性统计",
+        }.get(res.get("process_mode"), "—")),
     ])
+    # 工序降级要作为一等结论出现在责任声明里（评审 P0-4 验收：降级行为在报告页脚记录）。
+    # "未知工序模式不出强因果"这句必须明说，否则读者会拿通用统计当工序化结论来用。
+    if res.get("process_mode") == "unknown":
+        rep.callout(s17, "本次处于**未知工序通用模式**：工序未能判定，以下所有 SPC/Cpk、"
+                         "相关性、8D 结论均**不含工序知识库先验**，只基于数据本身的统计。"
+                         "它们可用于描述这批数据，但不得当作该工序的工艺结论对外发布。"
+                         "如需工序化结论，请用 --process 指定工序后重跑。", "warn")
+    elif res.get("process_mode") == "descriptive":
+        rep.callout(s17, "本次为**仅描述性统计**模式：只出具分布与数据质量报告，"
+                         "不输出根因、DOE、8D 等依赖工序假设的强结论。", "info")
     # v1.11：审计要能复现。版本号只是"哪份代码"，还必须有"哪个文件"和"自动做了哪些决定"
     _man = res.get("run_manifest") or {}
     if _man.get("inputs"):
@@ -4113,6 +4152,11 @@ def main():
     ap.add_argument("--outdir", "-o", default="output", help="输出目录")
     ap.add_argument("--target", "-t", default=None, help="目标指标列（不良率/容量等）")
     ap.add_argument("--process", "-p", default=None, help="指定工序 key，如 battery_coating")
+    ap.add_argument("--process-mode", default=None,
+                    help="工序判定失败/未知时的降级路径：auto（默认，自动判定，失败则按"
+                         "unknown 通用模式降级）/ unknown（强行通用模式，只做通用统计与"
+                         "数据质量报告，不做强因果）/ descriptive（仅描述性统计）。"
+                         "判定失败不再中断全流程——它只是退出依赖工序假设的那些结论")
     ap.add_argument("--defect", "-d", default=None, help="指定缺陷类型，如 针孔气泡")
     ap.add_argument("--sheet", default=None, help="XLSX 工作表名")
     ap.add_argument("--spec", default=None,
@@ -4278,6 +4322,7 @@ def main():
                   do_doe=not args.no_doe, auto_adapt=args.auto_adapt,
                   tenant=args.tenant, industry=args.industry, rules=args.rules,
                   spc_exclusion_mode=args.spc_exclusion_mode,
+                  process_mode=getattr(args, "process_mode", None),
                   doe_replicates=args.doe_replicates, doe_blocks=args.doe_blocks,
                   doe_seed=args.doe_seed, boundary_policy=args.boundary_policy,
                   role=args.role, controlled_spec=args.controlled_spec,

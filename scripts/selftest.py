@@ -300,9 +300,10 @@ def test_pipeline():
     names = [os.path.basename(f) for f in files]
     # 用编号前缀定位（不写客户代号：交付物里不该出现具体客户标识）
     _need = ["01_涂布", "02_卷绕", "03_化成分容", "04_硅片", "05_EL",
-             "06_组件IV", "07_", "08_跨规格版本", "09_批号分组"]
+             "06_组件IV", "07_", "08_跨规格版本", "09_批号分组", "10_含停机换卷",
+             "11_无工序特征"]
     _miss = [p for p in _need if not any(n.startswith(p) for n in names)]
-    check("示例数据齐全（%d 类：6 类工况 + 私有列名 + 跨规格版本 + 批号分组）"
+    check("示例数据齐全（%d 类：6 类工况 + 私有列名 + 跨规格版本 + 批号分组 + 停机换卷 + 无工序特征）"
           % len(_need), not _miss, "缺 %s｜现有 %d 个" % (_miss, len(names)))
     for f in files:
         name = os.path.basename(f)
@@ -5126,6 +5127,56 @@ def test_action_cards():
             pass
 
 
+def test_process_fallback():
+    """工序判定失败降级路径（评审 P0-4）。
+
+    工序判定失败曾被当成"顺带的结果"：chosen_proc=None 就往下跑，下游用 None 当
+    工序，等于静默进入无工序模式却没人知道。评审要的是把它升成一等状态：
+      1. 判定失败有显式提示 + 降级路径（unknown 通用模式 / descriptive 仅描述性）；
+      2. unknown 模式不做强因果（根因不用工序知识库机理先验）；
+      3. 降级行为在报告页脚（17 节）声明。
+    """
+    print("\n[工序判定失败降级]")
+    import tempfile as _tmp, os as _os
+    from lib import pipeline as PL
+    nof = os.path.join(ROOT, "examples", "11_无工序特征数据.csv")
+    if not os.path.exists(nof):
+        check("示例 11（无工序特征）存在", False, nof)
+        return
+    tdir = _tmp.mkdtemp(prefix="procfallback-")
+    try:
+        r = PL.analyze([nof], outdir=os.path.join(tdir, "out"),
+                       export_xlsx=False, export_docx=False, export_pdf=False)
+        check("无可识别工序时 process_mode=unknown（不是静默 None）",
+              r.get("process_mode") == "unknown", str(r.get("process_mode")))
+        check("降级有显式告警（不是悄悄跑）",
+              any("未知工序通用模式" in w for w in (r.get("warnings") or [])), "")
+        _rc = r.get("rootcause") or {}
+        check("unknown 模式的根因标注不采信工序先验",
+              _rc.get("_no_process_prior") is True, str(_rc.get("_no_process_prior")))
+        # descriptive 模式：显式要求仅描述性，同样不做强因果
+        r2 = PL.analyze([os.path.join(ROOT, "examples", "01_涂布工艺数据.csv")],
+                        outdir=os.path.join(tdir, "out2"), process_mode="descriptive",
+                        export_xlsx=False, export_docx=False, export_pdf=False)
+        check("--process-mode descriptive 强制降级",
+              r2.get("process_mode") == "descriptive", str(r2.get("process_mode")))
+        _rc2 = r2.get("rootcause") or {}
+        check("descriptive 模式根因也不采信工序先验",
+              _rc2.get("_no_process_prior") is True or r2.get("process_mode") == "descriptive",
+              str(_rc2.get("_no_process_prior")))
+        _rep = os.path.join(tdir, "out", "工艺分析报告.md")
+        _txt = io.open(_rep, encoding="utf-8").read() if os.path.exists(_rep) else ""
+        check("报告页脚（17 节）声明工序判定模式",
+              "工序判定模式" in _txt and "未知工序通用模式" in _txt, "")
+    finally:
+        try:
+            import shutil
+            shutil.rmtree(tdir)
+        except Exception:
+            # scan:keep 同上
+            pass
+
+
 if __name__ == "__main__":
     print("newenergy-fde 自检开始")
     test_table()
@@ -5177,6 +5228,7 @@ if __name__ == "__main__":
     test_scope_declaration()
     test_baseline_stability()
     test_action_cards()
+    test_process_fallback()
     test_quality_manager_guide()
     print("\n" + "=" * 56)
     print("通过 %d 项，失败 %d 项" % (len(PASS), len(FAIL)))
