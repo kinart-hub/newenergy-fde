@@ -4550,9 +4550,16 @@ def flow_verify(args):
         run_cmd("3. 护栏自检", [PY, "scripts/selftest_guard.py"], timeout=args.timeout),
         run_cmd("4. 审计规则自检", [PY, "scripts/prepublish_audit.py", "--selfcheck"],
                 timeout=args.timeout),
-        run_cmd("5. 上架前隐私审计", [PY, "scripts/prepublish_audit.py", "--strict"],
+        # 5. 静态全库扫描 —— 2026-10-29 才接进来。此前它一直游离于门禁之外，
+        #    只在有人手动想起才跑，于是"全库扫描 0 条"这句话长期是一句空话：
+        #    正文里的乱码活了很久没人知道，我自己加检查项时误删了 S8 也没人拦住。
+        #    **不进 verify 的检查等于没有检查。**
+        run_cmd("5. 静态全库扫描",
+                [PY, "scripts/static_scan.py", "--strict"],
                 timeout=args.timeout),
-        run_cmd("6. 打包完整性", [PY, "scripts/package.py"], timeout=args.timeout),
+        run_cmd("6. 上架前隐私审计", [PY, "scripts/prepublish_audit.py", "--strict"],
+                timeout=args.timeout),
+        run_cmd("7. 打包完整性", [PY, "scripts/package.py"], timeout=args.timeout),
     ]
     return finish("质量闸门全套", steps, args.report, started=started)
 

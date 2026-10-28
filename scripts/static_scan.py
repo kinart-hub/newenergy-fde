@@ -915,6 +915,7 @@ CHECKS = [
     ("S5", "文档承诺不存在的入口", scan_doc_promise),
     ("S6", "不可达分支/死循环", scan_unreachable),
     ("S7", "清单型硬编码副本", scan_hardcoded_duplicate),
+    ("S8", "跨模块调用签名不匹配", scan_call_signature),
     ("S9", "编码完整性（乱码）", scan_encoding),
 ]
 

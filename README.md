@@ -920,7 +920,7 @@ python scripts/package.py       # 生成 dist/newenergy-fde-<version>.zip
   `python scripts/fde_run.py analyze`（脚本模式），此时 `from . import events` 会抛 ImportError  
   并被"导入失败不能拖垮流水线"的兜底吞掉 → 事件表/位置聚集在 CLI 下**静默失效**，  
   退回 1.9 的旧行为（S5 判成 pv_module_iv、目标成"面积占比"）。评测走的是  
-  `import lib.pipeline` 包模式，所以 6/6 全绿也照发现不了。已改为按入口分支导入，  
+  `import lib.pipeline` 包模式，所以当时全套门禁全绿也照发现不了。已改为按入口分支导入，  
   并加 M 组自检：用子进程跑真实 CLI，断言两条入口能力齐平。  
   同时修正负例文案在候选全被排除时出现的「共检验 0 项」自相矛盾表述。
 
