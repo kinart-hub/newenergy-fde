@@ -4647,6 +4647,60 @@ def test_decision_records_uniform():
         check("混入 dict 也能完成去重（原实现在这里 TypeError）", False, repr(_ex))
 
 
+def test_quality_manager_guide():
+    """面向质量经理的「报告解读入门」（评审 P3-1）。
+
+    这类文档最容易出的错不是写得不好，而是**写得跟代码对不上**：
+    引用一个不存在的章节号、把置信度说成有五档、说 8D 有 6 个结案条件。
+    质量经理照着它读报告，读到的和看到的不是一回事，比没有文档更糟。
+    所以这里只验**可机检的一致性**：引用的章节真实存在、口径与代码一致、
+    README 能点到它（否则没人会翻到）。
+    """
+    print("\n[报告解读入门：给质量经理]")
+    rel = os.path.join("docs", "报告解读入门-给质量经理.md")
+    path = os.path.join(ROOT, rel)
+    ok = os.path.exists(path)
+    check("入门文档存在", ok, "" if ok else rel)
+    if not ok:
+        return
+    doc = io.open(path, encoding="utf-8").read()
+    src = io.open(os.path.join(ROOT, "lib", "pipeline.py"),
+                  encoding="utf-8").read()
+    # 1) 引用的「第 N 节」必须真的存在于报告（含 2b/2c/2d 这类条件段）
+    have = set(re.findall(r'\.section\("([0-9a-z]+)\.', src))
+    refs = set(re.findall(r"第\s*([0-9]+[a-z]?)\s*节", doc))
+    bad = sorted(r for r in refs if r not in have)
+    check("文档引用的章节在报告里都真实存在", not bad,
+          "不存在的章节：%s" % bad if bad
+          else "引用 %d 个章节（报告共 %d 节）" % (len(refs), len(have)))
+
+    # 2) 置信度档位口径必须与代码一致：四档、最高只到「中高」
+    from lib import rootcause as RC
+    lv = set()
+    for p0 in (0, 1, 2):
+        gaps = [{"level": "P0"}] * p0
+        for ev in (0, 3):
+            lv.add(RC.confidence_level(gaps, ev)["level"])
+    check("代码里确实只有四档置信度（文档据此写表）", len(lv) == 4, "、".join(sorted(lv)))
+    check("最高档是「中高」，文档里『没有高』这句才成立",
+          "中高" in lv and "高" not in lv, "、".join(sorted(lv)))
+    check("文档列出的档位与代码一致",
+          all(x in doc for x in lv), "文档缺：%s" % [x for x in lv if x not in doc])
+
+    # 3) 8D 的结案条件个数（文档写「7 个 gate」）
+    try:
+        from lib import eightd as E8D
+        n_gate = len(E8D.derive_d8({})["gates"])
+        check("文档写的 7 个结案条件与代码一致",
+              n_gate == 7 and "7 个 gate" in doc, "代码 %d 个" % n_gate)
+    except Exception as _ex:
+        check("文档写的 7 个结案条件与代码一致", False, repr(_ex))
+
+    # 4) 文档不能是孤儿：README 要能点到
+    rd = io.open(os.path.join(ROOT, "README.md"), encoding="utf-8").read()
+    check("README 有指向该文档的链接", "报告解读入门" in rd, "")
+
+
 if __name__ == "__main__":
     print("newenergy-fde 自检开始")
     test_table()
@@ -4694,6 +4748,7 @@ if __name__ == "__main__":
     test_lot_segment_extraction()
     test_ingest_incremental()
     test_spec_versioning()
+    test_quality_manager_guide()
     print("\n" + "=" * 56)
     print("通过 %d 项，失败 %d 项" % (len(PASS), len(FAIL)))
     if FAIL:

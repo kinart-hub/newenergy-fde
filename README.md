@@ -9,7 +9,7 @@
 ![License](https://img.shields.io/badge/license-Elastic--2.0-blue)
 ![Python](https://img.shields.io/badge/python-3.8%2B-blue)
 ![Dependencies](https://img.shields.io/badge/dependencies-0-brightgreen)
-![Self-test](https://img.shields.io/badge/selftest-778%20passing-brightgreen)
+![Self-test](https://img.shields.io/badge/selftest-785%20passing-brightgreen)
 
 ![newenergy-fde](assets/social-preview.png)
 
@@ -24,7 +24,7 @@
 git clone https://github.com/kinart-hub/newenergy-fde.git
 cd newenergy-fde
 
-python scripts/selftest.py          # 778 项端到端自检，应全部通过
+python scripts/selftest.py          # 785 项端到端自检，应全部通过
 python scripts/fde_run.py analyze -i examples/01_涂布工艺数据.csv -o output/try
 ```
 
@@ -38,6 +38,11 @@ python scripts/fde_run.py analyze -i examples/01_涂布工艺数据.csv -o outpu
 | **AI Skill**（推荐） | 装进支持 Skill 的 AI 客户端，直接说"分析这份涂布数据" | 不想碰命令行的工艺/质量工程师 |
 | **命令行** | `python scripts/fde_run.py analyze -i <数据> -o <输出>` | 要批量跑、要接定时任务的场景 |
 | **编程集成** | 调用 `lib/pipeline.py` | 集成进自有系统（**对外提供服务需商业授权**） |
+
+> 报告拿到手不知道怎么读、或者要拿去开会/答复客户：
+> 看 [`docs/报告解读入门-给质量经理.md`](docs/报告解读入门-给质量经理.md)——
+> 五分钟版只看四处、每节要做哪个决定、六个会导致错误决定的读法、术语与打印清单。
+> 那一份不需要统计基础。
 
 ---
 
@@ -165,7 +170,7 @@ python scripts/fde_run.py analyze --input examples/09_批号分组数据.csv --o
 python scripts/fde_run.py analyze --input data.csv \
        --lot-pattern "^([A-Z]\d{2})(\d{6})(\d+)$" --outdir out
 
-# 自检（778 项，含设备适配层、跨工序追溯、多企业隔离、行业作用域、基线热更新、设备记忆与知识库演进）
+# 自检（785 项，含设备适配层、跨工序追溯、多企业隔离、行业作用域、基线热更新、设备记忆与知识库演进）
 python scripts/selftest.py
 ```
 
@@ -225,7 +230,7 @@ newenergy-fde/
 │       ├── kb_manage.py              知识库管理台（status/list/propose/intake/harvest/
 │   │                             review/sync/verify/cases/devices/industries/update/rollback/patch）
 │   ├── make_device_samples.py    生成多厂商版式的对照样例（同一真值、不同导出）
-│   └── selftest.py               778 项端到端自检（含设备适配层、跨工序追溯、多企业隔离、行业作用域、基线热更新、设备记忆与知识库演进）
+│   └── selftest.py               785 项端到端自检（含设备适配层、跨工序追溯、多企业隔离、行业作用域、基线热更新、设备记忆与知识库演进）
 └── examples/
     ├── *.csv                     九类示例数据（6 类工况 + 私有列名 + 跨规格版本 + 批号分组）
     └── devices/*.csv             六类设备导出样例（竖表/双行表头/单位行/合计行/未知设备)

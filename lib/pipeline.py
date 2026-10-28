@@ -145,7 +145,7 @@ if EV is not None and EV.__name__ != "lib.events":
 KB = PP.load_knowledge()
 _fmt = RPT._fmt
 
-ANALYZER_VERSION = "2.11.0"
+ANALYZER_VERSION = "2.12.0"
 
 
 # 空数据排查清单。
@@ -2638,18 +2638,27 @@ def build_summary(res):
     if inferred:
         s.append("另有 %d 项 Cpk 偏低但**缺少企业规格**（%s），仅作提示，不能据此判定不合格"
                  % (len(inferred), "、".join(d["param_name"] or d["column"] for d in inferred[:3])))
-    top = (res.get("association") or [])[:3]
-    if top:
+    # 「强关联」这三个字只能给真的显著的相关系数。
+    # 实测踩过：没有一项显著时，原样把 r=0.09 的排头兵写进「强关联参数」，
+    # 质量经理读到的是一句自相矛盾的话（强关联…不显著），而正确结论是"没找到"。
+    _assoc = [d for d in (res.get("association") or []) if d.get("r") is not None]
+    _sig = [d for d in _assoc if d.get("significant")]
+    if _sig:
         s.append("强关联参数：" + "；".join(
-            "%s（r=%.2f, %s）" % (d["param"], d.get("r", 0),
-                                  "显著" if d.get("significant") else "不显著")
-            for d in top if d.get("r") is not None))
+            "%s（r=%.2f）" % (d["param"], d["r"]) for d in _sig[:3]))
+    elif _assoc:
+        _top = max(_assoc, key=lambda d: abs(d.get("r") or 0))
+        s.append("未发现显著相关的参数（最高 %s，r=%.2f，未过显著性门槛，"
+                 "不能当关联关系使用）" % (_top["param"], _top["r"]))
     rc = res.get("rootcause")
     if rc and rc.get("candidates"):
         c = rc["candidates"][0]
         if QG.rc_strong(rc):
-            s.append("首要候选根因：%s（得分 %.2f，%s）"
-                     % (c["param_name"], c["score"], c["data_status"]))
+            # 不在摘要里印内部状态码（SUCCESS / INSUFFICIENT_DATA）：
+            # 质量经理不认这套码，认了也判断不了。要披露的状态由第 11 节与
+            # 「使用边界」统一说，摘要只给得分与结论。
+            s.append("首要候选根因：%s（综合得分 %.2f）"
+                     % (c["param_name"], c["score"]))
         else:
             s.append("支撑不出根因结论：最高候选 %s 证据得分 %.2f，低于 %.2f 门槛，"
                      "仅作排查方向，不可据此调整工艺参数"

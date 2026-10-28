@@ -365,13 +365,6 @@ def check_doc_counts():
         if n != total:
             found.append("README 正文写 %d 项端到端自检，实测 %d 项" % (n, total))
     return [("WARN", msg) for msg in found]
-    # 正文：NNN 项端到端自检。只看「当前状态」那部分，
-    # 历史变更条目里的数字是当年的事实，不该被判漂移。
-    head = text[:text.find("## 变更")] if "## 变更" in text else text[:4000]
-    for n in set(int(x) for x in re.findall(r"(\d+)\s*项端到端自检", head)):
-        if n != total:
-            out.append(("WARN", "README 正文写 %d 项端到端自检，实测 %d 项" % (n, total)))
-    return out
 
 
 def main(argv=None):
