@@ -169,7 +169,7 @@ if EV is not None and EV.__name__ != "lib.events":
 KB = PP.load_knowledge()
 _fmt = RPT._fmt
 
-ANALYZER_VERSION = "2.17.0"
+ANALYZER_VERSION = "2.18.0"
 
 
 # 空数据排查清单。
@@ -3945,6 +3945,14 @@ def _render_disclaimer(rep, res):
                 "参数的任何建议，必须通过安全评审与小批验证后方可实施。"
                 "分析结论的可靠性受输入数据质量与测量系统能力（Gauge R&R）限制；"
                 "测量系统未经验证时，测量误差可能被判定为工艺问题。", "warn")
+    # 许可自检提示（评审 P4-1）：报告页脚要有一句许可摘要 + 对外服务自检，
+    # 让内部自用的企业不被误阻断，同时对外托管/服务的场景被显式提醒。
+    rep.callout(
+        s17,
+        "**许可与使用场景自检**：newenergy-fde 依据 Elastic License 2.0 提供。"
+        "企业内部自用（分析自己的数据、不给外部客户提供有偿服务）无需额外授权；"
+        "若您计划把本工具封装为对外托管服务、SaaS 或作为付费产品的一部分提供给第三方，"
+        "请先确认商业授权状态。本报告自身不因此限制内部使用。", "info")
     return rep
 
 

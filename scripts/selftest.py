@@ -5177,6 +5177,47 @@ def test_process_fallback():
             pass
 
 
+def test_license_notice():
+    """许可自检提示（评审 P4-1）。
+
+    既要让企业内部自用不被误阻断，也要让对外托管/服务的企业有感知——
+    这不是一条免责声明，是许可合规的工程化提示。可机检落点：
+      1. 报告页脚（17 节）有许可自检，且内部/外部边界都说清；
+      2. 入口输出一行许可摘要。
+    """
+    print("\n[许可与使用场景自检]")
+    import tempfile as _tmp, os as _os
+    from lib import pipeline as PL
+    f1 = os.path.join(ROOT, "examples", "01_涂布工艺数据.csv")
+    if not os.path.exists(f1):
+        check("示例 01 存在（许可提示前置）", False, f1)
+        return
+    tdir = _tmp.mkdtemp(prefix="lic-")
+    try:
+        r = PL.analyze([f1], outdir=os.path.join(tdir, "out"),
+                       export_xlsx=False, export_docx=False, export_pdf=False)
+        _rep = os.path.join(tdir, "out", "工艺分析报告.md")
+        _txt = io.open(_rep, encoding="utf-8").read() if os.path.exists(_rep) else ""
+        check("报告页脚有许可自检提示",
+              "许可与使用场景自检" in _txt and "Elastic License 2.0" in _txt, "")
+        check("许可证内部/外部边界都说清（不是只写一半）",
+              "企业内部自用" in _txt and "对外托管服务" in _txt, "")
+        check("对外服务场景被显式提醒（不是含糊带过）",
+              "请先确认商业授权" in _txt, "")
+        # 入口提示：fde_run.py 源码里要有一行许可摘要
+        _runsrc = io.open(os.path.join(ROOT, "scripts", "fde_run.py"),
+                          encoding="utf-8").read()
+        check("入口有一行许可摘要（使用者跑命令时能看见）",
+              'print("许可：Elastic License 2.0' in _runsrc, "")
+    finally:
+        try:
+            import shutil
+            shutil.rmtree(tdir)
+        except Exception:
+            # scan:keep 同上
+            pass
+
+
 if __name__ == "__main__":
     print("newenergy-fde 自检开始")
     test_table()
@@ -5229,6 +5270,7 @@ if __name__ == "__main__":
     test_baseline_stability()
     test_action_cards()
     test_process_fallback()
+    test_license_notice()
     test_quality_manager_guide()
     print("\n" + "=" * 56)
     print("通过 %d 项，失败 %d 项" % (len(PASS), len(FAIL)))

@@ -2522,6 +2522,35 @@ def rule_process_fallback():
     return _r(True, "", {"n_checks": 5})
 
 
+def rule_license_notice():
+    """报告页脚含许可自检、入口有许可摘要，不阻断内部自用。
+
+    P4 要的是"许可合规工程化提示"——既不让企业内部自用被误阻断，也不让对外
+    托管/服务的场景被含糊带过。落点：报告 17 节一句许可自检、入口一行许可摘要。
+    """
+    p = _read(PIPELINE_FILE) or ""
+    r = _read(os.path.join("scripts", "fde_run.py")) or ""
+    if not p or not r:
+        return _r(False, "读不到 lib/pipeline.py 或 scripts/fde_run.py")
+    # 1) 报告页脚有许可自检
+    if "许可与使用场景自检" not in p:
+        return _r(False, "报告页脚没有许可自检提示：对外托管的企业无感知")
+    if "Elastic License 2.0" not in p:
+        return _r(False, "报告页脚没有提 Elastic License 2.0：许可口径缺失")
+    # 2) 内部/外部边界都说清（不只有一半）
+    if "企业内部自用" not in p or "对外托管服务" not in p:
+        return _r(False, "许可提示只写了一面（内部或外部）：边界没画全")
+    # 3) 对外服务被显式提醒（不是含糊带过）
+    if "请先确认商业授权" not in p:
+        return _r(False, "对外服务场景没有被显式提醒：边界被含糊带过")
+    # 4) 入口有许可摘要。判据必须锚定到 print 那句，不能只查裸字面——
+    #    本规则函数自己的判据字符串里也含"Elastic License 2.0 · 企业内部自用"，
+    #    只查字面会自我指涉（变异删 print、判据自己那行还留着这个字面，照样判过）。
+    if 'print("许可：Elastic License 2.0 · 企业内部自用无需额外授权；' not in r:
+        return _r(False, "入口没有许可摘要：使用者看不到一句话提示")
+    return _r(True, "", {"n_checks": 5})
+
+
 def rule_lot_segment():
     """批号里提取的分组维度，不能是流水号。
 
@@ -3857,6 +3886,25 @@ AUDIT_RULES = [
                   _sub('        ("工序判定模式", {',
                        '        ("工序判定模式省略", {'),
                   PIPELINE_FILE)]),
+    Rule("许可提示：报告页脚含许可自检，入口有许可摘要，不阻断内部自用",
+         rule_license_notice,
+         "（1）报告页脚（17 节）有许可自检提示（Elastic 2.0 + 内外使用边界）；"
+         "（2）入口（fde_run.py）有许可摘要；"
+         "（3）内部自用不被误阻断（提示是 info 不是阻断）；"
+         "（4）对外服务场景被显式提醒（不是含糊带过）",
+         PIPELINE_FILE,
+         [_mutant("报告没许可自检提示（对外托管的企业无感知）",
+                  _sub('"**许可与使用场景自检**：newenergy-fde 依据 Elastic License 2.0 提供。"',
+                       '"**（许可提示已省略）**："'),
+                  PIPELINE_FILE),
+          _mutant("入口没有许可摘要（使用者看不到一句话提示）",
+                  _sub('print("许可：Elastic License 2.0 · 企业内部自用无需额外授权；',
+                       'pass  # 许可提示已删除'),
+                  os.path.join("scripts", "fde_run.py")),
+          _mutant("对外服务场景不提提醒（内部/外部边界被糊掉）",
+                  _sub('请先确认商业授权状态。本报告自身不因此限制内部使用。',
+                       '本报告不因此限制使用。'),
+                  PIPELINE_FILE)]),
 ]
 
 
@@ -4802,6 +4850,8 @@ def main(argv=None):
     print("=" * 68)
     print("newenergy-fde 编排器 —— %s" % args.flow)
     print("=" * 68)
+    print("许可：Elastic License 2.0 · 企业内部自用无需额外授权；"
+          "对外托管/服务请先确认商业授权。")
 
     if args.flow == "config":
         return flow_config(args)
