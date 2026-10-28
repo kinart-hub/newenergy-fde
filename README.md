@@ -9,7 +9,7 @@
 ![License](https://img.shields.io/badge/license-Elastic--2.0-blue)
 ![Python](https://img.shields.io/badge/python-3.8%2B-blue)
 ![Dependencies](https://img.shields.io/badge/dependencies-0-brightgreen)
-![Self-test](https://img.shields.io/badge/selftest-713%20passing-brightgreen)
+![Self-test](https://img.shields.io/badge/selftest-743%20passing-brightgreen)
 
 ![newenergy-fde](assets/social-preview.png)
 
@@ -24,7 +24,7 @@
 git clone https://github.com/kinart-hub/newenergy-fde.git
 cd newenergy-fde
 
-python scripts/selftest.py          # 713 项端到端自检，应全部通过
+python scripts/selftest.py          # 743 项端到端自检，应全部通过
 python scripts/fde_run.py analyze -i examples/01_涂布工艺数据.csv -o output/try
 ```
 
@@ -114,6 +114,9 @@ python scripts/fde_run.py analyze -i examples/01_涂布工艺数据.csv -o outpu
 - 相关性：Pearson / Spearman + 显著性、**滞后相关**、分类变量 ANOVA η²、VIF 共线性
 - 不良分类：Pareto + ABC 分级（**自动区分"计数型缺陷"与"连续测量列"**）
 - 根因定位：**知识库先验 × 数据证据 × 时序吻合** 三权重融合排序 + 5Why
+- **多批次摄入**：目录批量读入 + 按业务键去重 + 增量游标。MES 按时间窗滚动导出，
+  相邻批次必然重叠；不去重会让 σ 被低估（实测相邻重复把 σ_within 从 0.68 压到 0.34）、
+  控制限收窄、正常点被判超限。逐行保留出处（哪个文件第几行），批次表写清每批覆盖的时间段
 - 良率损失：按最显著的分组维度（ANOVA F 最大）拆解
 - DOE：全因子 / L8 / L9 / L16 / L27 正交表 / Box-Behnken / CCD + 主效应 + 信噪比 + 响应面寻优
 
@@ -151,7 +154,11 @@ python scripts/fde_run.py analyze --input data.csv --spec spec.json --outdir out
 python scripts/fde_run.py analyze --input 近两年数据.csv --spec 规格含版本.json \
        --spec-date-col 生产日期 --outdir out
 
-# 自检（713 项，含设备适配层、跨工序追溯、多企业隔离、行业作用域、基线热更新、设备记忆与知识库演进）
+# MES 每天一个导出文件：整个目录读进来，按业务键去重，并记增量
+python scripts/fde_run.py analyze --input-dir MES导出 --dedup-key 设备号,时间 \
+       --cursor out/.state/mes_cursor.json --outdir out
+
+# 自检（743 项，含设备适配层、跨工序追溯、多企业隔离、行业作用域、基线热更新、设备记忆与知识库演进）
 python scripts/selftest.py
 ```
 
@@ -187,6 +194,7 @@ newenergy-fde/
 │   ├── kbstore.py                知识库演进引擎（候选/审核/入库/版本/回滚）
 │   ├── msa.py                    测量系统门槛：Gauge R&R(ANOVA) / 重复性 / 判定分级 / 拦住结论
 │   ├── specver.py                规格版本化：版本登记 / 按生效期取版 / 空档与重叠体检 / 分段
+│   ├── ingest.py                 多批次摄入：目录扫描 / 同构判定 / 按键去重 / 增量游标
 │   ├── export_doc.py             原生导出：Word(OOXML) + PDF 1.4（零依赖，中文用 GB1 预定义字体）
 │   └── pipeline.py               主流水线 + CLI
 ├── knowledge/
@@ -210,7 +218,7 @@ newenergy-fde/
 │       ├── kb_manage.py              知识库管理台（status/list/propose/intake/harvest/
 │   │                             review/sync/verify/cases/devices/industries/update/rollback/patch）
 │   ├── make_device_samples.py    生成多厂商版式的对照样例（同一真值、不同导出）
-│   └── selftest.py               713 项端到端自检（含设备适配层、跨工序追溯、多企业隔离、行业作用域、基线热更新、设备记忆与知识库演进）
+│   └── selftest.py               743 项端到端自检（含设备适配层、跨工序追溯、多企业隔离、行业作用域、基线热更新、设备记忆与知识库演进）
 └── examples/
     ├── *.csv                     七类示例数据（含一个私有列名导出样例）
     └── devices/*.csv             六类设备导出样例（竖表/双行表头/单位行/合计行/未知设备)

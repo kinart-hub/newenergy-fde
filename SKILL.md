@@ -131,6 +131,14 @@ python scripts/fde_run.py analyze --input <数据文件> --outdir <输出目录>
 - `--rules 1,2,3,5` 判异规则集（也可用 `FDE_SPC_RULES`）。默认只开 1/2/3/5（Western Electric
   基本集）；`--rules all` 才开满八条。**不要动不动开全八条**：规则越多误报越多，
   现场两天就会把报警当噪音关掉
+- `--input-dir 目录` 目录批量摄入（含子目录）。MES 一天一个导出文件时用它，不用逐个列文件名
+- `--dedup-key 设备号,时间` 去重键。MES 按时间窗滚动导出，相邻批次必然重叠；不去重会让
+  σ 被低估、Cpk 虚高、SPC 连续点规则刷假报警。不给键时只删「整行完全相同」的行——
+  按猜出来的键去重会删掉真实观测，那是丢数据，比重复严重
+- `--dedup-conflict last|first|keep` 同一键出现不同值（源数据被改过）怎么处置：
+  默认 `last` 保留晚批次（新导出覆盖旧导出）；`keep` 两行都留交人核对
+- `--cursor out/.state/mes_cursor.json` 增量游标。给出后报告写明「本次新增了哪几个文件、
+  追加多少行」；首次运行自动建基准。游标读不出来会明说并按全量重跑，不会静默少算
 - `--no-xlsx` 不导出 Excel 结果表（默认导出）
 - `--spc-exclusion-mode auto|suggest|review` SPC 剔除模式。默认 `auto`（命中即剔除）；
   `suggest` 只标记可疑点不剔除、交人复核；`review` 按复核结论剔除（逐点带规则身份与审核人）

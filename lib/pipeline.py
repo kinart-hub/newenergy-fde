@@ -68,6 +68,10 @@ if __package__ in (None, ""):
         from lib import specver as SV
     except Exception:
         SV = None
+    try:                    # P2-1 增量摄入：多批次合并 / 去重 / 游标；失败只退化成逐文件读
+        from lib import ingest as IG
+    except Exception:
+        IG = None
     try:                    # P1-2 原生 Word/PDF 导出；失败只少两种交付形态
         from lib import export_doc as EX
     except Exception:
@@ -99,6 +103,10 @@ else:
         from . import specver as SV
     except Exception:
         SV = None
+    try:                    # P2-1 增量摄入（两个分支都要，只改一套会 NameError）
+        from . import ingest as IG
+    except Exception:
+        IG = None
     try:                    # P1-2 原生 Word/PDF 导出（两个分支都要，只改一套会 NameError）
         from . import export_doc as EX
     except Exception:
@@ -129,7 +137,7 @@ if EV is not None and EV.__name__ != "lib.events":
 KB = PP.load_knowledge()
 _fmt = RPT._fmt
 
-ANALYZER_VERSION = "2.9.0"
+ANALYZER_VERSION = "2.10.0"
 
 
 # 空数据排查清单。
@@ -385,6 +393,7 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
             doe_replicates=None, doe_blocks=None, doe_seed=None, boundary_policy=None,
             role=None, controlled_spec=None,
             msa_spec=None, spec_date_col=None,
+            input_dir=None, dedup_key=None, on_conflict="last", cursor=None,
             export_xlsx=True, export_docx=True, export_pdf=True,
             d2_card=None, emit_d2_card=True, verbose=False, views=None):
     """
@@ -403,6 +412,17 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
                   那一版规格）。不指定时自动识别；识别不出来会明说并按"无法按版本
                   重判"处理，**不默认取最新版本**——默认取最新版就是拿今天的尺子
                   量去年的货，正是这一层要防的事。
+    input_dir  —— 目录批量摄入：把一个目录下的数据文件全读进来。现场从 MES 导出时
+                  往往一天一个文件，手工一个个列文件名不可持续。
+    dedup_key  —— 去重键（列名列表，如 ["批次号","时间"]）。MES 按时间窗滚动导出，
+                  相邻批次必然重叠；重复行会让 σ 低估、Cpk 虚高，还会把 SPC 的
+                  连续点规则打成假报警。不给键时只删"整行完全相同"的行——
+                  键猜错会删掉真实观测，那是丢数据，比重复严重得多。
+    on_conflict—— 同键不同值怎么处置（源数据被改过时）：
+                  last 保留晚批次（默认，符合"新导出覆盖旧导出"）/
+                  first 保留早批次 / keep 两行都留交人核对。三者都会在报告里记账。
+    cursor     —— 增量游标文件路径。给出时只报"本次新增了哪些文件、追加了多少行"，
+                  并把本次文件指纹写回。游标读不出来会退回全量并明说，不静默少算。
     d2_card    —— 已填写的 8D D2 录入卡路径。给了就把 5W2H 与数据做交叉校验，
                   并据此渲染完整 D1–D8；不给则 D2 全空并在报告中标记「不具备对外条件」。
     emit_d2_card—— 是否随报告生成空白 D2 录入卡（默认生成）。
@@ -579,7 +599,25 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
                           version=ANALYZER_VERSION)
         except Exception as _obs_e:
             degrade.note("pipeline.analyze@observ_start", _obs_e)
-    _plist = paths if isinstance(paths, (list, tuple)) else [paths]
+    # 目录批量摄入：MES 一天一个导出文件时，手工逐个列文件名不可持续。
+    # 放在 provenance 之前，让溯源记录的是**真正读到的**那批文件，
+    # 而不是用户敲进来的那个目录名——出了事要能对着文件核。
+    _seek = list(paths) if isinstance(paths, (list, tuple)) \
+        else ([paths] if paths else [])
+    if input_dir:
+        _found = IG.scan(input_dir, recursive=True) if IG is not None else []
+        if _found:
+            _seek = _seek + [p for p in _found if p not in _seek]
+        else:
+            result.setdefault("warnings", []).append(
+                "指定的目录「%s」里没有可读的数据文件（支持 .csv/.tsv/.txt/.xlsx/.xls）"
+                % input_dir)
+            result.setdefault("degraded_sections", []).append(
+                {"section": "目录摄入", "error": "目录为空或没有可读格式"})
+        result["input_dir"] = {"dir": input_dir, "n_files": len(_found)}
+    paths = _seek
+    result["inputs"] = paths
+    _plist = paths
     try:
         _inputs = PROV.input_fingerprints(_plist)
     except Exception as _pv_e:
@@ -625,6 +663,7 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
 
     tables = []
     device_reports = []
+    _loaded_files = []     # 每个成功读入的文件的路径与行数（增量游标用）
     _empty_files = []      # 读到了文件但一行数据都没有（与"读不了"是两回事）
 
     # ------------------------------------------------------------------
@@ -692,6 +731,8 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
                 ing["notes"] = list(ing.get("notes") or []) + [
                     "已剔除单位行（表头第二行的 m/min、℃ 等不是观测值，留着会把均值与 σ 带偏）"]
             tables.append(tb)
+            # 记录"这个文件读进来多少行"，供增量游标比对（下次好回答"新增了多少"）
+            _loaded_files.append({"path": p, "rows": len(tb.rows)})
             device_reports.append({
                 "file": os.path.basename(p),
                 "device": ing["device"],
@@ -732,10 +773,106 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
             return 2
         return 1
 
+    # 4a. 多批次合并与去重。
+    #     MES 按时间窗滚动导出（今天导 1–7 号、明天导 4–10 号），相邻批次必然重叠。
+    #     不合并的话，现场只能人工切分文件；不去重的话，重复行会让 σ 被低估、
+    #     Cpk 虚高，还会把 SPC 的"连续 N 点"规则打成假报警。
+    #     **只合并同构表**：涂布与卷绕的列名重合度低，硬并成一张表会把两道的
+    #     参数当成同一批数据算——那是跨工序追溯的对象，不是同工序的多批导出。
+    _ing_report = None
+    if IG is not None and len(tables) > 1:
+        _m0 = sorted(tables, key=_main_rank)[0]
+        _same = [t for t in tables if t is _m0 or IG.is_same_shape(_m0, t)]
+        if len(_same) > 1:
+            try:
+                _r = IG.merge(_same, key_cols=dedup_key or None,
+                              time_col=spec_date_col, on_conflict=on_conflict)
+            except Exception as _ig_e:
+                degrade.note("pipeline.ingest@merge", _ig_e)
+                _r = None
+                result.setdefault("warnings", []).append(
+                    "多批次合并失败（%s），本次按各文件分别读取：批次之间的重复行没有去掉，"
+                    "SPC 的连续点规则可能被重复行打成误报" % _ig_e)
+                result.setdefault("degraded_sections", []).append(
+                    {"section": "多批次去重", "error": str(_ig_e)})
+            if _r and _r.get("table") is not None:
+                _mgt = _r["table"]
+                _mgt.name = _m0.name
+                _mgt.source_path = _m0.source_path
+                tables = [_mgt] + [t for t in tables
+                                   if t is not _m0 and not IG.is_same_shape(_m0, t)]
+                _ing_report = _r
+                # 主表档案挪到第一位：合并后 tables 长度变了，后面按位置取设备档案，
+                # 不挪就会拿别的文件的设备口径套在主表上（E02 同型错误）
+                _mf = os.path.basename(_m0.source_path or _m0.name)
+                device_reports.sort(
+                    key=lambda d: 0 if d.get("file") == _mf else 1)
+                if _r.get("warning"):
+                    result.setdefault("warnings", []).append(_r["warning"])
+
     main = sorted(tables, key=_main_rank)[0]
     # 主表是排序后选出来的，不一定是输入的第一份；设备档案必须取主表那一份，
     # 否则多文件时会拿上游表的设备口径套在本工序数据上（E02 踩过这个坑）。
     _mi = next((i for i, t in enumerate(tables) if t is main), 0)
+    # 摄入记账进 result：批次清单只留前 50（几百个批次时 JSON 会撑爆，
+    # 而人真正要看的是总量与异常批次）
+    if _ing_report is not None:
+        result["ingest"] = {
+            "n_batches": len(_ing_report.get("batches") or []),
+            "n_rows_in": _ing_report.get("n_in"),
+            "n_rows_out": _ing_report.get("n_out"),
+            "n_dup": _ing_report.get("n_dup"),
+            "n_conflict": _ing_report.get("n_conflict"),
+            "n_overwritten": _ing_report.get("n_overwritten", 0),
+            "key_mode": _ing_report.get("key_mode"),
+            "key_cols": _ing_report.get("key_cols"),
+            "on_conflict": _ing_report.get("on_conflict"),
+            "n_columns_added": _ing_report.get("n_columns_added"),
+            "batches": (_ing_report.get("batches") or [])[:50],
+            "conflicts": (_ing_report.get("conflicts") or [])[:10],
+        }
+        if (_ing_report.get("n_dup") or 0) > 0:
+            result.setdefault("decisions", []).append(
+                {"kind": "ingest_dedup",
+                 "detail": "多批次合并：读入 %d 行，去掉 %d 行重复（%s），保留 %d 行"
+                           % (_ing_report.get("n_in"), _ing_report.get("n_dup"),
+                              {"whole_row": "整行完全相同",
+                               "explicit": "按业务键 %s" % (dedup_key or ""),
+                               }.get(_ing_report.get("key_mode"), "未去重"),
+                              _ing_report.get("n_out") or 0)})
+
+    # 4b-bis. 增量游标：回答"这次比上次多了什么"。
+    #     游标写的是**本次读到的文件全集**（不是只写新增），下次比对才有基准。
+    if cursor and IG is not None and _loaded_files:
+        try:
+            _meta = {}
+            for _it in _loaded_files:
+                _fp = IG.fingerprint(_it["path"])
+                if _fp:
+                    _fp["rows"] = _it["rows"]
+                    _meta[_fp["file"]] = _fp
+            _st = IG.load_cursor(cursor)
+            _had_cursor = os.path.exists(cursor)
+            _dif = IG.diff_cursor(_st, _meta)
+            result["incremental"] = _dif
+            if _st is None and _had_cursor:
+                # 坏游标不能静默按"第一次运行"处理：那样"本次新增"会变成全量，
+                # 谁也不会注意到增量其实失效了
+                result.setdefault("warnings", []).append(
+                    "增量游标「%s」读不出来（损坏或版本不符），本次按全量处理并重建游标"
+                    % cursor)
+                result.setdefault("degraded_sections", []).append(
+                    {"section": "增量游标", "error": "游标损坏，已按全量重跑"})
+            IG.save_cursor(cursor, _meta,
+                           n_rows=sum(i["rows"] for i in _loaded_files))
+        except Exception as _cur_e:
+            degrade.note("pipeline.ingest@cursor", _cur_e)
+            result.setdefault("warnings", []).append(
+                "增量游标读写失败（%s）：本次结论不受影响，但下次无法判断哪些是新增数据"
+                % _cur_e)
+            result.setdefault("degraded_sections", []).append(
+                {"section": "增量游标", "error": str(_cur_e)})
+
     # v1.11：缺陷事件表（一行一个缺陷）。不先汇总就分析，会同时犯三个错：
     #   n 从产品数虚增到缺陷数（伪重复）、坐标列被当分析目标、真正的位置聚集算不出来。
     _raw_events = None
@@ -2542,6 +2679,87 @@ def build_report(res, work, spc_res, corr, assoc, pare, root, gaps, conf,
 
     # 2 数据与预处理
     s2 = rep.section("2. 数据来源、设备识别与预处理")
+    # 2a. 数据摄入：读者要先知道"这些结论建立在哪几批数据上"，再谈设备与预处理。
+    #     批次覆盖哪段时间，直接决定"有没有漏导"——这是现场最常见的第一个疑问。
+    _ing = res.get("ingest")
+    _inc = res.get("incremental")
+    if _ing or _inc:
+        rep.text(s2, "**数据摄入（多批次合并与去重）**")
+    if _ing:
+        _km = {"whole_row": "整行完全相同（保守，不猜业务键）",
+               "explicit": "按业务键 %s" % "、".join(
+                   str(c) for c in (_ing.get("key_cols") or [])),
+               "single": "单文件，无需去重",
+               "off": "已关闭去重"}.get(_ing.get("key_mode"), "—")
+        _oc = {"first": "保留早批次", "last": "保留晚批次",
+               "keep": "两行都保留"}.get(_ing.get("on_conflict"), "—")
+        rep.kv(s2, [
+            ("读入批次", "%s 个文件" % _ing.get("n_batches", 0)),
+            ("行数（合并前 → 后）", "%s → %s"
+             % (_ing.get("n_rows_in"), _ing.get("n_rows_out"))),
+            ("去重口径", _km),
+            ("去掉的重复行", "%s 行" % (_ing.get("n_dup") or 0)),
+            ("同键不同值", "%s 处（%s）"
+             % (_ing.get("n_conflict") or 0, _oc)),
+        ])
+        if (_ing.get("n_dup") or 0) > 0:
+            rep.callout(
+                s2,
+                "去掉的 %d 行不是数据丢失，是**同一观测被导出了两次**（MES 按时间窗滚动"
+                "导出必然重叠）。留着它们会让 σ 被低估、Cpk 虚高，还会把 SPC 的"
+                "「连续 N 点」规则打成假报警——那是重复行造成的假异常，不是过程真的变了。"
+                % _ing.get("n_dup"), "info")
+        if (_ing.get("n_conflict") or 0) > 0:
+            _cf = _ing.get("conflicts") or []
+            rep.callout(
+                s2,
+                "有 %d 处**同一个业务键出现了两个不同的值**，说明源数据被改过"
+                "（补录/返修/修正）。已按「%s」处置，被覆盖的行仍列在下面——"
+                "请回源文件确认哪个才是对的，工具不替你做这个判断。"
+                % (_ing.get("n_conflict"), _oc), "warn")
+            if _cf:
+                rep.table(
+                    s2, ["业务键", "涉及行号（合并表内）", "保留行"],
+                    [[", ".join(str(x) for x in (c.get("key") or [])),
+                      "%s / %s" % ((c.get("rows") or ["—", "—"])[0],
+                                   (c.get("rows") or ["—", "—"])[1]),
+                      c.get("kept_row") if c.get("kept_row") is not None
+                      else "两行都留"]
+                     for c in _cf])
+        _bt = _ing.get("batches") or []
+        if len(_bt) > 1:
+            rep.text(s2, "逐批覆盖范围（判断有没有漏导的直接依据）：")
+            rep.table(s2, ["文件", "读入行", "存活行", "重复行", "起", "止"],
+                      [[b.get("file"), b.get("rows"), b.get("rows_kept"),
+                        b.get("rows_dup"),
+                        (b.get("from") or "—")[:16],
+                        (b.get("to") or "—")[:16]] for b in _bt])
+    if _inc:
+        if _inc.get("status") == "no_cursor":
+            rep.callout(
+                s2, "本次首次建立增量基准（%d 个文件）。下次对同一目录重跑时，"
+                    "报告会直接告诉你「新增了哪几个文件、追加了多少行」，"
+                    "不用再人工比对导出记录。" % (_inc.get("n_new_files") or 0),
+                "info")
+        else:
+            _changed = _inc.get("changed") or []
+            _new = _inc.get("new") or []
+            if not _new and not _changed:
+                rep.callout(s2, "增量比对：与上次相比**没有新增数据**（%d 个文件内容未变）。"
+                                "本次结论与上次同源。"
+                            % len(_inc.get("unchanged") or []), "info")
+            else:
+                rep.kv(s2, [("新增文件", "%d 个%s" % (
+                                len(_new), ("：" + "、".join(_new[:6])) if _new else "")),
+                            ("内容有变的文件", "%d 个%s" % (
+                                len(_changed),
+                                ("：" + "、".join(_changed[:6])) if _changed else "")),
+                            ("追加行数", _inc.get("rows_added"))])
+                rep.callout(s2, "增量只用于回答「这次比上次多了什么」；"
+                                "本次的 SPC 与 Cpk 仍按**全量合并后**的数据计算——"
+                                "能力指数必须用全部数据，只用增量算出来的 Cpk 没有意义。",
+                            "info")
+
     devs = res.get("devices") or []
     if devs:
         d0 = devs[0]
@@ -3464,7 +3682,9 @@ def export_result_xlsx(result, work, outdir):
 
 def main():
     ap = argparse.ArgumentParser(description="新能源工艺数据分析流水线")
-    ap.add_argument("--input", "-i", nargs="+", required=True, help="CSV/XLSX 文件路径")
+    ap.add_argument("--input", "-i", nargs="+", default=None,
+                    help="CSV/XLSX 文件路径（可多个）。与 --input-dir 至少给一个："
+                         "现场从 MES 导出时往往是一整个目录，逐个列文件名不可持续")
     ap.add_argument("--outdir", "-o", default="output", help="输出目录")
     ap.add_argument("--target", "-t", default=None, help="目标指标列（不良率/容量等）")
     ap.add_argument("--process", "-p", default=None, help="指定工序 key，如 battery_coating")
@@ -3479,6 +3699,21 @@ def main():
     ap.add_argument("--spec-date-col", default=None,
                     help="指定哪一列是日期/时间列（用于按生效期取规格版本）。"
                          "不指定时自动识别；自动识别不出来会明说，不会默认取最新版")
+    ap.add_argument("--input-dir", default=None,
+                    help="目录批量摄入：把该目录下的数据文件（.csv/.tsv/.txt/.xlsx/.xls，"
+                         "含子目录）全部读入。MES 一天一个导出文件时用它，"
+                         "不用每次手工列文件名")
+    ap.add_argument("--dedup-key", default=None,
+                    help="去重键（逗号分隔的列名，如 批次号,时间）。MES 按时间窗滚动导出，"
+                         "相邻批次必然重叠；不指定时只删整行完全相同的行——"
+                         "按猜出来的键去重会删掉真实观测")
+    ap.add_argument("--dedup-conflict", default="last",
+                    choices=["last", "first", "keep"],
+                    help="同一去重键出现不同值时怎么办：last 保留晚批次（默认，"
+                         "新导出覆盖旧导出）/ first 保留早批次 / keep 两行都留交人核对")
+    ap.add_argument("--cursor", default=None,
+                    help="增量游标文件路径（如 out/.state/mes_cursor.json）。给出后报告会写明"
+                         "本次新增了哪些文件、追加了多少行；首次运行自动建立基准")
     ap.add_argument("--no-doe", action="store_true", help="跳过 DOE 方案")
     ap.add_argument("--json", default=None, help="额外输出 JSON 结果到指定文件")
     ap.add_argument("--tenant", default=os.environ.get("FDE_TENANT"),
@@ -3566,6 +3801,10 @@ def main():
                          "mgmt=客户单页摘要 all=全套。"
                          "视角层只做筛选与措辞，计算层仍是同一份结果")
     args = ap.parse_args()
+    if not args.input and not args.input_dir:
+        ap.error("必须给出 --input 或 --input-dir 之一")
+    if args.input is None:
+        args.input = []
 
     spec = None
     if args.spec:
@@ -3575,6 +3814,10 @@ def main():
     res = analyze(args.input, outdir=args.outdir, target=args.target, process=args.process,
                   defect=args.defect, sheet=args.sheet, spec_overrides=spec,
                   spec_date_col=args.spec_date_col,
+                  input_dir=args.input_dir,
+                  dedup_key=([c.strip() for c in args.dedup_key.split(",") if c.strip()]
+                             if args.dedup_key else None),
+                  on_conflict=args.dedup_conflict, cursor=args.cursor,
                   do_doe=not args.no_doe, auto_adapt=args.auto_adapt,
                   tenant=args.tenant, industry=args.industry, rules=args.rules,
                   spc_exclusion_mode=args.spc_exclusion_mode,

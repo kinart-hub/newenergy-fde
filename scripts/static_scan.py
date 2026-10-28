@@ -483,6 +483,8 @@ def scan_param_chain():
     alias = {
         "paths": "-i/--input（位置参数，不是 --paths）",
         "views": "--view（单数，nargs='+'）",
+        "on_conflict": "--dedup-conflict（形参叫 on_conflict 是因为它是去重函数的"
+                       "通用参数；命令行上归到 --dedup-key 那一组里更好找）",
         "msa_spec": "--msa-data / --msa-part / --msa-appraiser / --msa-value / "
                     "--msa-pct-grr / --msa-ndc / --msa-tolerance（一个 dict 由这组参数"
                     "组装；不收单个 JSON 串，免得现场在命令行里手写转义过的 JSON）",

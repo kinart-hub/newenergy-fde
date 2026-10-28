@@ -650,6 +650,8 @@ AUDIT_FILES = [
     # 规则 49 要读降级台账确认"护栏失败会转发到可观测性"，
     # 不复制过去副本里就没有这个文件，基线直接判不过
     os.path.join("lib", "degrade.py"),
+    # 规则 58 要读 ingest 侧"键不存在就不去重"的承诺，不复制过去副本里没这个文件
+    os.path.join("lib", "ingest.py"),
     # 规则 56：原生 Word/PDF 导出。判据同时读 export_doc.py 与 pipeline.py，
     # 变异要注入这两个文件——缺了 export_doc.py 会静默 SKIP（不是 FAIL）
     os.path.join("lib", "export_doc.py"),
@@ -1111,6 +1113,7 @@ EIGHTD_FILE = os.path.join("lib", "eightd.py")
 PIPELINE_FILE = os.path.join("lib", "pipeline.py")
 MSA_FILE = os.path.join("lib", "msa.py")
 EXPORT_FILE = os.path.join("lib", "export_doc.py")
+INGEST_FILE = os.path.join("lib", "ingest.py")
 PREPROCESS_FILE = os.path.join("lib", "preprocess.py")
 SPCPy = os.path.join("lib", "spc.py")
 CONTRACT_FILE = os.path.join("lib", "contract.py")
@@ -2267,6 +2270,47 @@ def rule_export_native():
     return _r(True, "", {"n_checks": 7})
 
 
+def rule_ingest_incremental():
+    """多批次摄入必须"合并且去重"，而不是把文件一个个分开算。
+
+    这条要防的是"像做了、其实没做"：
+      * 只合并不去重 → 重复点把移动极差压成 0，σ_within 腰斩、控制限收窄，
+        本来正常的点被判超限（自检里有数值证明，不是一句"有影响"）；
+      * 把不同工序的表也并进来 → 两道的参数当成同一批数据算，根因指向错的那道；
+      * 键写错却照样去重 → 真实观测被删，那是丢数据，比重复严重得多；
+      * 游标坏了当第一次跑 → "本次新增"变成全量，只有对着报告才会发现。
+    判据都落在赋值/写入动作上，删掉哪一行都会被下面某个变异抓到。
+    """
+    p = _read(PIPELINE_FILE) or ""
+    g = _read(INGEST_FILE) or ""
+    if not p or not g:
+        return _r(False, "读不到 lib/pipeline.py 或 lib/ingest.py")
+    # 1) 两个导入分支都登记（只改一套会在另一条路径上 NameError）
+    if p.count("import ingest as IG") < 2:
+        return _r(False, "两个导入分支没有都登记 ingest")
+    # 2) 只在**同构**表之间合并：不同工序的表并进来会串工艺
+    if not re.search(r"_same = \[t for t in tables if t is _m0 or IG\.is_same_shape",
+                     p):
+        return _r(False, "合并前没有按同构筛表：会把不同工序的参数当成同一批数据算")
+    # 3) 冲突策略必须真的透传下去（不传就等于写死一种，报告里的处置说明会撒谎）
+    if "on_conflict=on_conflict" not in g:
+        return _r(False, "去重函数没有接收冲突策略：报告里写的处置方式与实际不符")
+    # 4) 键写错时宁可不做——这是"丢数据"与"有重复"之间的取舍，必须保守
+    _m = g.find("        if miss:")
+    if _m < 0 or "return list(range(len(rows)))" not in g[_m:_m + 420]:
+        return _r(False, "去重键不存在时没有退回原样：按错的键去重会删掉真实观测")
+    # 5) 坏游标必须出声（否则"本次只有 3 行新增"是假的）
+    _c = p.find("            if _st is None and _had_cursor:")
+    if _c < 0 or 'setdefault("warnings"' not in p[_c:_c + 400]:
+        return _r(False, "游标读不出来时静默按全量处理：增量会悄悄失效，没人会注意")
+    # 6) 报告里要写清"去重去的是重复导出"，并写明能力仍按全量算
+    if "**数据摄入（多批次合并与去重）**" not in p:
+        return _r(False, "报告里没有数据摄入小节：使用者看不出结论建立在哪几批数据上")
+    if "仍按**全量合并后**的数据计算" not in p:
+        return _r(False, "没有写明能力指数按全量算：读者可能以为 Cpk 是拿增量算的")
+    return _r(True, "", {"n_checks": 6})
+
+
 def rule_spec_version_effective():
     """历史数据必须按**当时生效**的那一版规格判定，不能拿今天的尺子量去年的货。
 
@@ -3303,6 +3347,38 @@ AUDIT_RULES = [
           _mutant("两个导入分支只留一个（另一条路径 NameError）",
                   _sub("        from . import specver as SV\n", ""),
                   PIPELINE_FILE)]),
+    Rule("多批次数据必须合并去重，键写错宁可不去重，游标坏了要出声",
+         rule_ingest_incremental,
+         "（1）pipeline 两个导入分支都登记 ingest；"
+         "（2）只把同构表合并（不同工序的表并进来会串工艺）；"
+         "（3）冲突策略真的透传给去重函数（否则报告里的处置说明与实际不符）；"
+         "（4）去重键不存在时退回原样并告警（按错的键去重＝删掉真实观测）；"
+         "（5）游标读不出来时出声，不静默按全量；"
+         "（6）报告有数据摄入小节，且写明能力仍按全量算",
+         PIPELINE_FILE,
+         [_mutant("两个导入分支只留一个（另一条路径 NameError）",
+                  _sub("        from . import ingest as IG\n", ""),
+                  PIPELINE_FILE),
+          _mutant("合并不筛同构表（不同工序的参数混成一批数据）",
+                  _sub("        _same = [t for t in tables if t is _m0 or IG.is_same_shape(_m0, t)]\n",
+                       "        _same = list(tables)\n"),
+                  PIPELINE_FILE),
+          _mutant("去重键写错也照样去重（真实观测被删）",
+                  _sub("        if miss:\n"
+                       "            return list(range(len(rows))), {\n",
+                       "        if False:\n"
+                       "            return list(range(len(rows))), {\n"),
+                  INGEST_FILE),
+          _mutant("坏游标静默按第一次运行处理（增量悄悄失效）",
+                  _re_sub(r'^[ \t]*if _st is None and _had_cursor:[ \t]*\n'
+                          r'(?:[ \t]*#[^\n]*\n)*'
+                          r'[ \t]*result\.setdefault\("warnings", \[\]\)\.append\(\n'
+                          r'[^\n]*\n[^\n]*\n', "", flags=re.M),
+                  PIPELINE_FILE),
+          _mutant("报告不写清能力按全量算（读者以为 Cpk 是拿增量算的）",
+                  _sub('"本次的 SPC 与 Cpk 仍按**全量合并后**的数据计算——"',
+                       '"本次的 SPC 与 Cpk 按本次数据计算——"'),
+                  PIPELINE_FILE)]),
 ]
 
 
@@ -4076,9 +4152,11 @@ def flow_analyze(args):
             os.makedirs(outdir, exist_ok=True)
         except Exception as e:
             return False, "输出目录不可创建：%s" % e, {}
-        missing = [p for p in args.input if not os.path.exists(p)]
+        missing = [p for p in (args.input or []) if not os.path.exists(p)]
         if missing:
             return False, "输入文件不存在：%s" % "、".join(missing[:3]), {}
+        if args.input_dir and not os.path.isdir(args.input_dir):
+            return False, "输入目录不存在：%s" % args.input_dir, {}
         return ok, "" if ok else "Python 版本过低", {"python": "%d.%d" % (v[0], v[1])}
 
     steps.append(run_check("1. 环境预检", env_check))
@@ -4086,8 +4164,10 @@ def flow_analyze(args):
 
     # 透传清单由 lib/pipeline.py 的 argparse 定义生成，不手抄——
     # 手抄的清单会随 pipeline 加参数而漏项，且漏了不会报错只会静默少做。
-    cmd = [PY, "lib/pipeline.py", "--input"] + list(args.input) + \
-          ["--outdir", outdir, "--json", result_json]
+    cmd = [PY, "lib/pipeline.py"]
+    if args.input:
+        cmd += ["--input"] + list(args.input)
+    cmd += ["--outdir", outdir, "--json", result_json]
     cmd += passthrough_flags(args, pipeline_flag_specs())
 
     steps.append(run_cmd("3. 流水线分析", cmd, timeout=args.timeout))
@@ -4145,7 +4225,8 @@ def flow_analyze(args):
     steps.append(run_check("5. 产物落盘检查", check_artifacts))
 
     code = finish("交付主流程", steps, args.report,
-                  extra={"outdir": outdir, "inputs": list(args.input)},
+                  extra={"outdir": outdir, "inputs": list(args.input or []),
+           "input_dir": getattr(args, "input_dir", None)},
                   started=started)
 
     # 未确审 = 不得对外发出。这条必须显式说出来，不能只埋在报告里。
@@ -4236,8 +4317,9 @@ def main(argv=None):
         args.report = os.path.join("output",
                                    "_fde_run_%s_report.json" % (args.flow or "run"))
 
-    if args.flow == "analyze" and not args.input:
-        ap.error("analyze 必须给 --input")
+    if args.flow == "analyze" and not args.input and not args.input_dir:
+        # 现场从 MES 导出往往是一整个目录（一天一个文件），逐个列文件名不可持续
+        ap.error("analyze 必须给 --input 或 --input-dir")
 
     print("=" * 68)
     print("newenergy-fde 编排器 —— %s" % args.flow)

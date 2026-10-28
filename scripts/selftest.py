@@ -36,6 +36,7 @@ import shutil
 import threading
 import tempfile
 import json
+import csv
 import zlib
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -48,6 +49,7 @@ from lib import observ as OBS
 from lib import profile as PF
 from lib import msa as MSA
 from lib import specver as SV
+from lib import ingest as IG
 from lib import degrade as DG
 
 PASS, FAIL = [], []
@@ -3955,6 +3957,183 @@ def test_export_docx_pdf():
         EX.write_docx = _orig
 
 
+def test_ingest_incremental():
+    """增量摄入（评审 P2-1）：多批次合并、去重、游标。
+
+    这条要防的是"看着像在做、其实没做"：
+      * 合并了但没去重 → 重复行把 MR 压成 0，σ_within 腰斩、控制限收窄，
+        本来正常的点被判超限（下面用数值证明，不是凭感觉说"会影响"）；
+      * 去重了但键猜错 → 真实观测被删，那是丢数据，比重复严重；
+      * 有游标但读不出来就当第一次 → "本次新增"悄悄变成全量，没人会注意。
+    """
+    print("\n[增量摄入：多批次合并 / 去重 / 游标]")
+    base = os.path.join(ROOT, "output", "_test", "ingest")
+    try:
+        if os.path.isdir(base):
+            shutil.rmtree(base)
+    except Exception:
+        # scan:keep 清旧测试目录失败不影响后面的 makedirs（已存在就复用），
+        # 但若真有残留文件，下面的断言会因为数字对不上而直接报出来，不会静默通过。
+        pass
+    os.makedirs(base, exist_ok=True)
+    head = ["批次号", "时间", "设备号", "面密度"]
+    b1 = [["L1", "2026-03-01 00:00", "C-01", 120.1],
+          ["L1", "2026-03-01 01:00", "C-01", 119.8],
+          ["L1", "2026-03-01 02:00", "C-01", 120.5]]
+    b2 = b1[1:] + [["L2", "2026-03-01 03:00", "C-01", 121.0],
+                   ["L2", "2026-03-01 04:00", "C-01", 119.5]]
+    b3 = b2[2:] + [["L3", "2026-03-01 05:00", "C-01", 120.2]]
+
+    def _w(name, rows):
+        fp = os.path.join(base, name)
+        f = io.open(fp, "w", encoding="utf-8-sig", newline="")
+        w = csv.writer(f)
+        w.writerow(head)
+        w.writerows(rows)
+        f.close()
+        return fp
+
+    _w("bat_1.csv", b1)
+    _w("bat_2.csv", b2)
+    _w("bat_3.csv", b3)
+
+    got = IG.scan(base)
+    check("目录扫描找全 3 个批次", len(got) == 3, "%d 个" % len(got))
+    check("扫描顺序稳定（两次一致）", IG.scan(base) == got, "")
+
+    fp1 = IG.fingerprint(got[0])
+    check("同文件两次指纹一致", fp1 == IG.fingerprint(got[0]), "" if fp1 else "指纹为空")
+    _w("bat_tmp.csv", b1)
+    check("多一行文件指纹就不同（mtime 相同也能分辨）",
+          IG.fingerprint(os.path.join(base, "bat_tmp.csv")) != fp1, "")
+    os.remove(os.path.join(base, "bat_tmp.csv"))
+
+    tbs = []
+    for p in IG.scan(base):
+        tb = T.read_any(p)
+        if isinstance(tb, list):
+            tb = tb[0]
+        tb.attach_source(p)
+        tbs.append(tb)
+    # b1=3 行；b2 取 b1 后 2 行 + 2 行新 = 4；b3 取 b2 后 2 行 + 1 行新 = 3
+    check("三批行数 3/4/3", [len(t.rows) for t in tbs] == [3, 4, 3],
+          str([len(t.rows) for t in tbs]))
+    check("同构表相似度为 1（同一张表的多批导出）",
+          abs(IG.shape_similarity(tbs[0], tbs[1]) - 1.0) < 1e-9, "")
+    other = T.Table(["完全不同的列A", "完全不同的列B"], [[1, 2]], "x")
+    check("不同工序表不算同构（不能被并进同一张表）",
+          not IG.is_same_shape(tbs[0], other), "")
+
+    r = IG.merge(tbs, key_cols=["设备号", "时间"])
+    check("合并去重：10 行 → 6 行（唯一键 6 个）",
+          (r["n_in"], r["n_out"]) == (10, 6),
+          "%s → %s" % (r["n_in"], r["n_out"]))
+    check("重复行计数 4", r["n_dup"] == 4, str(r["n_dup"]))
+    check("保留行来源跨三个文件（逐行出处没丢）",
+          len(set(r["table"].src_of(i)[0] for i in range(len(r["table"].rows)))) == 3,
+          str([r["table"].src_of(i)[0] for i in range(len(r["table"].rows))]))
+    check("出处带原始行号（能回到文件第几行）",
+          all(r["table"].src_of(i)[1] is not None
+              for i in range(len(r["table"].rows))), "")
+    check("批次记账给出每批覆盖时间（判断漏导的依据）",
+          all(b.get("from") and b.get("to") for b in r["batches"]),
+          str([(b["file"], b["from"], b["to"]) for b in r["batches"]]))
+
+    # 键写错时宁可不做——按错的键去重会删掉真实观测
+    r_bad = IG.merge(tbs, key_cols=["不存在的列"])
+    check("去重键不存在时不硬做，且说明原因",
+          r_bad["key_mode"] == "none" and r_bad["n_out"] == r_bad["n_in"]
+          and "不存在" in (r_bad.get("warning") or ""),
+          "%s / %s" % (r_bad["key_mode"], r_bad["n_out"]))
+
+    # 同键不同值：源数据被改过
+    t4 = T.Table(head, [["L3", "2026-03-01 05:00", "C-01", 999.9]], "bat_4")
+    t4.attach_source("bat_4.csv")
+    r_last = IG.merge(tbs + [t4], key_cols=["设备号", "时间"], on_conflict="last")
+    r_first = IG.merge(tbs + [t4], key_cols=["设备号", "时间"], on_conflict="first")
+    r_keep = IG.merge(tbs + [t4], key_cols=["设备号", "时间"], on_conflict="keep")
+    check("同键不同值被抓成冲突（不是当重复删掉）",
+          r_last["n_conflict"] == 1 and r_last["n_overwritten"] == 1,
+          "conflict=%s over=%s" % (r_last["n_conflict"], r_last["n_overwritten"]))
+    check("last 保留晚批次（新导出覆盖旧导出）", r_last["n_out"] == 6, str(r_last["n_out"]))
+    check("first 保留早批次", r_first["n_out"] == 6, str(r_first["n_out"]))
+    check("keep 两行都留（交人核对）", r_keep["n_out"] == 7, str(r_keep["n_out"]))
+    check("冲突提示写清了用了哪种处置", "保留晚批次" in (r_last.get("warning") or ""),
+          (r_last.get("warning") or "")[:40])
+
+    # 浮点末位差异不该刷成冲突（MES 重导常差 1e-9）
+    t5 = T.Table(head, [["L3", "2026-03-01 05:00", "C-01", 120.2000000001]], "bat_5")
+    t5.attach_source("bat_5.csv")
+    r_f = IG.merge(tbs + [t5], key_cols=["设备号", "时间"])
+    check("浮点末位差异不算冲突（否则冲突噪音会埋掉真改写）",
+          r_f["n_conflict"] == 0 and r_f["n_dup"] == 5,
+          "conflict=%s dup=%s" % (r_f["n_conflict"], r_f["n_dup"]))
+
+    # 不给键：只删整行完全相同的行
+    r_auto = IG.merge(tbs)
+    check("不给键时走整行去重（保守：不猜业务键）",
+          r_auto["key_mode"] == "whole_row" and r_auto["n_out"] == 6,
+          "%s / %s" % (r_auto["key_mode"], r_auto["n_out"]))
+
+    # --- 游标 ---
+    cdir = os.path.join(base, ".state")
+    cur = os.path.join(cdir, "cursor.json")
+    meta = {}
+    for p, tb in zip(IG.scan(base), tbs):
+        fp = IG.fingerprint(p)
+        fp["rows"] = len(tb.rows)
+        meta[fp["file"]] = fp
+    IG.save_cursor(cur, meta, n_rows=r["n_out"])
+    check("游标目录不存在时会自动建", os.path.exists(cur), cdir)
+    st = IG.load_cursor(cur)
+    check("游标能读回且文件数对", st is not None and len(st["files"]) == 3,
+          "%s" % (len(st["files"]) if st else None))
+    check("首次运行（无游标）报 no_cursor 而不是假装没变化",
+          IG.diff_cursor(None, meta)["status"] == "no_cursor", "")
+    d0 = IG.diff_cursor(st, meta)
+    check("内容没变时 rows_added=0、全部 unchanged",
+          d0["rows_added"] == 0 and len(d0["unchanged"]) == 3, str(d0))
+    _w("bat_4_new.csv", [["L9", "2026-03-01 09:00", "C-01", 120.0]])
+    meta2 = dict(meta)
+    fp4 = IG.fingerprint(os.path.join(base, "bat_4_new.csv"))
+    fp4["rows"] = 1
+    meta2[fp4["file"]] = fp4
+    d1 = IG.diff_cursor(st, meta2)
+    check("新文件进 new，并给出追加行数",
+          d1["new"] == ["bat_4_new.csv"] and d1["rows_added"] == 1, str(d1))
+    meta2["bat_2.csv"] = dict(meta["bat_2.csv"], sha="deadbeef", rows=6)
+    d2 = IG.diff_cursor(st, meta2)
+    check("文件内容变了进 changed，并算出追加 2 行",
+          d2["changed"] == ["bat_2.csv"] and d2["rows_added"] == 3,
+          str(d2))
+    f = io.open(cur, "w", encoding="utf-8")
+    f.write("{这不是 JSON")
+    f.close()
+    check("坏游标返回 None（由调用方出声，不静默当成第一次）",
+          IG.load_cursor(cur) is None, "")
+
+    # --- 危害的数值证明：不去重会腰斩 σ_within、收窄控制限 ---
+    # 这组数只用来说明"为什么必须去重"，本身是一串正常波动。
+    v = [10.0, 11.0, 9.0, 10.5, 9.8, 10.2, 10.1, 9.9] * 5
+    dbl = [x for x in v for _ in (0, 1)]      # 每点重复一次（MES 重导后的典型形态）
+    ch1 = SPC.x_mr(v)[0]
+    ch2 = SPC.x_mr(dbl)[0]
+    check("重复点相邻时 σ_within 被腰斩（0.68 → 0.34 量级）",
+          ch2.sigma_within < ch1.sigma_within * 0.6,
+          "%.4f vs %.4f" % (ch2.sigma_within, ch1.sigma_within))
+    check("控制限随之收窄超 1/3（正常点会被判超限）",
+          (ch2.ucl - ch2.lcl) < (ch1.ucl - ch1.lcl) * 0.75,
+          "%.2f vs %.2f" % (ch2.ucl - ch2.lcl, ch1.ucl - ch1.lcl))
+    # 同一点被导两次：按点号去重后应回到原始点数
+    _dup_rows = []
+    for _i, _x in enumerate(v):
+        _dup_rows.append([float(_i), _x])
+        _dup_rows.append([float(_i), _x])
+    keep, _info = IG.dedup_rows(_dup_rows, ["点号", "值"], ["点号"])
+    check("去重后回到原始点数（恢复正确的控制限）", len(keep) == len(v),
+          "%d vs %d" % (len(keep), len(v)))
+
+
 def test_spec_versioning():
     """规格版本化（评审 P1-3）：历史数据必须按**当时生效**的规格重判。
 
@@ -4333,6 +4512,7 @@ if __name__ == "__main__":
     test_msa_gauge_rr_gate()
     test_autocorrelation_ewma_cusum()
     test_export_docx_pdf()
+    test_ingest_incremental()
     test_spec_versioning()
     print("\n" + "=" * 56)
     print("通过 %d 项，失败 %d 项" % (len(PASS), len(FAIL)))

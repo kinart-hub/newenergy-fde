@@ -264,7 +264,14 @@ class Table(object):
         return os.path.basename(self.source_path) if self.source_path else None
 
     def src_of(self, i):
-        """(文件名, 原始行号)；无追溯信息时行号为 None。"""
+        """(文件名, 原始行号)；无追溯信息时行号为 None。
+
+        合并表（多批次合成一张）必须逐行记出处：整表只剩一个文件名的话，
+        报告里"第 37 点异常"回不到是哪一批导出的，客户那边没法核对。
+        """
+        sm = self.__dict__.get("src_map")
+        if sm and 0 <= i < len(sm):
+            return sm[i]
         f = self.src_file()
         if self.src_rows and 0 <= i < len(self.src_rows):
             return (f, self.src_rows[i])
