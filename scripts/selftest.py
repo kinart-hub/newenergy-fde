@@ -50,6 +50,7 @@ from lib import profile as PF
 from lib import msa as MSA
 from lib import specver as SV
 from lib import ingest as IG
+from lib import lotcode as LC
 from lib import degrade as DG
 
 PASS, FAIL = [], []
@@ -299,10 +300,10 @@ def test_pipeline():
     names = [os.path.basename(f) for f in files]
     # 用编号前缀定位（不写客户代号：交付物里不该出现具体客户标识）
     _need = ["01_涂布", "02_卷绕", "03_化成分容", "04_硅片", "05_EL",
-             "06_组件IV", "07_", "08_跨规格版本"]
+             "06_组件IV", "07_", "08_跨规格版本", "09_批号分组"]
     _miss = [p for p in _need if not any(n.startswith(p) for n in names)]
-    check("示例数据齐全（%d 类：6 类工况 + 私有列名 + 跨规格版本）" % len(_need),
-          not _miss, "缺 %s｜现有 %d 个" % (_miss, len(names)))
+    check("示例数据齐全（%d 类：6 类工况 + 私有列名 + 跨规格版本 + 批号分组）"
+          % len(_need), not _miss, "缺 %s｜现有 %d 个" % (_miss, len(names)))
     for f in files:
         name = os.path.basename(f)
         outdir = os.path.join(ROOT, "output", "_test", name[:2])
@@ -3957,6 +3958,184 @@ def test_export_docx_pdf():
         EX.write_docx = _orig
 
 
+def test_lot_segment_extraction():
+    """批号拆解（评审 P2-2）：从编码里提取能分组的前缀段。
+
+    这条要防的是一种**看起来极有说服力、实际上完全无用**的结论：
+    把批号里的流水号当成分组维度。按流水号分组，η² 会很高、p 值会很小，
+    报告会写"第 3 段对不良率有显著影响"——而现场真正能做的事是零，
+    因为"第几个"不是可调整的工艺条件。
+    """
+    print("\n[批号拆解：从编码里提取分组维度]")
+    rnd = random.Random(20261028)
+
+    # --- 拆分 ---
+    v1 = ["SUP01-20240301-A001", "SUP02-20240302-A002", "SUP03-20240303-A003"]
+    s1 = LC.split_values(v1)
+    check("按分隔符拆成 3 段", s1["status"] == "ok" and s1["n_parts"] == 3,
+          "%s/%s" % (s1.get("status"), s1.get("n_parts")))
+    check("段值正确", s1["parts"][0] == ["SUP01", "20240301", "A001"],
+          str(s1["parts"][0]))
+    check("下划线也能拆", LC.split_values(["C01_2403_07"] * 3 + ["C02_2404_08"])["n_parts"] == 3, "")
+    _mix = LC.split_values(["A-1", "A-2-3", "B-1"])
+    check("段数不一致时不硬按分隔符拆（否则字段会错位）",
+          _mix.get("sep") != "-", str(_mix.get("sep")))
+    zh = LC.split_values(["A01", "A02", "B01", "B02"])
+    check("无分隔符时按「字母前缀 + 数字体」拆",
+          zh["status"] == "ok" and zh["n_parts"] == 2, zh.get("sep"))
+    eq = LC.split_values(["20240301001", "20240301002", "20240301003"])
+    check("等长无分隔不硬按位置切，并提示用 --lot-pattern",
+          eq["status"] == "no_split" and "lot-pattern" in (eq.get("note") or ""),
+          eq.get("status"))
+    cu = LC.split_values(["LC01X0001", "LC02X0002", "LC03X0003"],
+                         pattern=r"^LC(\d+)X(\d+)$")
+    check("自定义模式能拆", cu["status"] == "ok" and cu["n_parts"] == 2,
+          cu.get("status"))
+    bad = LC.split_values(["A1", "A2"], pattern="([")
+    check("非法正则返回 bad_pattern（不是崩掉）", bad["status"] == "bad_pattern",
+          bad.get("status"))
+
+    # --- 段画像 ---
+    rows = []
+    bias = {"SUP01": 0.0, "SUP02": 2.2, "SUP03": -0.5}
+    for sup in bias:
+        for d in ("20240301", "20240302", "20240303"):
+            for k in range(1, 13):
+                rows.append(["%s-%s-A%03d" % (sup, d, k),
+                             round(120 + bias[sup] + rnd.gauss(0, 1.2), 2)])
+    tb = T.Table(["批号", "面密度"], rows, "lot")
+    info = LC.analyze(tb, "批号", y_vals=tb.numeric_column("面密度"))
+    check("识别出 3 段", len(info["segments"]) == 3, str(len(info["segments"])))
+    seg1 = info["segments"][0]
+    check("供应商段判为可分组（3 个取值、每块 36 行）",
+          seg1["kind"] == "groupable" and seg1["n_uniq"] == 3,
+          "%s/%s" % (seg1["kind"], seg1["n_uniq"]))
+    check("供应商段 η² 明显（造数时给了 2.2 的偏移）",
+          (seg1.get("eta2") or 0) > 0.15, str(seg1.get("eta2")))
+    check("日期段被认出是 YYYYMMDD",
+          info["segments"][1].get("date_format") == "YYYYMMDD",
+          str(info["segments"][1].get("date_format")))
+    check("序号段（A001…）判为 sequence，不是分组维度",
+          info["segments"][2]["kind"] == "sequence",
+          info["segments"][2]["kind"])
+    check("候选里只有供应商段与日期段，没有序号段",
+          info["candidates"] == ["批号#1", "批号#2"], str(info["candidates"]))
+
+    # 每行唯一的流水号：必须判 identifier / too_sparse，绝不进候选
+    rows2 = [["LOT-%05d" % i, round(120 + rnd.gauss(0, 2), 2)] for i in range(120)]
+    tb2 = T.Table(["批号", "值"], rows2, "lot2")
+    st2 = LC.segment_stats([r[0] for r in rows2])
+    check("每行唯一的段判 identifier 或太稀疏（不能当分组）",
+          st2["kind"] in ("identifier", "too_sparse"), st2["kind"])
+    check("这种列整列没有可分组段", LC.analyze(tb2, "批号")["candidates"] == [],
+          str(LC.analyze(tb2, "批号")["candidates"]))
+
+    # --- 混杂保护：序号段的 η² 不能拿来说事 ---
+    rows3 = []
+    b2 = {"01": 0.0, "02": 2.0, "03": 0.2}
+    for ln in b2:
+        for k in range(30):
+            rows3.append(["L%s-%03d" % (ln, k),
+                          round(120 + b2[ln] + rnd.gauss(0, 1.0), 2)])
+    tb3 = T.Table(["批号", "面密度"], rows3, "lot3")
+    i3 = LC.analyze(tb3, "批号", y_vals=tb3.numeric_column("面密度"))
+    check("成块出现的数字段（真产线编号）判 groupable",
+          i3["segments"][0]["kind"] == "groupable", i3["segments"][0]["kind"])
+    check("序号段即使 η² 很高也不复活（η² 会混杂别的因素）",
+          i3["segments"][1]["kind"] == "sequence"
+          and i3["segments"][1].get("revived") is None,
+          "%s/revived=%s" % (i3["segments"][1]["kind"],
+                             i3["segments"][1].get("revived")))
+    check("且写明这个 η² 不能直接采信", "混杂" in (i3["segments"][1].get("eta2_note") or ""),
+          (i3["segments"][1].get("eta2_note") or "")[:30])
+
+    # --- enrich ---
+    r = LC.enrich(tb, target_col="面密度")
+    names = [a["name"] for a in r["added"]]
+    check("enrich 只加可分组的段", names == ["批号#1", "批号#2"], str(names))
+    check("序号段没有被加成派生列", "批号#3" not in tb.columns, str(tb.columns))
+    check("派生列真的进了表（后续分组能直接取）",
+          tb.col_index("批号#1") is not None
+          and sorted(set(tb.column("批号#1"))) == ["SUP01", "SUP02", "SUP03"],
+          str(sorted(set(tb.column("批号#1")))))
+    lines = LC.describe(r["added"])
+    check("说明只讲事实（取值数/中位行数/η²），不给段起名字",
+          all(("取值" in x and "组内中位" in x) for x in lines)
+          and not any("供应商" in x for x in lines), str(lines[:1]))
+
+    # 本身基数就低的列不重复拆：pick_groups 早就用它了
+    tb4 = T.Table(["批号", "值"],
+                  [["L%d" % (i % 5), 120 + rnd.gauss(0, 1)] for i in range(50)],
+                  "lot4")
+    r4 = LC.enrich(tb4, target_col="值")
+    check("本身只有 5 个取值的列不重复拆（避免同义列）", r4["added"] == [],
+          str(r4["added"]))
+
+    # 拆不出来时要说清原因，不能静默当"没有批号"
+    eq2 = T.Table(["批号", "值"],
+                  [["2024030%04d" % i, 120 + rnd.gauss(0, 1)] for i in range(40)],
+                  "lot5")
+    r5 = LC.enrich(eq2, target_col="值")
+    check("拆不出来时给出原因（不是静默略过）",
+          r5["added"] == [] and any("lot-pattern" in n for n in r5["notes"]),
+          str((r5.get("notes") or [""])[:1]))
+
+    # --- 派生列进入分组后，8D 的「涉及批次数」不能拿切片当批次数 ---
+    # 实测踩过：unit_hotspots 的 levels 是**水平个数**（int），按列表去 len() 会
+    # TypeError；而 8D 整节外面有 try/except → 静默降级成「未装载」，报告照常
+    # 生成、只是没有 8D 段（运行门禁第 4 步才发现）。批号派生列出现后第一次踩到。
+    try:
+        from lib import eightd as E8D
+    except Exception:
+        E8D = None
+    check("8D 模块可导入（下面两条的回归前提）", E8D is not None, "")
+    if E8D is not None:
+        _r = {"shape": [90, 4],
+              "unit_hotspots": [{"dim": "批号#1", "levels": 3}],
+              "group_compare": [{"dimension": "批号#1",
+                                 "groups": ["SUP01", "SUP02", "SUP03"]}]}
+        check("水平数是 int 时不抛 TypeError（8D 不会整节降级）",
+              E8D._count_defects(_r)["batches"] is None,
+              str(E8D._count_defects(_r)["batches"]))
+        check("批号派生段不当成「涉及批次数」（3 个供应商不是 3 批）",
+              E8D._count_defects(_r)["batches"] is None,
+              str(E8D._count_defects(_r)["batches"]))
+        _r2 = {"shape": [90, 4],
+               "unit_hotspots": [{"dim": "批号", "levels": 30}],
+               "group_compare": []}
+        check("真实批号列的水平数照旧取到（30 批）",
+              E8D._count_defects(_r2)["batches"] == 30,
+              str(E8D._count_defects(_r2)["batches"]))
+
+    # --- 端到端：示例数据跑通，派生列进分组、但不污染数值分析 ---
+    _src = os.path.join(ROOT, "examples", "09_批号分组数据.csv")
+    _out = tempfile.mkdtemp(prefix="fde_lot_")
+    try:
+        subprocess.run([sys.executable, "lib/pipeline.py", "--input", _src,
+                        "--outdir", _out, "--json", os.path.join(_out, "r.json")],
+                       capture_output=True, cwd=ROOT, timeout=600)
+        _rj = os.path.join(_out, "r.json")
+        _res = json.load(io.open(_rj, encoding="utf-8")) \
+            if os.path.exists(_rj) else {}
+        _ls = _res.get("lot_segments") or {}
+        _names = [a["name"] for a in (_ls.get("added") or [])]
+        check("端到端：批号拆出两段并加成派生列",
+              _names == ["批号#1", "批号#2"], str(_names))
+        check("端到端：序号段没有被加成派生列",
+              "批号#3" not in _names, str(_names))
+        check("端到端：派生列真的进了分组维度",
+              "批号#1" in (_res.get("groups") or []), str(_res.get("groups")))
+        check("端到端：日期段没被当成测量值画控制图",
+              all("#" not in str(d.get("column"))
+                  for d in (_res.get("spc") or [])),
+              str([d.get("column") for d in (_res.get("spc") or [])]))
+        check("端到端：没有静默降级的小节",
+              not (_res.get("degraded_sections") or []),
+              str((_res.get("degraded_sections") or [])[:2]))
+    finally:
+        shutil.rmtree(_out, ignore_errors=True)
+
+
 def test_ingest_incremental():
     """增量摄入（评审 P2-1）：多批次合并、去重、游标。
 
@@ -4512,6 +4691,7 @@ if __name__ == "__main__":
     test_msa_gauge_rr_gate()
     test_autocorrelation_ewma_cusum()
     test_export_docx_pdf()
+    test_lot_segment_extraction()
     test_ingest_incremental()
     test_spec_versioning()
     print("\n" + "=" * 56)

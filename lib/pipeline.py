@@ -72,6 +72,10 @@ if __package__ in (None, ""):
         from lib import ingest as IG
     except Exception:
         IG = None
+    try:                    # P2-2 批号拆解：从编码里提取可分组前缀段；失败只少一层分组维度
+        from lib import lotcode as LC
+    except Exception:
+        LC = None
     try:                    # P1-2 原生 Word/PDF 导出；失败只少两种交付形态
         from lib import export_doc as EX
     except Exception:
@@ -107,6 +111,10 @@ else:
         from . import ingest as IG
     except Exception:
         IG = None
+    try:                    # P2-2 批号拆解（两个分支都要，只改一套会 NameError）
+        from . import lotcode as LC
+    except Exception:
+        LC = None
     try:                    # P1-2 原生 Word/PDF 导出（两个分支都要，只改一套会 NameError）
         from . import export_doc as EX
     except Exception:
@@ -137,7 +145,7 @@ if EV is not None and EV.__name__ != "lib.events":
 KB = PP.load_knowledge()
 _fmt = RPT._fmt
 
-ANALYZER_VERSION = "2.10.0"
+ANALYZER_VERSION = "2.11.0"
 
 
 # 空数据排查清单。
@@ -394,6 +402,7 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
             role=None, controlled_spec=None,
             msa_spec=None, spec_date_col=None,
             input_dir=None, dedup_key=None, on_conflict="last", cursor=None,
+            lot_pattern=None,
             export_xlsx=True, export_docx=True, export_pdf=True,
             d2_card=None, emit_d2_card=True, verbose=False, views=None):
     """
@@ -423,6 +432,9 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
                   first 保留早批次 / keep 两行都留交人核对。三者都会在报告里记账。
     cursor     —— 增量游标文件路径。给出时只报"本次新增了哪些文件、追加了多少行"，
                   并把本次文件指纹写回。游标读不出来会退回全量并明说，不静默少算。
+    lot_pattern—— 批号拆解用的正则（带捕获组）。不给时自动按分隔符/字母前缀试拆；
+                  拆不准（段数不一致、等长无分隔）会明说并让你给这个模式，
+                  不硬按位置切——那会把供应商代码切掉一半。
     d2_card    —— 已填写的 8D D2 录入卡路径。给了就把 5W2H 与数据做交叉校验，
                   并据此渲染完整 D1–D8；不给则 D2 全空并在报告中标记「不具备对外条件」。
     emit_d2_card—— 是否随报告生成空白 D2 录入卡（默认生成）。
@@ -1081,6 +1093,38 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
              "detail": "自动选择分析目标＝「%s」。理由：优先取该工序的**结果型**质量特性，"
                        "并要求它在数据里确实存在可被其它变量解释的变异；"
                        "编号/时间/坐标、分档标签与派生合计列均不作为目标。" % y_col})
+    # 4a-bis. 批号拆解：把编码里的前缀段提取成可分组维度。
+    #     批号常形如 SUP01-20240301-A001，整列分组时每批自成一组建不了模；
+    #     拆开才有"哪家料/哪条线"的信息。但流水号段绝不进分组候选——
+    #     按它分组得到的结论是"第 7 个和第 12 个不一样"，现场无从下手。
+    if LC is not None:
+        try:
+            _lot = LC.enrich(work, target_col=y_col, pattern=lot_pattern)
+        except Exception as _lot_e:
+            degrade.note("pipeline.lotcode@enrich", _lot_e)
+            _lot = None
+            result.setdefault("warnings", []).append(
+                "批号拆解失败（%s）：本次未从批号里提取分组维度" % _lot_e)
+            result.setdefault("degraded_sections", []).append(
+                {"section": "批号拆解", "error": str(_lot_e)})
+        # 派生列名记在表上：后续挑数值列做 SPC/相关性时必须排除，
+        # 否则像「20260401」这种日期编码会被当成测量参数画控制图
+        work.lot_derived = [a["name"] for a in (_lot or {}).get("added") or []]
+        if _lot and _lot.get("added"):
+            _lines = LC.describe(_lot["added"])
+            result["lot_segments"] = {"added": _lot["added"],
+                                      "notes": _lot.get("notes") or [],
+                                      "lines": _lines}
+            for _l in _lines:
+                result.setdefault("decisions", []).append(
+                    {"kind": "lot_segment", "detail": "批号拆解：%s" % _l})
+        elif _lot and (_lot.get("notes") or _lot.get("rejected")):
+            # 拆不出来也要说清为什么：不说的话，使用者会以为"批号列被忽略了"
+            result["lot_segments"] = {"added": [], "notes": _lot.get("notes") or [],
+                                      "rejected": _lot.get("rejected") or []}
+            for _n in (_lot.get("notes") or [])[:3]:
+                result.setdefault("warnings", []).append(_n)
+
     groups = pick_groups(work)
     result["groups"] = groups
 
@@ -1185,7 +1229,10 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
     #     报告看起来像"分析过了"，实际每个统计量都是 None。
     #     必须排除时间列再数：实测「2026-01-01」会被解析成数值 2026.0，
     #     不排除的话时间列单独就能让这个检测失效。
-    _numcols = [c for c in work.numeric_columns() if c != tcol]
+    #     批号派生出的日期段同理（20260401 是编码不是测量值）。
+    _lot_dd = set(getattr(work, "lot_derived", ()) or ())
+    _numcols = [c for c in work.numeric_columns()
+                if c != tcol and c not in _lot_dd]
     _n_valid = 0
     for _c in _numcols:
         try:
@@ -1288,8 +1335,10 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
     try:  # 护栏：SPC 环节失败只降级本节，不中断整轮
         # 7. SPC
         spc_res = []
+        _lot_d = set(getattr(work, "lot_derived", ()) or ())
         numcols = [c for c in work.numeric_columns()
-                   if len([v for v in work.numeric_column(c) if v is not None]) >= 8]
+                   if c not in _lot_d
+                   and len([v for v in work.numeric_column(c) if v is not None]) >= 8]
         priority = []
         for c, k in col_map.items():
             if k:
@@ -2931,6 +2980,11 @@ def build_report(res, work, spc_res, corr, assoc, pare, root, gaps, conf,
         # 时间/分组列不参与参数识别，不算漏识别
         _unmapped = [c for c in _unmapped
                      if PP.match_param(c) is None and _src.get(c) != "device"]
+        # 批号拆出来的派生列不是"未识别列"：它们是本次自己加的，
+        # 不排除的话报告会一边说"已提取分组维度"、一边把它们列进未识别告警
+        _lot_cols = set(a2["name"] for a2 in
+                        ((res.get("lot_segments") or {}).get("added") or []))
+        _unmapped = [c for c in _unmapped if c not in _lot_cols]
         if _unmapped:
             rep.callout(s3, "以下 %d 个列名未能识别，不参与本次分析。若它其实是某个工艺参数，"
                             "可用 <code>kb_manage.py propose --type param_alias</code> "
@@ -2938,6 +2992,24 @@ def build_report(res, work, spc_res, corr, assoc, pare, root, gaps, conf,
                             % (len(_unmapped), "、".join(_unmapped[:12])), "warn")
         rep.callout(s3, "未出现在表中的标准参数，说明本次导出数据未覆盖该工序的关键控制点，"
                         "这是数据缺口而非分析遗漏。", "info")
+
+    # 批号拆解：哪些段被提出来当分组维度、哪些被挡掉、为什么。
+    # 用户会问"我这列批号里有供应商信息，你为什么没用上"——这一节就是答案。
+    _ls = res.get("lot_segments") or {}
+    if _ls.get("added"):
+        rep.text(s3, "**批号拆解**（从编码里提取分组维度）")
+        rep.bullets(s3, _ls.get("lines") or [])
+        rep.table(s3, ["派生列", "来自", "取值数", "组内中位行数", "η²"],
+                  [[a3["name"], a3["col"], a3["n_uniq"], a3["median_size"],
+                    round(a3["eta2"], 3) if a3.get("eta2") is not None else "—"]
+                   for a3 in _ls["added"]],
+                  caption="η² 是该段对分析目标的解释力（越大说明组间差异越明显）")
+        rep.callout(s3, "这些是从批号里拆出来的**派生列**，不是原始观测；只作为分组维度"
+                        "参与分组比较，不参与参数识别与共线性判断。流水号段（每批一个）"
+                        "没有被当成分组维度——按它分组得到的结论是「第 7 个和第 12 个"
+                        "不一样」，现场无法据此行动。", "info")
+    for _ln in (_ls.get("notes") or []):
+        rep.callout(s3, _ln, "info")
 
     # 4 SPC
     s4 = rep.section("4. SPC 控制图与判异")
@@ -3711,6 +3783,10 @@ def main():
                     choices=["last", "first", "keep"],
                     help="同一去重键出现不同值时怎么办：last 保留晚批次（默认，"
                          "新导出覆盖旧导出）/ first 保留早批次 / keep 两行都留交人核对")
+    ap.add_argument("--lot-pattern", default=None,
+                    help="批号拆解正则（带捕获组），如 '^(\\w{5})-(\\d{8})-(\\w+)$'。"
+                         "不给时自动按分隔符/字母前缀试拆；拆不准会明说并提示用这个参数，"
+                         "不会按位置硬切（那会把供应商代码切掉一半）")
     ap.add_argument("--cursor", default=None,
                     help="增量游标文件路径（如 out/.state/mes_cursor.json）。给出后报告会写明"
                          "本次新增了哪些文件、追加了多少行；首次运行自动建立基准")
@@ -3818,6 +3894,7 @@ def main():
                   dedup_key=([c.strip() for c in args.dedup_key.split(",") if c.strip()]
                              if args.dedup_key else None),
                   on_conflict=args.dedup_conflict, cursor=args.cursor,
+                  lot_pattern=getattr(args, "lot_pattern", None),
                   do_doe=not args.no_doe, auto_adapt=args.auto_adapt,
                   tenant=args.tenant, industry=args.industry, rules=args.rules,
                   spc_exclusion_mode=args.spc_exclusion_mode,

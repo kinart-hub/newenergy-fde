@@ -9,7 +9,7 @@
 ![License](https://img.shields.io/badge/license-Elastic--2.0-blue)
 ![Python](https://img.shields.io/badge/python-3.8%2B-blue)
 ![Dependencies](https://img.shields.io/badge/dependencies-0-brightgreen)
-![Self-test](https://img.shields.io/badge/selftest-743%20passing-brightgreen)
+![Self-test](https://img.shields.io/badge/selftest-778%20passing-brightgreen)
 
 ![newenergy-fde](assets/social-preview.png)
 
@@ -24,7 +24,7 @@
 git clone https://github.com/kinart-hub/newenergy-fde.git
 cd newenergy-fde
 
-python scripts/selftest.py          # 743 项端到端自检，应全部通过
+python scripts/selftest.py          # 778 项端到端自检，应全部通过
 python scripts/fde_run.py analyze -i examples/01_涂布工艺数据.csv -o output/try
 ```
 
@@ -158,7 +158,14 @@ python scripts/fde_run.py analyze --input 近两年数据.csv --spec 规格含�
 python scripts/fde_run.py analyze --input-dir MES导出 --dedup-key 设备号,时间 \
        --cursor out/.state/mes_cursor.json --outdir out
 
-# 自检（743 项，含设备适配层、跨工序追溯、多企业隔离、行业作用域、基线热更新、设备记忆与知识库演进）
+# 批号里压着供应商/日期/序号：自动拆出能分组的那几段（序号段会被排除）
+python scripts/fde_run.py analyze --input examples/09_批号分组数据.csv --outdir out
+
+# 批号等长无分隔（如 A2403010007）：给一条正则，告诉工具怎么切
+python scripts/fde_run.py analyze --input data.csv \
+       --lot-pattern "^([A-Z]\d{2})(\d{6})(\d+)$" --outdir out
+
+# 自检（778 项，含设备适配层、跨工序追溯、多企业隔离、行业作用域、基线热更新、设备记忆与知识库演进）
 python scripts/selftest.py
 ```
 
@@ -218,9 +225,9 @@ newenergy-fde/
 │       ├── kb_manage.py              知识库管理台（status/list/propose/intake/harvest/
 │   │                             review/sync/verify/cases/devices/industries/update/rollback/patch）
 │   ├── make_device_samples.py    生成多厂商版式的对照样例（同一真值、不同导出）
-│   └── selftest.py               743 项端到端自检（含设备适配层、跨工序追溯、多企业隔离、行业作用域、基线热更新、设备记忆与知识库演进）
+│   └── selftest.py               778 项端到端自检（含设备适配层、跨工序追溯、多企业隔离、行业作用域、基线热更新、设备记忆与知识库演进）
 └── examples/
-    ├── *.csv                     七类示例数据（含一个私有列名导出样例）
+    ├── *.csv                     九类示例数据（6 类工况 + 私有列名 + 跨规格版本 + 批号分组）
     └── devices/*.csv             六类设备导出样例（竖表/双行表头/单位行/合计行/未知设备)
 ```
 

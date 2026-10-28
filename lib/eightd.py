@@ -119,6 +119,25 @@ def _num(v):
         return None
 
 
+def _n_levels(v):
+    """「水平数」的两种形态都要认：有时是水平**个数**（int），有时是水平**列表**。
+
+    实测踩过：unit_hotspots 的 levels 是 int（crossprocess 里就是 len(buckets)），
+    group_compare 的 groups 是 list。当成 list 去 len() 会 TypeError，
+    而这一节外面有 try/except 兜底 → 整节 8D 静默降级成「未装载」，
+    报告照常生成、只是 8D 没了。批号派生列出现后第一次踩到。
+    """
+    if v is None or isinstance(v, bool):
+        return None
+    if isinstance(v, int):
+        return v if v > 0 else None
+    try:
+        n = len(v)
+    except TypeError:
+        return None
+    return n or None
+
+
 def _count_defects(res):
     """
     数据里能核算出的不良件数 / 率 / 批次数。
@@ -151,22 +170,27 @@ def _count_defects(res):
         # 算出来超过 100% 说明口径错了，宁可留空也不写一个假数字
         rate = None
 
-    # 批次数：分组维度里挑一个最像批次号的，取其水平数
+    # 批次数：分组维度里挑一个最像批次号的，取其水平数。
+    # 批号派生段（名形如「批号#1」）**不算**：它是批号的切片，水平数是供应商数/
+    # 天数，不是批次数。拿它填「涉及批次数」会写进 D2 一个错数字（3 批 vs 实际 30 批），
+    # 而 D2 是要发给客户的第一页。宁可留空，让录入卡提示"算不出，请填"。
     batches = None
     for hs in (res.get("unit_hotspots") or []):
         dim = hs.get("dim") or ""
+        if "#" in dim:
+            continue
         if any(w in dim for w in ("批", "卷", "lot", "batch", "工单", "订单")):
-            lv = hs.get("levels") or []
-            if lv:
-                batches = len(lv)
+            batches = _n_levels(hs.get("levels"))
+            if batches:
                 break
     if batches is None:
         for gc in (res.get("group_compare") or []):
             dim = gc.get("dimension") or ""
+            if "#" in dim:
+                continue
             if any(w in dim for w in ("批", "卷", "lot", "batch")):
-                g = gc.get("groups") or []
-                if g:
-                    batches = len(g)
+                batches = _n_levels(gc.get("groups"))
+                if batches:
                     break
     return {"defects": total, "rate": rate, "batches": batches, "rows": rows}
 

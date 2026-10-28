@@ -652,6 +652,8 @@ AUDIT_FILES = [
     os.path.join("lib", "degrade.py"),
     # 规则 58 要读 ingest 侧"键不存在就不去重"的承诺，不复制过去副本里没这个文件
     os.path.join("lib", "ingest.py"),
+    # 规则 59 要读 lotcode 侧"流水号不进分组"的判据
+    os.path.join("lib", "lotcode.py"),
     # 规则 56：原生 Word/PDF 导出。判据同时读 export_doc.py 与 pipeline.py，
     # 变异要注入这两个文件——缺了 export_doc.py 会静默 SKIP（不是 FAIL）
     os.path.join("lib", "export_doc.py"),
@@ -1114,6 +1116,7 @@ PIPELINE_FILE = os.path.join("lib", "pipeline.py")
 MSA_FILE = os.path.join("lib", "msa.py")
 EXPORT_FILE = os.path.join("lib", "export_doc.py")
 INGEST_FILE = os.path.join("lib", "ingest.py")
+LOT_FILE = os.path.join("lib", "lotcode.py")
 PREPROCESS_FILE = os.path.join("lib", "preprocess.py")
 SPCPy = os.path.join("lib", "spc.py")
 CONTRACT_FILE = os.path.join("lib", "contract.py")
@@ -2270,6 +2273,58 @@ def rule_export_native():
     return _r(True, "", {"n_checks": 7})
 
 
+def rule_lot_segment():
+    """批号里提取的分组维度，不能是流水号。
+
+    这条要防的是一种**看起来极有说服力、实际完全无用**的结论：
+    把流水号当分组维度。按流水号分组，η² 会很高、p 值会很小，报告会写
+    "批号第 3 段对不良率有显著影响"——现场能做的事是零，因为"第几个"
+    不是可调整的工艺条件，D5 措施根本写不出来。
+
+    判据落在判定动作与排除动作上：
+      * 序号识别必须真的参与判定（不是有这个函数就算）；
+      * 序号段的 η² 必须写明"不能直接采信"（那个 η² 是混杂出来的）；
+      * 派生列必须排除在 SPC/相关性之外，否则日期编码会被当测量值画控制图；
+      * 拆不准必须提示 --lot-pattern，不能静默略过。
+    """
+    p = _read(PIPELINE_FILE) or ""
+    g = _read(LOT_FILE) or ""
+    if not p or not g:
+        return _r(False, "读不到 lib/pipeline.py 或 lib/lotcode.py")
+    # 1) 两个导入分支都登记
+    if p.count("import lotcode as LC") < 2:
+        return _r(False, "两个导入分支没有都登记 lotcode")
+    # 2) 序号识别必须参与种类判定（不是"有这个函数"就算）
+    if not re.search(r"elif _is_sequence\(seg\):[^\n]*\n"
+                     r"(?:[ \t]*#[^\n]*\n)*"
+                     r"[ \t]*kind = \"sequence\"", g):
+        return _r(False, "序号识别没有参与段分类：流水号会被当成可分组维度")
+    # 3) 序号段的 η² 必须标注不可采信（它很可能是混杂出来的）
+    if '"eta2_note"' not in g:
+        return _r(False, "序号段的高 η² 没有标注混杂风险：会被当成显著分组依据")
+    # 4) SPC 数值列必须排除派生列。
+    #    判据锚在 numcols 那一行上——不能只查 "c not in _lot_d" 这个字样：
+    #    相关性那行的 _lot_dd 本身就含这个子串，抹掉 SPC 这行照样命中（实测踩过）。
+    if not re.search(r"numcols = \[c for c in work\.numeric_columns\(\)\n"
+                     r"[ \t]*if c not in _lot_d\b", p):
+        return _r(False, "SPC 数值列没有排除批号派生列："
+                         "日期编码（20260401）会被当成测量参数画控制图")
+    # 5) 相关性/归因的数值列同样要排除（漏这一处，日期编码照样进相关矩阵）
+    if "if c != tcol and c not in _lot_dd" not in p:
+        return _r(False, "相关性分析的数值列没有排除批号派生列："
+                         "日期编码会与工艺参数算出假相关")
+    # 6) 派生列不能被算进"未识别列"（否则报告一边说已提取、一边报警告）
+    if "_lot_cols" not in p or "if c not in _lot_cols" not in p:
+        return _r(False, "批号派生列被算进了未识别列：报告会自相矛盾")
+    # 7) 拆不准要给 --lot-pattern，不能静默略过。
+    #    只数 "请用 --lot-pattern"（两条 no_split 结论里各一处），
+    #    不数模块说明里的那处——否则抹掉一条提示仍然凑够数（实测踩过）。
+    if g.count('"status": "no_split"') < 2 or g.count("请用 --lot-pattern") < 2:
+        return _r(False, "拆不准时没有在结论里给出 --lot-pattern："
+                         "使用者会以为批号列被忽略了")
+    return _r(True, "", {"n_checks": 7})
+
+
 def rule_ingest_incremental():
     """多批次摄入必须"合并且去重"，而不是把文件一个个分开算。
 
@@ -3379,6 +3434,40 @@ AUDIT_RULES = [
                   _sub('"本次的 SPC 与 Cpk 仍按**全量合并后**的数据计算——"',
                        '"本次的 SPC 与 Cpk 按本次数据计算——"'),
                   PIPELINE_FILE)]),
+    Rule("批号里提取的分组维度不能是流水号，派生列不能污染数值分析",
+         rule_lot_segment,
+         "（1）pipeline 两个导入分支都登记 lotcode；"
+         "（2）序号识别真的参与段分类（_is_sequence → sequence）；"
+         "（3）序号段的高 η² 标注混杂风险，不当显著依据；"
+         "（4）派生列从 SPC 与相关性里排除（日期编码不是测量值）；"
+         "（5）派生列不算「未识别列」（否则报告自相矛盾）；"
+         "（6）拆不准时提示 --lot-pattern，不静默略过",
+         LOT_FILE,
+         [_mutant("两个导入分支只留一个（另一条路径 NameError）",
+                  _sub("        from . import lotcode as LC\n", ""),
+                  PIPELINE_FILE),
+          _mutant("序号识别不参与判定（流水号被当成可分组维度）",
+                  _sub("    elif _is_sequence(seg):\n"
+                       "        # 序号段：不连续成块 + 数字部分随行号递增。按它分组＝问\n"
+                       "        # \"第 7 个和第 12 个有没有区别\"，对追根因毫无用处。\n"
+                       "        kind = \"sequence\"\n",
+                       "    elif False:\n"
+                       "        kind = \"sequence\"\n"),
+                  LOT_FILE),
+          _mutant("序号段的高 η² 不标注混杂风险（被当成显著分组依据）",
+                  _sub('                st["eta2_note"] = ', '                pass  # '),
+                  LOT_FILE),
+          _mutant("派生列不排除出 SPC（日期编码被当测量值画控制图）",
+                  _sub("                   if c not in _lot_d\n",
+                       "                   if True\n"),
+                  PIPELINE_FILE),
+          _mutant("派生列不排除出相关性（日期编码与工艺参数算出假相关）",
+                  _sub("if c != tcol and c not in _lot_dd",
+                       "if c != tcol"),
+                  PIPELINE_FILE),
+          _mutant("拆不准时静默略过（使用者以为批号列被忽略）",
+                  _re_sub(r"请用 --lot-pattern 给出正则", "该列无法拆解"),
+                  LOT_FILE)]),
 ]
 
 
