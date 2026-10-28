@@ -493,6 +493,8 @@ def scan_param_chain():
         # 免得多一次"忘了传就没有"的踩坑。
         "export_docx": "--no-docx（反向开关：默认导出 Word，传了才不导）",
         "export_pdf": "--no-pdf（反向开关：默认导出 PDF，传了才不导）",
+        "exclude_enabled": "--no-exclude（反向开关：默认开启无效段排除，传了才关；"
+                          "排除这件事本身就该默认做，不存在需要正向去开的场景）",
     }
     for p in sig:
         flag = "--" + p.replace("_", "-")

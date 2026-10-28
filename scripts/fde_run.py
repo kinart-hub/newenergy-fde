@@ -616,6 +616,7 @@ AUDIT_FILES = [
     os.path.join("scripts", "package.py"),
     os.path.join("scripts", "fde_run.py"),
     os.path.join("lib", "pipeline.py"),
+    os.path.join("lib", "exclude.py"),
     os.path.join("lib", "preprocess.py"),
     os.path.join("lib", "hotswap.py"),
     os.path.join("lib", "kbstore.py"),
@@ -1117,6 +1118,7 @@ MSA_FILE = os.path.join("lib", "msa.py")
 EXPORT_FILE = os.path.join("lib", "export_doc.py")
 INGEST_FILE = os.path.join("lib", "ingest.py")
 LOT_FILE = os.path.join("lib", "lotcode.py")
+EXCLUDE_FILE = os.path.join("lib", "exclude.py")
 PREPROCESS_FILE = os.path.join("lib", "preprocess.py")
 SPCPy = os.path.join("lib", "spc.py")
 CONTRACT_FILE = os.path.join("lib", "contract.py")
@@ -2271,6 +2273,80 @@ def rule_export_native():
             return _r(False, "%s 导出失败未同时进 warnings 与 degraded_sections："
                              "少了交付形态却没人知道" % _nm)
     return _r(True, "", {"n_checks": 7})
+
+
+def rule_exclude_invalid_segments():
+    """停机/换卷/首件段必须从逐点统计里剔出去，但不能伪造相邻关系。
+
+    这条规则盯的是两个方向相反、却同样致命的失效：
+
+      A. 不剔 —— 冻结段把 σ 压小、Cpk 虚高（明明能力不够却判合格）；
+         恢复段把 σ 撑大、Cpk 虚低（明明受控却判不合格）。
+         两者都不报错，报告看起来都是"算出来了"。
+
+      B. 剔了却处理错了接缝 —— 剔行之后前后两块被强行拼在一起，
+         接缝处凭空出现一个从未发生过的差分，σ_within 被抬高、
+         控制限被撑宽，最该报警的点反而落回限内。
+         这是这一条规则真正难守的地方：代码看着还在"做排除"，
+         实际把过程 alarm 的灵敏度悄悄调低了。
+
+    判据全部落在**动作与赋值**上，且锚定到具体那一行：
+    只查"有没有 blocks() 调用"会漏掉 seams 参数被内部清空的写法。
+    """
+    p = _read(PIPELINE_FILE) or ""
+    g = _read(EXCLUDE_FILE) or ""
+    if not p or not g:
+        return _r(False, "读不到 lib/pipeline.py 或 lib/exclude.py")
+    # 1) 两个导入分支都登记（只改一套会在另一种导入方式下 NameError）
+    if p.count("import exclude as XCL") < 2:
+        return _r(False, "两个导入分支没有都登记 exclude")
+    # 2) 必须发生在所有统计之前。
+    #    锚定在"缺陷识别"注释行之前——那是 6 之后各节统计的起点，
+    #    放在它后面等于只给报告加了一段话，污染已经进了所有数字。
+    _pos_exc = p.find("_exc = XCL.detect(")
+    _pos_stat = p.find("# 6. 缺陷识别与 Pareto")
+    if _pos_exc <= 0 or _pos_stat <= 0 or _pos_exc > _pos_stat:
+        return _r(False, "无效段排除没有发生在统计之前："
+                         "剔晚了等于没剔，数字已经算完了")
+    # 3) 删行后必须重算时间列（这是最容易漏、也最难发现的一处：
+    #    数据看着正常，结论整体偏一格）
+    if not re.search(r"^[ \t]*times = PP\.parse_time_column\(work\)\[1\]",
+                     p, re.M):
+        return _r(False, "剔除行之后没有重算时间列：每一行的时间都会错位")
+    # 3b) 第二份时间变量 _times 也要同步裁。
+    #     zip(times, mask) 的形态才算是"按保留标记过滤"，只写 _times 不能算。
+    if not re.search(r"_times = \[t for t, m in zip\(_times, _exc\[.mask.\]\) if m\]", p):
+        return _r(False, "另一份时间变量 _times 没有同步裁剪："
+                         "规格版本化按行取生效版本时会用错位的时间")
+    # 4) SPC 必须只在连续块内做
+    if "vals = _slice(work.numeric_column(c))" not in p:
+        return _r(False, "SPC 没有按连续块切片：会跨接缝求差分，"
+                         "把 σ_within 抬高、控制限撑宽")
+    if "_times_local = _slice(_times)" not in p:
+        return _r(False, "规格版本化取的时间没有跟着切片：values 与 times 长度不一致")
+    # 5) seams 必须真的用上。判据不能只看函数签名里有 seams：
+    #    把参数在函数体首行清空也能通过签名检查（变异 4 就是这么做的）。
+    if re.search(r"def blocks\(mask, seams=\(\)\):\s*\n\s*seams = \(\)", g):
+        return _r(False, "blocks 收到 seams 后立刻清空：接缝不会被断块")
+    if "(i - 1) in seamset" not in g:
+        return _r(False, "接缝两侧都保留时不断块：两坨隔了几小时的数据会被当成相邻观测")
+    # 6) 剔除必须可见（给回原始行号，客户能回源核对）
+    if "_e[\"row_from\"] = _src_before[_a]" not in p:
+        return _r(False, "被剔除的行没有换算成原始文件行号：客户没法回源文件核对")
+    if "无效段排除（停机 / 换卷 / 首件 / 断流）" not in p:
+        return _r(False, "报告里没有无效段小节：使用者不知道这批数字剔过什么")
+    # 7) 安全阀：判据显然用错了要整体放弃，而不是把半个数据集删掉。
+    #    注意别去查常量值是多少（那是可调阈值，规定具体数字会把正当调整判死），
+    #    要查的是"这条比较真的进了 if"——变异测试为此专门对着这一行下手。
+    if "if n_ex and (kept < MIN_KEPT_ROWS or kept * 1.0 / n < MIN_KEPT_RATIO):" not in g:
+        return _r(False, "剔除比例的安全线没有参与判定：规则暴走时会把产品当噪声删掉")
+    if '"attempted": n_ex' not in g:
+        return _r(False, "放弃剔除时没有交代原本识别出多少行：使用者看不出该人工核对")
+    # 8) 自动推定必须以读数交叉验证（防把停机推定成在产、剔反方向）
+    if "_cross_check_running(" not in g:
+        return _r(False, "状态列缺少读数交叉验证："
+                         "设备大部分时间停机时会把停机推定成在产状态，剔反方向")
+    return _r(True, "", {"n_checks": 9})
 
 
 def rule_lot_segment():
@@ -3468,6 +3544,42 @@ AUDIT_RULES = [
           _mutant("拆不准时静默略过（使用者以为批号列被忽略）",
                   _re_sub(r"请用 --lot-pattern 给出正则", "该列无法拆解"),
                   LOT_FILE)]),
+    Rule("无效段必须排除，但排除不许伪造相邻关系",
+         rule_exclude_invalid_segments,
+         "（1）pipeline 两个导入分支都登记 exclude；"
+         "（2）排除发生在所有统计之前（放在最后等于只给报告加一段话）；"
+         "（3）删行后重算时间列，且同步裁第二份时间变量（否则索引错位）；"
+         "（4）SPC 只在最长连续块内做（跨接缝差分是伪造的波动）；"
+         "（5）接缝 hours两侧都保留也必须断开（blocks 收 seams 参数）；"
+         "（6）报告写明剔了什么、给回原始行号；"
+         "（7）剔除过半时整体放弃（不敢把产品当噪声删了）",
+         EXCLUDE_FILE,
+         [_mutant("两个导入分支只留一个（另一条路径 NameError）",
+                  _sub("        from . import exclude as XCL\n", ""),
+                  PIPELINE_FILE),
+          _mutant("删行后不重算时间列（每一行的时间都错位一格）",
+                  _re_sub(r'^[ \t]*times = PP\.parse_time_column\(work\)\[1\][ \t]*\n',
+                          "", flags=re.M),
+                  PIPELINE_FILE),
+          _mutant("SPC 不按连续块切片（跨接缝求差分，σ 抬高等价于放宽控制限）",
+                  _sub("            vals = _slice(work.numeric_column(c))\n",
+                       "            vals = work.numeric_column(c)\n"),
+                  PIPELINE_FILE),
+          _mutant("异常断流不参与切块（接缝两侧当成相邻观测）",
+                  _sub("def blocks(mask, seams=()):", "def blocks(mask, seams=()):\n    seams = ()"),
+                  EXCLUDE_FILE),
+          # 变异目标必须是"安全线参与判定"的那一行，不是常量本身：
+          # 起初我把 MIN_KEPT_RATIO 改成 0.0 当变异，判据却只检查"存在一个小数值"，
+          # 于是改不改都判过 —— 变异没喊，等于证明不了这条规则有效。
+          _mutant("剔除过半也照剔（把产品当噪声删掉）",
+                  _sub("    if n_ex and (kept < MIN_KEPT_ROWS "
+                       "or kept * 1.0 / n < MIN_KEPT_RATIO):\n",
+                       "    if n_ex and kept < MIN_KEPT_ROWS:\n"),
+                  EXCLUDE_FILE),
+          _mutant("报告不写剔了什么（使用者不知道数字来自哪批数据）",
+                  _sub('rep.text(s2, "**无效段排除（停机 / 换卷 / 首件 / 断流）**")',
+                       "pass"),
+                  PIPELINE_FILE)]),
 ]
 
 

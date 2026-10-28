@@ -9,7 +9,7 @@
 ![License](https://img.shields.io/badge/license-Elastic--2.0-blue)
 ![Python](https://img.shields.io/badge/python-3.8%2B-blue)
 ![Dependencies](https://img.shields.io/badge/dependencies-0-brightgreen)
-![Self-test](https://img.shields.io/badge/selftest-785%20passing-brightgreen)
+![Self-test](https://img.shields.io/badge/selftest-820%20passing-brightgreen)
 
 ![newenergy-fde](assets/social-preview.png)
 
@@ -24,7 +24,7 @@
 git clone https://github.com/kinart-hub/newenergy-fde.git
 cd newenergy-fde
 
-python scripts/selftest.py          # 785 项端到端自检，应全部通过
+python scripts/selftest.py          # 820 项端到端自检，应全部通过
 python scripts/fde_run.py analyze -i examples/01_涂布工艺数据.csv -o output/try
 ```
 
@@ -172,7 +172,15 @@ python scripts/fde_run.py analyze --input examples/09_批号分组数据.csv --o
 python scripts/fde_run.py analyze --input data.csv \
        --lot-pattern "^([A-Z]\d{2})(\d{6})(\d+)$" --outdir out
 
-# 自检（785 项，含设备适配层、跨工序追溯、多企业隔离、行业作用域、基线热更新、设备记忆与知识库演进）
+# 数据里混着停机/换卷段：登记设备状态列，工具自动把非生产段排除出 Cpk/SPC
+python scripts/fde_run.py analyze --input examples/10_含停机换卷段数据.csv \
+       --exclude-status-col 设备状态 --outdir out
+
+# 工艺文件规定换卷后头 3 卷报废：按你的规定剔，工具不做推断
+python scripts/fde_run.py analyze --input data.csv \
+       --exclude-recovery 3 --outdir out
+
+# 自检（820 项，含设备适配层、跨工序追溯、多企业隔离、行业作用域、基线热更新、设备记忆与知识库演进）
 python scripts/selftest.py
 ```
 
@@ -232,7 +240,7 @@ newenergy-fde/
 │       ├── kb_manage.py              知识库管理台（status/list/propose/intake/harvest/
 │   │                             review/sync/verify/cases/devices/industries/update/rollback/patch）
 │   ├── make_device_samples.py    生成多厂商版式的对照样例（同一真值、不同导出）
-│   └── selftest.py               785 项端到端自检（含设备适配层、跨工序追溯、多企业隔离、行业作用域、基线热更新、设备记忆与知识库演进）
+│   └── selftest.py               820 项端到端自检（含设备适配层、跨工序追溯、多企业隔离、行业作用域、基线热更新、设备记忆与知识库演进）
 └── examples/
     ├── *.csv                     九类示例数据（6 类工况 + 私有列名 + 跨规格版本 + 批号分组）
     └── devices/*.csv             六类设备导出样例（竖表/双行表头/单位行/合计行/未知设备)

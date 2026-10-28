@@ -72,10 +72,14 @@ if __package__ in (None, ""):
         from lib import ingest as IG
     except Exception:
         IG = None
-    try:                    # P2-2 批号拆解：从编码里提取可分组前缀段；失败只少一层分组维度
+    try:                    # P2-2 批号拆解；失败只少一层分组维度
         from lib import lotcode as LC
     except Exception:
         LC = None
+    try:                    # P0-3 无效段排除；失败只退化成"全段参与统计"。
+        from lib import exclude as XCL   # 别名不能叫 EX：那个已被 export_doc 占用
+    except Exception:
+        XCL = None
     try:                    # P1-2 原生 Word/PDF 导出；失败只少两种交付形态
         from lib import export_doc as EX
     except Exception:
@@ -115,6 +119,10 @@ else:
         from . import lotcode as LC
     except Exception:
         LC = None
+    try:                    # P0-3 无效段排除（两个分支都要，只改一套会 NameError）
+        from . import exclude as XCL
+    except Exception:
+        XCL = None
     try:                    # P1-2 原生 Word/PDF 导出（两个分支都要，只改一套会 NameError）
         from . import export_doc as EX
     except Exception:
@@ -145,7 +153,7 @@ if EV is not None and EV.__name__ != "lib.events":
 KB = PP.load_knowledge()
 _fmt = RPT._fmt
 
-ANALYZER_VERSION = "2.12.0"
+ANALYZER_VERSION = "2.13.0"
 
 
 # 空数据排查清单。
@@ -169,6 +177,14 @@ _EMPTY_CHECKLIST = [
     "过滤条件：--sheet 指定的工作表不对（Excel 多表文件常见），"
     "或数据行全部落在被剔除的统计尾行、单位行里。",
 ]
+
+
+def _sv_list(raw):
+    """把 '停机,换卷' 这样的命令行串拆成列表；空串/None 一律当没给。"""
+    if not raw:
+        return None
+    out = [x.strip() for x in str(raw).replace("，", ",").split(",") if x.strip()]
+    return out or None
 
 
 def _empty_data_error(stage, detail_lines=None, files=None):
@@ -403,6 +419,8 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
             msa_spec=None, spec_date_col=None,
             input_dir=None, dedup_key=None, on_conflict="last", cursor=None,
             lot_pattern=None,
+            exclude_status_col=None, exclude_status_values=None,
+            exclude_recovery=0, exclude_enabled=True,
             export_xlsx=True, export_docx=True, export_pdf=True,
             d2_card=None, emit_d2_card=True, verbose=False, views=None):
     """
@@ -1249,6 +1267,116 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
                 "排查方向：数值列里混了单位字符（如「12.3 mm」）或千分位逗号时，"
                 "整列会被当成文本；单元格里只写了「/」「-」「NA」等占位符同理。",
             ])
+    # 5c. 无效段识别与排除（评审 P0-3）
+    # 位置必须在这里：时间列已解析（要用来找断流接缝）、目标列已定（要用来找冻结
+    # 段）、而 6 之后的每一节统计都还没开始。放在最后等于只给报告加一段话，
+    # 污染已经进了所有数字。
+    _exc = {"status": "disabled", "items": [], "n_excluded": 0,
+            "seams": [], "blocks": [], "main_block": None, "notes": [], "warnings": []}
+    # 报告里的行号必须是**原始导出文件的行号**：客户拿不到我们内部的下标。
+    # 剔除行之后坐标会整体前移，所以先把映射表留下来再动表。
+    _src_before = list(work.src_rows) if work.src_rows else \
+        [i + 2 for i in range(len(work))]
+    try:
+        _sv_col = exclude_status_col if (exclude_status_col
+                                         and exclude_status_col in work.columns) else None
+        if exclude_status_col and not _sv_col:
+            result.setdefault("warnings", []).append(
+                "--exclude-status-col 指定的列「%s」不在数据里（现有列：%s），"
+                "本次没用它识别非生产段。"
+                % (exclude_status_col, "、".join(work.columns[:8])))
+        _exc = XCL.detect(
+            times=times,
+            status_values=(work.column(_sv_col) if _sv_col else None),
+            status_excluded=(_sv_list(exclude_status_values) if exclude_status_values
+                             else None),
+            target_values=(work.numeric_column(y_col) if y_col else None),
+            recovery=exclude_recovery,
+            enabled=exclude_enabled and XCL is not None)
+    except Exception as _ex_e:
+        # 排除**本身**出错必须说出来。悄悄跳过的话，使用者看到的是一份
+        # 什么都没排除的报告，与"确实没有无效段"长得一模一样。
+        degrade.note("pipeline.analyze@exclude", _ex_e)
+        _exc = {"status": "aborted", "items": [], "n_excluded": 0, "seams": [],
+                "blocks": [], "main_block": None, "aborted": True,
+                "notes": [], "warnings":
+                ["无效段识别环节自身出错（%s），本次没有排除任何行——"
+                 "这不代表数据里没有停机/换卷段。" % _ex_e]}
+    _exc_rows = _exc.get("n_excluded") or 0
+    if _exc_rows:
+        # keep_mask 会同步把 src_rows 裁掉，行级追溯不断。
+        # 这一步之后 work 只剩有效行，下游的 SPC/相关性/分组/8D 全部自动受益。
+        _exc_log = []
+        try:
+            work.keep_mask(_exc["mask"], reason="无效段（停机/换卷/调试/首件）",
+                           log=_exc_log)
+        except Exception as _km_e:
+            degrade.note("pipeline.analyze@keep_mask", _km_e)
+            _exc_log = []
+        # 删行之后必须重算时间列：times 是旧坐标的 list，
+        # 不重算的话每一行的时间都错位，后面所有按时间排序/分段的结论全是错的。
+        try:
+            times = PP.parse_time_column(work)[1]
+        except Exception as _pt_e:
+            degrade.note("pipeline.analyze@reparse_time", _pt_e)
+        # 同一张表的第二份时间变量（第 4 段给"目标列与规格"用的 _times）
+        # 与 times 是两条独立的引用，不会因为改了 times 就跟着变。
+        # 不同步裁 rows 的话，规格版本化按行取生效版本时用的是错位的时间
+        # ——这类"一处改了、另一处没改"的错位最难查：数据看起来正常，结论偏一格。
+        if _time_col and _times and len(_times) == len(_exc["mask"]):
+            try:
+                _times = [t for t, m in zip(_times, _exc["mask"]) if m]
+            except Exception as _tz_e:
+                degrade.note("pipeline.analyze@resync_times", _tz_e)
+        # 接缝换算到新坐标：第 s 行之前（含）保留了 cnt 行，
+        # 那么接缝就落在新数组的第 cnt-1 行之后。
+        _new_seams = []
+        for _s in (_exc.get("seams") or []):
+            _cnt = 0
+            for _k in range(len(_exc["mask"])):
+                if _exc["mask"][_k] and _k <= _s:
+                    _cnt += 1
+            if 0 < _cnt < len(work):
+                _new_seams.append(_cnt - 1)
+        _exc["blocks"] = [list(b) for b in XCL.blocks([True] * len(work), _new_seams)]
+        _lb = XCL.largest_block(XCL.blocks([True] * len(work), _new_seams))
+        _exc["main_block"] = list(_lb) if _lb else None
+        _exc["excluded_rows"] = _exc_log
+        # 被剔的那些行的坐标还在老表上，主分析段的坐标已经在新表上——
+        # 两套坐标混着给出去，报告里的行号就会差一大截。统一成原始文件行号：
+        _kept_src = [s for s, m in zip(_src_before, _exc["mask"]) if m]
+        if _lb:
+            _exc["main_block_rows"] = (_kept_src[_lb[0]], _kept_src[_lb[1]])
+        for _e in (_exc.get("items") or []) + (_exc.get("attempted_items") or []):
+            _a, _b = int(_e.get("start") or 0), int(_e.get("end") or 0)
+            if 0 <= _a < len(_src_before):
+                _e["row_from"] = _src_before[_a]
+                _e["row_to"] = _src_before[min(_b, len(_src_before) - 1)]
+        if len(_exc["blocks"]) > 1:
+            _others = [b for b in _exc["blocks"] if b != (_exc["main_block"] or [])]
+            result.setdefault("warnings", []).append(
+                "有效数据被切成 %d 个连续段（最长段 %d 行，其余 %d 段共 %d 行）。"
+                "控制图以最长段为准——跨段拼接会在接缝处造出假差分，把 σ_within 抬高、"
+                "控制限撑宽，最该报警的点反而落在限内。"
+                % (len(_exc["blocks"]),
+                   (_exc["main_block"][1] - _exc["main_block"][0] + 1)
+                   if _exc["main_block"] else 0,
+                   len(_others), sum(b[1] - b[0] + 1 for b in _others)))
+    for _w in (_exc.get("warnings") or []):
+        result.setdefault("warnings", []).append(_w)
+    _KL = {"status": "非生产状态", "frozen": "数值冻结", "recovery": "过渡/首件",
+           "gap": "断流接缝"}
+    _exc_out = {k: v for k, v in _exc.items()
+                if k not in ("mask", "segments", "seams", "excluded_rows")}
+    for _e in (_exc_out.get("items") or []) + (_exc_out.get("attempted_items") or []):
+        _e["kind_label"] = _KL.get(_e.get("kind"), _e.get("kind"))
+    _exc_out["had_status_col"] = bool(_sv_col) or bool(exclude_status_values)
+    _exc_out["excluded_rows"] = [
+        {"row": e.get("row"), "file": e.get("file"), "reason": e.get("reason")}
+        for e in (_exc.get("excluded_rows") or [])][:200]
+    _exc_out["n_rows_listed"] = len(_exc.get("excluded_rows") or [])
+    result["excluded_segments"] = _exc_out
+
     # 6. 缺陷识别与 Pareto
     # P2-4：关键步骤埋耗时。只记整轮时长等于什么都没记——
     # 慢在哪一步不知道，就只能在最热的那个环节上瞎猜。
@@ -1335,6 +1463,17 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
     try:  # 护栏：SPC 环节失败只降级本节，不中断整轮
         # 7. SPC
         spc_res = []
+        # 有效行的第二段约束：只在**最长连续块**内做逐点统计。
+        # 行级排除解决了"停机/换卷行本身"的污染，但 接缝两侧的假差分
+        # （相邻两行其实隔了三小时）会在 MR 里造出一个伪突变，把 σ_within 抬高。
+        # 控制图因此我们只看最长那一块，其余块的行数在警告里点名。
+        _blk = (_exc.get("main_block") if isinstance(_exc, dict) else None)
+
+        def _slice(vs):
+            if not _blk or len(vs) < _blk[1] + 1:
+                return vs
+            return vs[_blk[0]:_blk[1] + 1]
+
         _lot_d = set(getattr(work, "lot_derived", ()) or ())
         numcols = [c for c in work.numeric_columns()
                    if c not in _lot_d
@@ -1371,7 +1510,8 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
             if QG.column_role(c, work.numeric_column(c) if c in work.columns else None) \
                     not in ("measure", "count"):
                 continue
-            vals = work.numeric_column(c)
+            vals = _slice(work.numeric_column(c))
+            _times_local = _slice(_times) if _times else None
             key = col_map.get(c)
             spec = KB["params"].get(key, {}) if key else {}
             ctrl = spec.get("control", {})
@@ -1387,7 +1527,7 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
             _seg = None
             if _spec_reg is not None and _spec_reg.is_versioned(c):
                 try:
-                    _seg = _spec_reg.split(c, vals, _times)
+                    _seg = _spec_reg.split(c, vals, _times_local)
                 except Exception as _sp_e:
                     degrade.note("pipeline.specver@split", _sp_e)
                     _seg = None
@@ -2818,6 +2958,65 @@ def build_report(res, work, spc_res, corr, assoc, pare, root, gaps, conf,
                                 "能力指数必须用全部数据，只用增量算出来的 Cpk 没有意义。",
                             "info")
 
+    # 2a-bis. 无效段排除：报告必须说清"剔了多少、按什么剔、还剩多少"。
+    #  这是 P0-3 的核心交付——停机/换卷段混进 Cpk 会把结论带向两个相反的方向
+    #  （冻结段让 σ 变小、Cpk 虚高；恢复段让 σ 变大、Cpk 虚低），两者都看起来像算出来了。
+    _exc_rep = res.get("excluded_segments") or {}
+    if _exc_rep.get("status") not in (None, "disabled"):
+        rep.text(s2, "**无效段排除（停机 / 换卷 / 首件 / 断流）**")
+        _ex_note = list(_exc_rep.get("notes") or [])
+        if _exc_rep.get("attempted"):
+            _cb = ("**未执行剔除**：规则识别出 %d 行疑似无效段，剔除后仅剩 %d 行，"
+                   "低于安全线。" % (_exc_rep["attempted"], _exc_rep.get("n_kept") or 0))
+            rep.callout(s2, _cb + "这多半是把判据套到了采样本就稀疏的数据上，"
+                                 "而不是真有那么多停机。请人工核对后再决定是否显式登记状态列。",
+                        "warn")
+        elif _exc_rep.get("n_excluded"):
+            rep.kv(s2, [
+                ("总行数 → 有效行", "%s → %s"
+                 % (_exc_rep.get("n_total"), _exc_rep.get("n_kept"))),
+                ("排除行数", "%s 行（%.1f%%）"
+                 % (_exc_rep.get("n_excluded"),
+                    (_exc_rep.get("n_excluded") or 0) * 100.0
+                    / max(1, _exc_rep.get("n_total") or 1))),
+                ("发现断流接缝", "%s 处" % (_exc_rep.get("n_seams") or 0)),
+                ("有效数据被切成", "%s 个连续段" % len(_exc_rep.get("blocks") or [])),
+            ])
+            _it_rows = []
+            for it in XCL.merge_items(_exc_rep.get("items") or [])[:12]:
+                _rs = it.get("row_from") or ((it.get("start") or 0) + 1)
+                _re = it.get("row_to") or ((it.get("end") or 0) + 1)
+                _it_rows.append([it.get("kind_label") or it.get("kind"),
+                                 "第 %s–%s 行" % (_rs, _re), _re - _rs + 1,
+                                 it.get("evidence") or it.get("reason") or "—"])
+            _mb = _exc_rep.get("main_block_rows")
+            if _mb and len(_exc_rep.get("blocks") or []) > 1:
+                rep.text(s2, "本次控制图绘制在第 %s–%s 行这一段上（共 %d 段的连续区段中"
+                             "最长的一段）。" % (_mb[0], _mb[1],
+                                              len(_exc_rep.get("blocks") or [])))
+            if _it_rows:
+                rep.text(s2, "被排除的每一段（行号为原始导出文件的行号，可直接回源核对）：")
+                rep.table(s2, ["类型", "行范围", "行数", "依据"], _it_rows)
+            rep.callout(
+                s2,
+                "排除走的是「标记」，不是「删除」：上面每一段都留了行号，回源文件一查就知道"
+                "有没有误伤真实产品。**控制图在下述连续段中最长的那一段内绘制**——"
+                "跨接缝（中间几小时没采到数）求相邻差分会凭空造出一个巨大波动，"
+                "把 σ_within 抬高、控制限撑宽，最该报警的点反而落回限内。", "info")
+        else:
+            rep.callout(s2, "未识别到需要排除的无效段：相邻采样间隔无异常放大、"
+                            "目标列无连续冻结段、%s。"
+                            % ("已按你登记的设备状态列逐行核对过"
+                               if _exc_rep.get("had_status_col") else
+                               "数据里也没有给出设备状态列"), "info")
+            if not _exc_rep.get("had_status_col"):
+                rep.text(s2, "提示：连续生产（卷对卷涂布、挤出、拉晶、连铸等）"
+                             "的导出通常混着停机与换卷段。若现场确实有，"
+                             "请用 `--exclude-status-col <状态列名>` 登记，"
+                             "或按工艺文件用 `--exclude-recovery N` 剔除每段开头的过渡品。")
+        for _n in _ex_note:
+            rep.text(s2, _n)
+
     devs = res.get("devices") or []
     if devs:
         d0 = devs[0]
@@ -3796,6 +3995,20 @@ def main():
                     help="批号拆解正则（带捕获组），如 '^(\\w{5})-(\\d{8})-(\\w+)$'。"
                          "不给时自动按分隔符/字母前缀试拆；拆不准会明说并提示用这个参数，"
                          "不会按位置硬切（那会把供应商代码切掉一半）")
+    ap.add_argument("--exclude-status-col", default=None,
+                    help="哪一列是设备状态列（登记事实，不是给统计参数）。给出来后，"
+                         "同一种状态连续出现且占比不是最高的那些行会被判为非生产段。"
+                         "例：运行/停机/换卷混在一列时，「运行」被推定为在产状态")
+    ap.add_argument("--exclude-status-values", default=None,
+                    help="显式登记哪些状态值算「没在生产」（逗号分隔），如 '停机,换卷,调试'。"
+                         "不给时由数据自己推定（占行数最多的那个取值即在产状态）")
+    ap.add_argument("--exclude-recovery", type=int, default=0,
+                    help="工艺文件规定：每个连续生产段开头几行属于过渡/调整品，必须剔除"
+                         "（如换卷后头 3 卷、开机暖机头 5 件）。这是你们的工艺规定，"
+                         "工具不做推断，你登记几行就剔几行")
+    ap.add_argument("--no-exclude", action="store_true",
+                    help="完全关闭无效段识别（数据已人工清干净时用）。默认开启，"
+                         "因为睡着了不知道比报错更贵：停机段既可能让 Cpk 虚高也可能让它虚低")
     ap.add_argument("--cursor", default=None,
                     help="增量游标文件路径（如 out/.state/mes_cursor.json）。给出后报告会写明"
                          "本次新增了哪些文件、追加了多少行；首次运行自动建立基准")
@@ -3904,6 +4117,10 @@ def main():
                              if args.dedup_key else None),
                   on_conflict=args.dedup_conflict, cursor=args.cursor,
                   lot_pattern=getattr(args, "lot_pattern", None),
+                  exclude_status_col=getattr(args, "exclude_status_col", None),
+                  exclude_status_values=getattr(args, "exclude_status_values", None),
+                  exclude_recovery=getattr(args, "exclude_recovery", 0) or 0,
+                  exclude_enabled=not getattr(args, "no_exclude", False),
                   do_doe=not args.no_doe, auto_adapt=args.auto_adapt,
                   tenant=args.tenant, industry=args.industry, rules=args.rules,
                   spc_exclusion_mode=args.spc_exclusion_mode,

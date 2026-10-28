@@ -4647,6 +4647,210 @@ def test_decision_records_uniform():
         check("混入 dict 也能完成去重（原实现在这里 TypeError）", False, repr(_ex))
 
 
+def test_exclude_invalid_segments():
+    """无效段识别与排除（评审 P0-3）。
+
+    停机/换卷/首件段混在连续生产的导出里，是这类数据最隐蔽的一个坑：
+    它不报错、不缺列，Cpk 照算，只是冻结段把 σ 压小（虚高）、恢复段把 σ 撑大（虚低），
+    两个方向都看起来像"算出来了"。
+
+    本模块最容易被写错、也最容易蒙混过关的一点是：**接缝必须断开控制图**。
+    剔行之后把前后两块强行拼在一起，会在接缝处造出一个从未发生过的差分，
+    把 σ_within 抬高、控制限撑宽——最该报警的点反而落回限内。
+    下面第 7–9 条就是专门盯着这件事的。
+    """
+    print("\n[无效段排除：停机/换卷/首件/断流]")
+    import datetime as D
+    import tempfile
+    from lib import exclude as XCL, table as TB, pipeline as PL
+
+    # ---------- A. 状态列：推定不许猜，判不出来就直说 ----------
+    sv = ["运行"] * 60 + ["停机"] * 10 + ["运行"] * 40 + ["换卷"] * 8 + ["运行"] * 50
+    inf = XCL.pick_status_values(sv)
+    check("状态列能为设备状态列推定非在产值",
+          set(inf.get("values") or []) == {"停机", "换卷"}
+          and inf.get("assumed_running") == "运行",
+          str(inf.get("values")))
+    check("只有一种取值时不推定（无从区分在产与非在产）",
+          XCL.pick_status_values(["运行"] * 50)["values"] == [], "")
+    jumpy = ["A" if i % 2 else "B" for i in range(60)]
+    check("逐行跳变的列不推定（工况不会每行一变）",
+          XCL.pick_status_values(jumpy)["values"] == []
+          and "连续出现" in (XCL.pick_status_values(jumpy).get("reason") or ""), "")
+    check("取值过多时不推定（那是流水号/名称，不是工况）",
+          XCL.pick_status_values(["V%02d" % (i % 13) for i in range(60)])["values"] == [], "")
+    # 三种工况、最大的那个只占 40% —— 这时自动推定会把「停机」当成在产状态，
+    # 反过来把真正在产的行剔掉，所以必须拒绝并交给人。
+    halfish = ["停机"] * 24 + ["运行"] * 20 + ["换卷"] * 16
+    ci = XCL.pick_status_values(halfish)
+    check("占比最大的取值也不到一半时不敢自动剔",
+          ci["values"] == [] and "恐怕大部分时间没在生产" in (ci.get("reason") or ""),
+          (ci.get("reason") or "")[:40])
+
+    # ---------- B. 接缝必须断开（本模块的核心保证） ----------
+    check("无接缝时为整块", XCL.blocks([True] * 100) == [(0, 99)], str(XCL.blocks([True] * 100)))
+    check("两侧都保留也必须在接缝处断开",
+          XCL.blocks([True] * 100, [49]) == [(0, 49), (50, 99)],
+          str(XCL.blocks([True] * 100, [49])))
+    check("残段少于最小段长会被丢弃（噪声段不成图）",
+          XCL.blocks([True] * 50 + [False] + [True, True] + [False] + [True] * 20)
+          == [(0, 49), (54, 73)],
+          str(XCL.blocks([True] * 50 + [False] + [True, True] + [False] + [True] * 20)))
+    check("多个接缝切成多块",
+          len(XCL.blocks([True] * 90, [29, 59])) == 3,
+          str(XCL.blocks([True] * 90, [29, 59])))
+    check("largest_block 取最长的一段",
+          XCL.largest_block([(0, 9), (10, 39), (40, 44)]) == (10, 39), "")
+
+    # ---------- C. detect：三条规则 + 工艺登记 ----------
+    t0 = D.datetime(2026, 3, 1, 6, 0, 0)
+    n = 120
+
+    def mktimes(jumps=()):       # jumps = 在第 i 行之后插入 3 小时断流
+        ts, p = [], t0
+        for i in range(n):
+            ts.append(p)
+            if i in jumps:
+                p = p + D.timedelta(hours=3)
+            p = p + D.timedelta(minutes=5)
+        return ts
+
+    # 真实测量值总带末位抖动，不会像 i%7 那样来回循环；
+    # 用循环值构造会让"列的取值多样性"失真，进而误触发失去保护的分支。
+    _rd = __import__("random").Random(11)
+    tv = [100.0] * 20 + [round(120.0 + _rd.gauss(0, 1.0), 3) for _ in range(100)]
+    # gap 单独测：不给目标列，免得冻结规则掺进来，让人分不清"接缝"和"冻结"各自的账
+    d_gap = XCL.detect(times=mktimes(jumps=(59,)), status_values=None,
+                       target_values=None, recovery=0)
+    check("断流接缝被识别出来",
+          (d_gap.get("n_seams") or 0) == 1 and d_gap["n_excluded"] == 0,
+          "seams=%s excluded=%s" % (d_gap.get("n_seams"), d_gap.get("n_excluded")))
+    check("断流**不删行**（那两行都是真实读数，只是不相邻）",
+          all(d_gap["mask"]),
+          "有行被剔了：%d 行" % d_gap.get("n_excluded", 0))
+    check("断流把数据切成两块（这是它的唯一用途）",
+          len(d_gap.get("segments") or []) == 2,
+          str(d_gap.get("segments")))
+
+    d_fr = XCL.detect(times=None, target_values=tv, recovery=0)
+    check("数值冻结段被排除（设备没在动）",
+          d_fr["n_excluded"] == 19 and d_fr["items"][0]["kind"] == "frozen",
+          "excluded=%s kinds=%s" % (d_fr.get("n_excluded"),
+                                    [i["kind"] for i in d_fr["items"]][:3]))
+    check("冻结段保留段首那一行（它是最后一个真实读数）",
+          d_fr["items"][0]["start"] == 1 and d_fr["items"][0]["end"] == 19,
+          str(d_fr["items"][0]))
+    d_st = XCL.detect(times=None, status_values=sv, recovery=0)
+    check("非在产状态段被排除",
+          d_st["n_excluded"] == 18 and {i["kind"] for i in d_st["items"]} == {"status"},
+          "excluded=%s" % d_st.get("n_excluded"))
+    d_rc = XCL.detect(times=mktimes(jumps=(59,)), target_values=None, recovery=3)
+    _rc = [i for i in d_rc["items"] if i["kind"] == "recovery"]
+    check("工艺登记的过渡品：每个连续段开头都剔",
+          len(_rc) == 2 and _rc[0]["start"] == 0 and _rc[1]["start"] == 60,
+          str([(i["start"], i["end"]) for i in _rc]))
+    d_off = XCL.detect(times=mktimes(jumps=(59,)), status_values=sv, target_values=tv,
+                       enabled=False)
+    check("明确关闭时一行不剔", d_off["n_excluded"] == 0
+          and d_off["status"] == "disabled", "")
+
+    # ---------- D. 安全阀：判据显然用错了就整体放弃 ----------
+    # 85 行"停机"（读数冻在 100.0）+ 15 行"运行"（读数在波动）。
+    # 只按占比推定的话会把"停机"当成在产状态，反而把仅有的在产数据剔掉
+    # ——这就是为什么推定必须拿读数做交叉验证。
+    _tv2 = [100.0] * 85 + [round(120.0 + (i % 11) * 0.37, 3) for i in range(15)]
+    mostly_bad = ["停机"] * 85 + ["运行"] * 15
+    ci2 = XCL.pick_status_values(mostly_bad, target_values=_tv2)
+    check("推定出的『在产状态』读数几乎不变时拒绝推定（防方向剔反）",
+          ci2["values"] == [] and "更像停机" in (ci2.get("reason") or ""),
+          (ci2.get("reason") or "")[:60])
+    _rd2 = __import__("random").Random(13)
+    ci3 = XCL.pick_status_values(
+        mostly_bad,
+        target_values=[round(100.0 + _rd2.gauss(0, 1.0), 3) for _ in range(100)])
+    check("两组读数都在正常波动时仍照占比推定（不因噎废食）",
+          ci3.get("assumed_running") == "停机" and set(ci3.get("values") or []) == {"运行"},
+          str(ci3.get("values")))
+    # 冻结规则剔到超过一半时才触发安全阀：这类"规则暴走"多半是判据用错了对象
+    _tv4 = [100.0] * 60 + [round(120.0 + (i % 37) * 0.13, 3) for i in range(40)]
+    d_ab = XCL.detect(times=None, status_values=None, target_values=_tv4)
+    check("剔除后样本不足时放弃剔除（不敢把产品当噪声删了）",
+          d_ab.get("aborted") and d_ab["n_excluded"] == 0 and d_ab["status"] == "aborted",
+          "status=%s ex=%s" % (d_ab.get("status"), d_ab.get("n_excluded")))
+
+    # ---------- E. 同一段被多条规则命中不许重复计数 ----------
+    _mk = [{"kind": "status", "start": 40, "end": 59, "reason": "r", "evidence": "e"},
+           {"kind": "frozen", "start": 41, "end": 59, "reason": "r", "evidence": "e"}]
+    _mg = XCL.merge_items(_mk)
+    check("多条规则命中同一区间合并成一条", len(_mg) == 1, str(len(_mg)))
+    check("合并后注明互为印证（否则读者会把行数加成两份）",
+          "不重复计数" in (_mg[0].get("evidence") or "")
+          and _mg[0].get("corroborated_by") == ["frozen"],
+          (_mg[0].get("evidence") or "")[:50])
+    check("独立的两段不会被误合并",
+          len(XCL.merge_items([{"kind": "a", "start": 0, "end": 5},
+                               {"kind": "b", "start": 9, "end": 12}])) == 2, "")
+
+    # ---------- F. 端到端：examples/10 ----------
+    f10 = os.path.join(ROOT, "examples", "10_含停机换卷段数据.csv")
+    if not os.path.exists(f10):
+        check("示例 10（含停机换卷段）存在", False, f10)
+        return
+    check("示例 10（含停机换卷段）存在", True, "")
+    tmp = tempfile.mkdtemp(prefix="excl-")
+    try:
+        res = PL.analyze([f10], outdir=os.path.join(tmp, "out"),
+                         exclude_status_col="设备状态", export_xlsx=False,
+                         export_docx=False, export_pdf=False)
+        ex = res.get("excluded_segments") or {}
+        check("端到端：登记状态列后剔掉了三段非生产数据",
+              (ex.get("n_excluded") or 0) == 60 and len(ex.get("items") or []) >= 3,
+              "excluded=%s items=%d" % (ex.get("n_excluded"), len(ex.get("items") or [])))
+        check("端到端：有效行数 = 总行数 − 剔除数",
+              (ex.get("n_total") or 0) - (ex.get("n_excluded") or 0)
+              == (ex.get("n_kept") or -1), str(ex.get("n_kept")))
+        check("端到端：剔除的行都能给回原始文件行号（客户可回源核对）",
+              all(i.get("row_from") and i.get("row_to")
+                  for i in (ex.get("items") or [])) and (ex.get("items") or []),
+              str([(i.get("row_from"), i.get("row_to")) for i in (ex.get("items") or [])][:2]))
+        check("端到端：断流接缝把数据切成了 2 块",
+              (ex.get("n_seams") or 0) == 1 and len(ex.get("blocks") or []) == 2,
+              "seams=%s blocks=%s" % (ex.get("n_seams"), len(ex.get("blocks") or [])))
+        check("端到端：主分析段落在两块里较长的那块",
+              (ex.get("main_block_rows") or [0, 0])[1]
+              > (ex.get("main_block_rows") or [0, 0])[0] + 600,
+              str(ex.get("main_block_rows")))
+        _rep = os.path.join(tmp, "out", "工艺分析报告.md")
+        _txt = io.open(_rep, encoding="utf-8").read() if os.path.exists(_rep) else ""
+        check("端到端：报告里能看见剔了什么（不是只在 JSON 里）",
+              "无效段排除" in _txt and "60 行" in _txt, "")
+        check("端到端：报告写明控制图只画最长那一段",
+              "控制图绘制在第" in _txt, "")
+        # 不登记状态列时，纯结构性规则仍应起效（不能完全依赖使用者登记）
+        res2 = PL.analyze([f10], outdir=os.path.join(tmp, "out2"),
+                          export_xlsx=False, export_docx=False, export_pdf=False)
+        ex2 = res2.get("excluded_segments") or {}
+        check("未登记状态列时，结构性规则（数值冻结）仍能剔",
+              (ex2.get("n_excluded") or 0) > 0
+              and any(i["kind"] == "frozen" for i in (ex2.get("items") or [])),
+              "excluded=%s" % ex2.get("n_excluded"))
+        # SPC 画图的点数必须等于主分析段长度：若这里对不上，说明删行之后
+        # 时间列 /_times 有一份没同步裁，控制图与行号已经错位。
+        _full = res.get("_spc_full") or []
+        _mb = ex.get("main_block") or []
+        if _full and _mb:
+            check("SPC 作图点数 = 主分析段长度（删行后索引没歪）",
+                  len(_full[0].get("values") or []) == _mb[1] - _mb[0] + 1,
+                  "vals=%d block=%s" % (len(_full[0].get("values") or []), _mb))
+    finally:
+        try:
+            shutil.rmtree(tmp)
+        except Exception:
+            # scan:keep 测试收尾清理临时目录失败不需中断：本轮断言已全部完成，
+            # 残留的临时目录由系统回收，这里抛异常只会污染测试判定的结果。
+            pass
+
+
 def test_quality_manager_guide():
     """面向质量经理的「报告解读入门」（评审 P3-1）。
 
@@ -4748,6 +4952,7 @@ if __name__ == "__main__":
     test_lot_segment_extraction()
     test_ingest_incremental()
     test_spec_versioning()
+    test_exclude_invalid_segments()
     test_quality_manager_guide()
     print("\n" + "=" * 56)
     print("通过 %d 项，失败 %d 项" % (len(PASS), len(FAIL)))
