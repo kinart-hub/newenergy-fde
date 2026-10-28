@@ -617,6 +617,7 @@ AUDIT_FILES = [
     os.path.join("scripts", "fde_run.py"),
     os.path.join("lib", "pipeline.py"),
     os.path.join("lib", "exclude.py"),
+    os.path.join("lib", "context.py"),
     os.path.join("lib", "preprocess.py"),
     os.path.join("lib", "hotswap.py"),
     os.path.join("lib", "kbstore.py"),
@@ -1119,6 +1120,7 @@ EXPORT_FILE = os.path.join("lib", "export_doc.py")
 INGEST_FILE = os.path.join("lib", "ingest.py")
 LOT_FILE = os.path.join("lib", "lotcode.py")
 EXCLUDE_FILE = os.path.join("lib", "exclude.py")
+CONTEXT_FILE = os.path.join("lib", "context.py")
 PREPROCESS_FILE = os.path.join("lib", "preprocess.py")
 SPCPy = os.path.join("lib", "spc.py")
 CONTRACT_FILE = os.path.join("lib", "contract.py")
@@ -2347,6 +2349,54 @@ def rule_exclude_invalid_segments():
         return _r(False, "状态列缺少读数交叉验证："
                          "设备大部分时间停机时会把停机推定成在产状态，剔反方向")
     return _r(True, "", {"n_checks": 9})
+
+
+def rule_scope_declaration():
+    """单位/时区/班次的口径，判不了的必须显式声明，不许静默假设。
+
+    这三样东西的共同失效方式：工具替使用者静默假设一个口径（"列名里那个括号就是
+    单位""时间戳都按本机时钟""班次不用对齐")，错了相关性与 SPC 整体失真，
+    报告还完全看不出来——因为它压根没告诉你它做了这些假设。
+
+    判据落在"显式声明"这个动作上：未确认（naive/conflict/warn）不单是内部状态，
+    它必须能进 downgrades 让下游降级，并且报告里要有能被人读到的一段。
+    """
+    p = _read(PIPELINE_FILE) or ""
+    g = _read(CONTEXT_FILE) or ""
+    if not p or not g:
+        return _r(False, "读不到 lib/pipeline.py 或 lib/context.py")
+    # 1) 两个导入分支都登记
+    if p.count("import context as CXF") < 2:
+        return _r(False, "两个导入分支没有都登记 context")
+    # 2) 口径声明发生在统计之前（时间列解析后、缺陷识别前）
+    _pos_ctx = p.find("result[\"scope_context\"] = {")
+    _pos_stat = p.find("# 6. 缺陷识别与 Pareto")
+    if _pos_ctx <= 0 or _pos_stat <= 0 or _pos_ctx > _pos_stat:
+        return _r(False, "口径声明没有发生在统计之前："
+                         "声明晚了，下游的统计已经按错误口径算完了")
+    # 3) 无时区必须显式 naive（不是假装 UTC/固定时区）
+    if '"status": "naive"' not in g:
+        return _r(False, "无时区时间戳没有显式声明 naive：会静默按某个假定时区解释")
+    # 4) 带/不带时区混着必须判 conflict
+    if "if has_tz and no_tz:" not in g:
+        return _r(False, "带/不带时区混在一份数据里没有判冲突："
+                         "会漏掉一半 UTC 一半本地的情况")
+    if '"status": "conflict"' not in g:
+        return _r(False, "时区冲突没有显式的 conflict 状态")
+    # 5) naive / shift 未登记要进 downgrades（这是降级的触发点，不是装饰字段）
+    if 'if tz["status"] in ("naive", "conflict"):' not in g:
+        return _r(False, "naive/conflict 没有进 downgrades：下游没法据此降级")
+    if 'if shift["status"] == "warn":' not in g:
+        return _r(False, "班次边界未登记没有进 downgrades：跨午夜切断的风险被吞掉")
+    # 6) 报告里要有口径声明段
+    if "**口径声明（单位 / 时区 / 班次）**" not in p:
+        return _r(False, "报告里没有口径声明段：使用者不知道数字在什么口径下算的")
+    # 7) CLI 要有显式登记入口（--timezone / --shift-boundary），
+    #    否则"请登记时区"这句话指向一个不存在的参数
+    if '"--timezone"' not in p or '"--shift-boundary"' not in p:
+        return _r(False, "CLI 没有 --timezone / --shift-boundary："
+                         "提示里让人去登记的口径根本没有入口")
+    return _r(True, "", {"n_checks": 7})
 
 
 def rule_lot_segment():
@@ -3578,6 +3628,36 @@ AUDIT_RULES = [
                   EXCLUDE_FILE),
           _mutant("报告不写剔了什么（使用者不知道数字来自哪批数据）",
                   _sub('rep.text(s2, "**无效段排除（停机 / 换卷 / 首件 / 断流）**")',
+                       "pass"),
+                  PIPELINE_FILE)]),
+    Rule("口径声明：单位/时区/班次判不了的必须显式声明，不许静默假设",
+         rule_scope_declaration,
+         "（1）pipeline 两个导入分支都登记 context；"
+         "（2）口径声明发生在统计之前（时间列解析之后、缺陷识别之前）；"
+         "（3）无时区时间戳显式声明 naive（不假装 UTC）；"
+         "（4）带/不带时区混在一份数据里判 conflict（不是只看带 tz 行偏移一致）；"
+         "（5）未确认的降级要进 downgrades（时区 naive / 班次未登记）；"
+         "（6）报告正文出现「口径声明」段",
+         CONTEXT_FILE,
+         [_mutant("两个导入分支只留一个（另一条路径 NameError）",
+                  _sub("        from . import context as CXF\n", ""),
+                  PIPELINE_FILE),
+          _mutant("无时区时间戳不当 naive 处理（假装有口径）",
+                  _sub('return {"status": "naive", "declared": None, "naive": True',
+                       'return {"status": "declared", "declared": "UTC", "naive": False'),
+                  CONTEXT_FILE),
+          _mutant("带/不带时区混着不判冲突（漏掉一半 UTC 一半本地的情况）",
+                  _sub("    if has_tz and no_tz:\n"
+                       "        return {\"status\": \"conflict\"",
+                       "    if has_tz and no_tz and False:\n"
+                       "        return {\"status\": \"conflict\""),
+                  CONTEXT_FILE),
+          _mutant("naive 不进 downgrades（时序类结论悄悄按错误口径算）",
+                  _sub('    if tz["status"] in ("naive", "conflict"):',
+                       '    if tz["status"] == "conflict":'),
+                  CONTEXT_FILE),
+          _mutant("报告没有口径声明段（读者不知道数字在什么口径下算的）",
+                  _sub('rep.text(s2, "**口径声明（单位 / 时区 / 班次）**")',
                        "pass"),
                   PIPELINE_FILE)]),
 ]

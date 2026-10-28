@@ -154,6 +154,10 @@ python scripts/fde_run.py analyze --input <数据文件> --outdir <输出目录>
 - `--exclude-recovery N` 工艺文件规定每个连续段开头 N 行是过渡/调整品。这是你们的
   工艺规定，工具不推断，登记几行剔几行
 - `--no-exclude` 完全关闭无效段识别（数据已人工清干净时用）。默认开启
+- `--timezone +08:00` 数据所在时区。时间戳不含时区时默认按「无时区」处理并在报告
+  声明；若数据跨时区（总部 UTC + 产线本地），必须登记，否则时序滞后/班次对齐类结论失真
+- `--shift-boundary "早:06-14;中:14-22;夜:22-06"` 班次边界。检测到轮班制班次列
+  却未登记边界时，会提示跨午夜切断的风险
 - `--no-xlsx` 不导出 Excel 结果表（默认导出）
 - `--spc-exclusion-mode auto|suggest|review` SPC 剔除模式。默认 `auto`（命中即剔除）；
   `suggest` 只标记可疑点不剔除、交人复核；`review` 按复核结论剔除（逐点带规则身份与审核人）

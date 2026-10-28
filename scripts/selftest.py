@@ -4905,6 +4905,113 @@ def test_quality_manager_guide():
     check("README 有指向该文档的链接", "报告解读入门" in rd, "")
 
 
+def test_scope_declaration():
+    """单位 / 时区 / 班次口径声明（评审 P0-2）。
+
+    这三样东西的共同点是：不声明，工具就静默替使用者假设一个口径，
+    错了相关性与 SPC 整体失真还不自知。核心立场——判得了的判，
+    判不了的显式声明「未确认」，绝不静默假设——必须落在可机检的三个动作上：
+      1. 未确认（时区 naive / 班次边界未登记 / 单位冲突）要进 downgrades；
+      2. 报告里有一句人能看懂的口径声明；
+      3. 显式登记后 downgrades 要相应消失（不是登记了还照样降级）。
+    """
+    print("\n[口径声明：单位 / 时区 / 班次]")
+    import datetime as D
+    from lib import context as CXF, table as TB
+
+    # ---------- A. 单位口径 ----------
+    check("无单位信息时显式声明（不假装有口径）",
+          CXF.unit_scope()["status"] == "none"
+          and any("没有显式单位信息" in n for n in CXF.unit_scope()["notes"]), "")
+    check("有换算时口径标记为已统一换算",
+          CXF.unit_scope(conversions=[{"column": "厚度", "from": "mm", "to": "um",
+                                       "factor": 1000}])["status"] == "converted", "")
+    check("无法换算的冲突要显式点出（不是悄悄退出判定）",
+          CXF.unit_scope(adapt_issues=[{"type": "unit_conflict", "column": "功率",
+                                        "unit_in_file": "kW", "unit_expected": "W"}])["status"]
+          == "conflict"
+          and len(CXF.unit_scope(adapt_issues=[{"type": "unit_conflict",
+                                                "column": "功率", "unit_in_file": "kW",
+                                                "unit_expected": "W"}])["issues"]) == 1, "")
+
+    # ---------- B. 时区口径 ----------
+    times = [D.datetime(2026, 3, 1, 6, 0, 0)] * 10
+    check("无时区时间戳 → naive（不是假装 UTC）",
+          CXF.timezone_scope(times, None, "时间")["status"] == "naive", "")
+    check("显式登记时区 → declared",
+          CXF.timezone_scope(times, "+08:00", "时间")["status"] == "declared", "")
+    check("没有时间列 → empty",
+          CXF.timezone_scope(None, None, None)["status"] == "empty", "")
+    _tz = D.timezone(D.timedelta(hours=8))
+    times_tz = [D.datetime(2026, 3, 1, 6, 0, 0, tzinfo=_tz)] * 10
+    check("时间戳自带一致时区 → offset",
+          CXF.timezone_scope(times_tz, None, "时间")["status"] == "offset", "")
+    times_mixed = [D.datetime(2026, 3, 1, 6, 0, 0, tzinfo=_tz)] * 5 \
+        + [D.datetime(2026, 3, 1, 6, 0, 0)] * 5
+    check("同一份数据混着带/不带时区 → conflict（不是静默假设同区）",
+          CXF.timezone_scope(times_mixed, None, "时间")["status"] == "conflict", "")
+
+    # ---------- C. 班次口径 ----------
+    check("无班次列 → none", CXF.shift_scope(None, None, times, None)["status"] == "none", "")
+    check("有轮班列但没登记边界 → warn（跨午夜会切断）",
+          CXF.shift_scope(None, "班次", times, None)["status"] == "warn", "")
+    check("显式登记边界 → ok",
+          CXF.shift_scope(None, "班次", times, "早:06-14;中:14-22;夜:22-06")["status"]
+          == "ok", "")
+    tb = TB.Table(["班次", "值"],
+                  [["甲班", 1.0], ["乙班", 2.0]] * 6)
+    check("短标签（甲班/乙班）判为轮班制 → warn",
+          CXF.shift_scope(tb, "班次", times, None)["status"] == "warn", "")
+    tb2 = TB.Table(["班次", "值"],
+                   [["张三组", 1.0], ["李四组", 2.0], ["王五组", 3.0]] * 4)
+    check("人名/班组名（张三组）不是轮班 → ok",
+          CXF.shift_scope(tb2, "班次", times, None)["status"] == "ok", "")
+
+    # ---------- D. 汇总降级 ----------
+    sc = CXF.scope(times=times, time_col="时间", shift_col="班次")
+    check("naive 或 shift 未登记都要进 downgrades",
+          set(sc["downgrades"]) >= {"timezone", "shift"},
+          str(sc["downgrades"]))
+    sc2 = CXF.scope(times=times, time_col="时间", shift_col="班次",
+                    declared_tz="+08:00", declared_boundary="早:06-14")
+    check("显式登记后 downgrades 相应消失（登记了还降级=白登记）",
+          sc2["downgrades"] == [], str(sc2["downgrades"]))
+
+    # ---------- E. 端到端：报告里有口径声明，参数能消降级 ----------
+    import tempfile as _tmp, os as _os
+    from lib import pipeline as PL
+    f1 = os.path.join(ROOT, "examples", "01_涂布工艺数据.csv")
+    if not os.path.exists(f1):
+        check("示例 01 存在（口径端到端前置）", False, f1)
+        return
+    tdir = _tmp.mkdtemp(prefix="scope-")
+    try:
+        r1 = PL.analyze([f1], outdir=os.path.join(tdir, "a"),
+                        export_xlsx=False, export_docx=False, export_pdf=False)
+        sc1 = r1.get("scope_context") or {}
+        check("端到端：默认时区 naive 进 downgrades",
+              "timezone" in (sc1.get("downgrades") or []), str(sc1.get("downgrades")))
+        r2 = PL.analyze([f1], outdir=os.path.join(tdir, "b"), timezone="+08:00",
+                        export_xlsx=False, export_docx=False, export_pdf=False)
+        sc2 = r2.get("scope_context") or {}
+        check("端到端：--timezone 登记后 timezone 退出 downgrades",
+              sc2.get("tz_status") == "declared"
+              and "timezone" not in (sc2.get("downgrades") or []),
+              str(sc2.get("downgrades")))
+        _rep = os.path.join(tdir, "a", "工艺分析报告.md")
+        _txt = io.open(_rep, encoding="utf-8").read() if os.path.exists(_rep) else ""
+        check("端到端：报告正文出现「口径声明」段",
+              "口径声明" in _txt and "时钟口径" in _txt, "")
+    finally:
+        try:
+            import shutil
+            shutil.rmtree(tdir)
+        except Exception:
+            # scan:keep 测试收尾清理临时目录失败不需中断：断言已全部完成，
+            # 残留临时目录由系统回收，抛异常只会污染测试判定结果。
+            pass
+
+
 if __name__ == "__main__":
     print("newenergy-fde 自检开始")
     test_table()
@@ -4953,6 +5060,7 @@ if __name__ == "__main__":
     test_ingest_incremental()
     test_spec_versioning()
     test_exclude_invalid_segments()
+    test_scope_declaration()
     test_quality_manager_guide()
     print("\n" + "=" * 56)
     print("通过 %d 项，失败 %d 项" % (len(PASS), len(FAIL)))

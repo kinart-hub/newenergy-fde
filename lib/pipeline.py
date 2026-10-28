@@ -80,6 +80,10 @@ if __package__ in (None, ""):
         from lib import exclude as XCL   # 别名不能叫 EX：那个已被 export_doc 占用
     except Exception:
         XCL = None
+    try:                    # P0-2 口径声明（单位/时区/班次）；失败只少一段声明，不拦分析
+        from lib import context as CXF
+    except Exception:
+        CXF = None
     try:                    # P1-2 原生 Word/PDF 导出；失败只少两种交付形态
         from lib import export_doc as EX
     except Exception:
@@ -123,6 +127,10 @@ else:
         from . import exclude as XCL
     except Exception:
         XCL = None
+    try:                    # P0-2 口径声明（两个分支都要，只改一套会 NameError）
+        from . import context as CXF
+    except Exception:
+        CXF = None
     try:                    # P1-2 原生 Word/PDF 导出（两个分支都要，只改一套会 NameError）
         from . import export_doc as EX
     except Exception:
@@ -153,7 +161,7 @@ if EV is not None and EV.__name__ != "lib.events":
 KB = PP.load_knowledge()
 _fmt = RPT._fmt
 
-ANALYZER_VERSION = "2.13.0"
+ANALYZER_VERSION = "2.14.0"
 
 
 # 空数据排查清单。
@@ -421,6 +429,7 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
             lot_pattern=None,
             exclude_status_col=None, exclude_status_values=None,
             exclude_recovery=0, exclude_enabled=True,
+            timezone=None, shift_boundary=None,
             export_xlsx=True, export_docx=True, export_pdf=True,
             d2_card=None, emit_d2_card=True, verbose=False, views=None):
     """
@@ -1242,6 +1251,47 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
     tcol, times = PP.parse_time_column(work)
 
     _v("[5/6] 时间列=%s" % (tcol or "无"))
+    # 5a. 口径声明：单位 / 时区 / 班次（评审 P0-2）。
+    #     位置在时间列解析之后、缺陷识别之前——时间列解析完才知道时钟口径，
+    #     而口径结论要赶在任何依赖绝对时刻 / 单位的统计之前进 result，
+    #     报告里那段"口径声明"才能与后面的数字对得上。
+    #     三样东西的共同点：不声明，工具就静默替使用者假设一个口径，
+    #     错了相关性与 SPC 整体失真还不自知。这里的立场与无效段模块一致：
+    #     判得了的判，判不了的一律显式声明「未确认」，绝不静默假设。
+    try:
+        _shift_col = next((c for c in (work.columns or [])
+                           if any(w in (c or "") for w in ("班次", "班别", "班组",
+                                                           "shift", "轮班"))), None)
+        _adapt_issues = (result.get("adaptation") or {}).get("issues") or []
+        _adapt_applied = (result.get("adaptation") or {}).get("applied") or []
+        _convs = [{"column": a.get("column") or a.get("to_col"),
+                   "from": a.get("from_unit") or a.get("from"),
+                   "to": a.get("to_unit") or a.get("to"),
+                   "factor": a.get("factor"), "source": a.get("source")}
+                  for a in _adapt_applied if isinstance(a, dict)]
+        _scp = CXF.scope(
+            adapt_issues=_adapt_issues, conversions=_convs,
+            times=times, declared_tz=timezone,
+            time_col=tcol, shift_col=_shift_col,
+            declared_boundary=shift_boundary, table=work)
+        result["scope_context"] = {
+            "unit": _scp["unit"], "timezone": _scp["timezone"],
+            "shift": _scp["shift"], "downgrades": _scp["downgrades"],
+            "unit_status": _scp["unit"]["status"],
+            "tz_status": _scp["timezone"]["status"],
+            "shift_status": _scp["shift"]["status"],
+            "tz_declared": _scp["timezone"].get("declared"),
+            "shift_col": _shift_col,
+        }
+        for _n in ((_scp["unit"].get("notes") or [])
+                   + (_scp["timezone"].get("notes") or [])
+                   + (_scp["shift"].get("notes") or [])):
+            _kind = "warn" if _n.startswith(("有", "检测到", "时间戳不含", "班次列")) else "info"
+            result.setdefault("warnings", []).append(
+                "口径：%s" % _n)
+    except Exception as _ctx_e:
+        degrade.note("pipeline.analyze@scope", _ctx_e)
+        result["scope_context"] = {"error": str(_ctx_e)}
     # 5b. 行数不为 0 却一个有效观测值都没有 —— 与「0 行」等价，
     #     却比 0 行更容易蒙混过关：列名全对得上、工序也能判定出来，
     #     报告看起来像"分析过了"，实际每个统计量都是 None。
@@ -3058,6 +3108,31 @@ def build_report(res, work, spc_res, corr, assoc, pare, root, gaps, conf,
     cr = res.get("clean", {})
     rep.kv(s2, [("原始行数", cr.get("rows_in")), ("清洗后行数", cr.get("rows_out")),
                 ("时间列", tcol or "未识别"), ("分组维度", "、".join(res.get("groups", [])) or "未识别")])
+    # 口径声明（评审 P0-2）：单位 / 时区 / 班次这三样，不声明就是默许静默假设。
+    # 读者看报告时得知道"这批数字是在什么口径下算出来的"——尤其时区 naive 时，
+    # 时序类的结论（滞后相关、班次对齐）本身就更不可信，这里点出来。
+    _scp = res.get("scope_context") or {}
+    if _scp and not _scp.get("error"):
+        rep.text(s2, "**口径声明（单位 / 时区 / 班次）**")
+        _tz = _scp.get("timezone") or {}
+        _tz_label = {"declared": "已登记（%s）" % _tz.get("declared"),
+                     "offset": "时间戳自带时区（%s）" % _tz.get("declared"),
+                     "naive": "无时区（按本机时钟）",
+                     "empty": "无时间列"}.get(_tz.get("status"), "—")
+        _unit = _scp.get("unit") or {}
+        _unit_label = {"ok": "无冲突", "converted": "已统一换算",
+                       "conflict": "存在无法换算的单位冲突",
+                       "none": "无显式单位信息"}.get(_unit.get("status"), "—")
+        _shift = _scp.get("shift") or {}
+        _shift_label = {"ok": "不涉及/非轮班", "warn": "边界未登记",
+                        "none": "无班次列"}.get(_shift.get("status"), "—")
+        rep.kv(s2, [("单位口径", _unit_label), ("时钟口径", _tz_label),
+                    ("班次口径", _shift_label)])
+        _notes = ((_unit.get("notes") or []) + (_tz.get("notes") or [])
+                  + (_shift.get("notes") or []))
+        for _n in _notes:
+            rep.callout(s2, _n, "warn" if _n.startswith(("有", "检测到", "时间戳不含", "班次列"))
+                        else "info")
     if cr.get("actions"):
         rep.bullets(s2, cr["actions"])
     if cr.get("outliers"):
@@ -4009,6 +4084,13 @@ def main():
     ap.add_argument("--no-exclude", action="store_true",
                     help="完全关闭无效段识别（数据已人工清干净时用）。默认开启，"
                          "因为睡着了不知道比报错更贵：停机段既可能让 Cpk 虚高也可能让它虚低")
+    ap.add_argument("--timezone", default=None,
+                    help="数据所在时区，如 +08:00 / Asia/Shanghai。时间戳不含时区时，"
+                         "工具默认按「无时区」处理并在报告声明——若数据跨时区，"
+                         "必须登记，否则时序滞后/班次对齐类结论会失真")
+    ap.add_argument("--shift-boundary", default=None,
+                    help="班次边界定义，如「早:06:00-14:00;中:14:00-22:00;夜:22:00-06:00」。"
+                         "检测到轮班制班次列却未登记边界时，会提示跨午夜切断的风险")
     ap.add_argument("--cursor", default=None,
                     help="增量游标文件路径（如 out/.state/mes_cursor.json）。给出后报告会写明"
                          "本次新增了哪些文件、追加了多少行；首次运行自动建立基准")
@@ -4121,6 +4203,8 @@ def main():
                   exclude_status_values=getattr(args, "exclude_status_values", None),
                   exclude_recovery=getattr(args, "exclude_recovery", 0) or 0,
                   exclude_enabled=not getattr(args, "no_exclude", False),
+                  timezone=getattr(args, "timezone", None),
+                  shift_boundary=getattr(args, "shift_boundary", None),
                   do_doe=not args.no_doe, auto_adapt=args.auto_adapt,
                   tenant=args.tenant, industry=args.industry, rules=args.rules,
                   spc_exclusion_mode=args.spc_exclusion_mode,
