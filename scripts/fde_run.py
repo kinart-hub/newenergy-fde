@@ -618,6 +618,7 @@ AUDIT_FILES = [
     os.path.join("lib", "pipeline.py"),
     os.path.join("lib", "exclude.py"),
     os.path.join("lib", "context.py"),
+    os.path.join("lib", "actioncard.py"),
     os.path.join("lib", "preprocess.py"),
     os.path.join("lib", "hotswap.py"),
     os.path.join("lib", "kbstore.py"),
@@ -1121,6 +1122,7 @@ INGEST_FILE = os.path.join("lib", "ingest.py")
 LOT_FILE = os.path.join("lib", "lotcode.py")
 EXCLUDE_FILE = os.path.join("lib", "exclude.py")
 CONTEXT_FILE = os.path.join("lib", "context.py")
+ACTIONCARD_FILE = os.path.join("lib", "actioncard.py")
 PREPROCESS_FILE = os.path.join("lib", "preprocess.py")
 SPCPy = os.path.join("lib", "spc.py")
 CONTRACT_FILE = os.path.join("lib", "contract.py")
@@ -2445,6 +2447,47 @@ def rule_baseline_stability():
     return _r(True, "", {"n_checks": 5})
 
 
+def rule_action_cards():
+    """行动卡片必须结构化可导出，未知字段不编造、设定值不替人拍。
+
+    D5/D6 在 eightd 里已结构化，但各自为政、无法导出，现场只能手工抄卡片。
+    本规则守住三件事：卡片字段契约齐全（MES 对接靠字段名）、导出带 schema、
+    以及两条诚实铁律——不知道的字段（负责人/窗口）标待填不编造、
+    设定值不替人拍（回指 DOE）。任何一处破了，现场拿到手里的就是失实或半截的卡片。
+    """
+    p = _read(PIPELINE_FILE) or ""
+    g = _read(ACTIONCARD_FILE) or ""
+    if not p or not g:
+        return _r(False, "读不到 lib/pipeline.py 或 lib/actioncard.py")
+    # 1) 两个导入分支都登记
+    if p.count("import actioncard as AC") < 2:
+        return _r(False, "两个导入分支没有都登记 actioncard")
+    # 2) 卡片含 6 个核心字段（评审点名的字段契约）。
+    #    必须锚定到 CARD_FIELDS 那个列表块——字段字符串在 D5/D6 卡片里也重复出现，
+    #    只查字面的话删掉 CARD_FIELDS 里那一行、卡片 body 里还留着，判据照样过。
+    _cf = re.search(r"CARD_FIELDS = \[\n(.*?)\n\]", g, re.S)
+    _cfbody = _cf.group(1) if _cf else ""
+    for f in ("suggested_value", "verification_batches", "success_criteria",
+              "owner_role", "verification_window"):
+        if ('"%s"' % f) not in _cfbody:
+            return _r(False, "卡片字段契约缺「%s」：MES 对接的键丢了" % f)
+    # 3) 导出 JSON 带 schema + fields 契约
+    if '"schema": "action_card_v1"' not in g:
+        return _r(False, "导出 JSON 没有 schema：下游拿不到字段含义")
+    if '"fields": CARD_FIELDS' not in g:
+        return _r(False, "导出 JSON 没有 fields 契约：字段顺序/含义丢失")
+    # 4) 未知字段不编造（owner_role 标 None，导出 CSV 才转"待填"，源头不写假名字）
+    if "        \"owner_role\": None,          # 待填：谁执行验证由现场排产定" not in g:
+        return _r(False, "负责人角色被编造了：工具不能替厂里指派到人")
+    # 5) 导出失败要出声（否则现场以为拿到卡片、实际文件是空的）
+    if "行动卡片导出失败" not in p:
+        return _r(False, "导出失败没有出声：静默失败会让现场以为卡片已生成")
+    # 6) 卡片只在 8D 产出后生成
+    if "if AC is not None and res.get(\"eightd\"):" not in p:
+        return _r(False, "卡片不依赖 8D 产出就生成：8D 没算完，卡片是空壳")
+    return _r(True, "", {"n_checks": 6})
+
+
 def rule_lot_segment():
     """批号里提取的分组维度，不能是流水号。
 
@@ -3731,6 +3774,33 @@ AUDIT_RULES = [
                        "        elif capped and False:\n"
                        "            # 关键：封顶中断时必须如实说\"不稳\""),
                   SPCPy)]),
+    Rule("行动卡片必须结构化可导出，未知字段不编造、设定值不替人拍",
+         rule_action_cards,
+         "（1）pipeline 两个导入分支都登记 actioncard；"
+         "（2）卡片含 6 个核心字段（待验证参数/建议取值/验证批次/成功判据/"
+         "负责人角色/验证窗口）；"
+         "（3）导出 JSON 带 schema+fields 契约（MES 对接靠它）、CSV 表头对齐；"
+         "（4）导出失败出声，不静默（否则现场以为拿到了卡片）；"
+         "（5）卡片只在 8D 产出后生成（8D 没产出就没有值得导出的对象）",
+         ACTIONCARD_FILE,
+         [_mutant("两个导入分支只留一个（另一条路径 NameError）",
+                  _sub("        from . import actioncard as AC\n", ""),
+                  PIPELINE_FILE),
+          _mutant("卡片字段契约被删（MES 对接的键丢了一半）",
+                  _sub('    "verification_batches",  # 验证批次建议（来自 MDD 表，样本量是产能决定的）\n',
+                       ''),
+                  ACTIONCARD_FILE),
+          _mutant("导出 JSON 不带 schema/fields（下游拿不到字段含义）",
+                  _sub('payload = {"schema": "action_card_v1", "fields": CARD_FIELDS,',
+                       'payload = {"cards": [dict(c) for c in cards], "n": n}'),
+                  ACTIONCARD_FILE),
+          _mutant("导出失败被静默吞掉（现场以为拿到了卡片）",
+                  _sub('            except Exception as _ace:\n'
+                       '                res.setdefault("warnings", []).append(\n'
+                       '                    "行动卡片导出失败：%s" % _ace)\n',
+                       '            except Exception as _ace:\n'
+                       '                pass\n'),
+                  PIPELINE_FILE)]),
 ]
 
 

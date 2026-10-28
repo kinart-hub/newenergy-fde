@@ -84,6 +84,10 @@ if __package__ in (None, ""):
         from lib import context as CXF
     except Exception:
         CXF = None
+    try:                    # P2-1 结构化行动卡片；失败只少一种导出形态，不拦 8D
+        from lib import actioncard as AC
+    except Exception:
+        AC = None
     try:                    # P1-2 原生 Word/PDF 导出；失败只少两种交付形态
         from lib import export_doc as EX
     except Exception:
@@ -131,6 +135,10 @@ else:
         from . import context as CXF
     except Exception:
         CXF = None
+    try:                    # P2-1 结构化行动卡片（两个分支都要，只改一套会 NameError）
+        from . import actioncard as AC
+    except Exception:
+        AC = None
     try:                    # P1-2 原生 Word/PDF 导出（两个分支都要，只改一套会 NameError）
         from . import export_doc as EX
     except Exception:
@@ -161,7 +169,7 @@ if EV is not None and EV.__name__ != "lib.events":
 KB = PP.load_knowledge()
 _fmt = RPT._fmt
 
-ANALYZER_VERSION = "2.15.0"
+ANALYZER_VERSION = "2.16.0"
 
 
 # 空数据排查清单。
@@ -3713,6 +3721,44 @@ def build_report(res, work, spc_res, corr, assoc, pare, root, gaps, conf,
                          "请检查模块完整性。", "warn")
         res.setdefault("degraded_sections", []).append(
             {"section": "8D", "error": "eightd 模块未导入"})
+
+    # 12b. 结构化行动卡片（评审 P2-1）：把 D5 永久对策 + D6 验证方案合并成
+    #      一张张可分发、可回填、可导出的"验证任务"卡。定位在 8D 渲染之后——
+    #      因为卡片是 8D 结论的结构化投影，8D 没产出就不该有卡片。
+    #      8D 没装载时没有值得导出的对象，写卡片只能写空壳。
+    try:
+        if AC is not None and res.get("eightd"):
+            _ac = AC.build(res, lead=None)
+            res["action_cards"] = _ac["cards"]
+            res["action_card_n"] = _ac["n"]
+            for _n in (_ac.get("notes") or []):
+                res.setdefault("warnings", []).append("行动卡片：%s" % _n)
+            # 落盘两份：JSON 给 MES/工单对接，CSV 给现场打印回填。
+            # 路径随报告走，不写死；导出失败只降级本节，不拖垮整轮。
+            _outdir = res.get("outdir") or "output"
+            try:
+                _jpath, _jn = AC.export(_ac["cards"], os.path.join(
+                    _outdir, "行动卡片.json"), fmt="json")
+                _cpath, _cn = AC.export(_ac["cards"], os.path.join(
+                    _outdir, "行动卡片.csv"), fmt="csv")
+                res["action_card_files"] = {"json": _jpath, "csv": _cpath}
+            except Exception as _ace:
+                res.setdefault("warnings", []).append(
+                    "行动卡片导出失败：%s" % _ace)
+    except Exception as _ace2:
+        # 卡片生成自身出错，不能装作"没有卡片"——那与"确实没有待验证任务"长得一样
+        degrade.note("pipeline.analyze@actioncard", _ace2)
+        res.setdefault("degraded_sections", []).append(
+            {"section": "行动卡片", "error": str(_ace2)})
+
+    # 12c. 报告里引述行动卡片文件（正文要能点到，读者才知道有这两份产物）
+    if res.get("action_card_files"):
+        rep.callout(
+            s12, "已生成 **%d 张结构化行动卡片**（D5 对策方向 + D6 验证方案各若干张），"
+                 "可分发、可回填、可对接 MES/工单：`行动卡片.json`（结构化，字段即接口键）、"
+                 "`行动卡片.csv`（打印后白板回填）。负责人角色与验证窗口按厂内排产回填，"
+                 "工具不替厂里指派到人。"
+            % res.get("action_card_n", 0), "info")
 
     # 13 知识沉淀
     s13 = rep.section("13. 知识沉淀候选（本次分析的收获）")

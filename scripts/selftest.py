@@ -5058,6 +5058,74 @@ def test_baseline_stability():
             pass
 
 
+def test_action_cards():
+    """结构化行动卡片（评审 P2-1）。
+
+    D5/D6 在 eightd 里已结构化，但各自为政、无法导出。本模块把它们组装成
+    统一卡片并导出 JSON/CSV。两条铁律：不知道的字段不编（负责人/窗口标待填），
+    设定值不替人拍。可机检落点：
+      1. 卡片含评审点名的 6 个字段（待验证参数/建议取值/验证批次/成功判据/
+         负责人角色/验证窗口）；
+      2. JSON 结构含 schema + fields 契约（MES 对接要靠它）；
+      3. CSV 表头与 CARD_FIELDS 对齐；
+      4. 导出与卡片数一致；JSON 能 round-trip 回解析。
+    """
+    print("\n[结构化行动卡片]")
+    import tempfile as _tmp, os as _os, json as _json
+    from lib import actioncard as AC, pipeline as PL
+
+    # ---------- A. build 的字段契约 ----------
+    f1 = os.path.join(ROOT, "examples", "01_涂布工艺数据.csv")
+    if not os.path.exists(f1):
+        check("示例 01 存在（行动卡片前置）", False, f1)
+        return
+    tdir = _tmp.mkdtemp(prefix="cards-")
+    try:
+        r = PL.analyze([f1], outdir=os.path.join(tdir, "out"),
+                       export_xlsx=False, export_docx=False, export_pdf=False)
+        cards = r.get("action_cards") or []
+        check("8D 产出后生成行动卡片（>0 张）", len(cards) >= 1, str(len(cards)))
+        if cards:
+            _req = ["target", "suggested_value", "verification_batches",
+                    "success_criteria", "owner_role", "verification_window"]
+            check("每张卡片都带评审点名的 6 个核心字段",
+                  all(f in c for c in cards for f in _req), "")
+            check("卡片有 stage 区分 D5/D6 且 id 稳定",
+                  all(c.get("stage") in ("D5", "D6") and isinstance(c.get("id"), str)
+                      for c in cards), "")
+            # 诚实原则：不知道的字段要么填了真值、要么是 None/待填，绝不编 Fake 名字
+            check("D6 卡负责人角色不编造（None 或待填）",
+                  all(c.get("owner_role") is None for c in cards
+                      if c.get("stage") == "D6"), "")
+        # ---------- B. 导出契约 ----------
+        _fp = r.get("action_card_files") or {}
+        jp = _fp.get("json"); cp = _fp.get("csv")
+        check("JSON 与 CSV 都写出来了", bool(jp) and bool(cp) and
+              os.path.exists(jp) and os.path.exists(cp), str(_fp))
+        if jp and os.path.exists(jp):
+            _j = _json.load(open(jp, encoding="utf-8"))
+            check("JSON 带 schema + fields 契约（MES 对接要靠它）",
+                  _j.get("schema") == "action_card_v1"
+                  and isinstance(_j.get("fields"), list)
+                  and len(_j.get("fields")) >= 6, str(_j.get("schema")))
+            check("JSON 卡片数与 result 一致（导出没丢卡）",
+                  _j.get("n") == len(cards), "%s vs %s" % (_j.get("n"), len(cards)))
+        if cp and os.path.exists(cp):
+            _head = io.open(cp, encoding="utf-8-sig").readline().strip()
+            check("CSV 表头与字段契约对齐",
+                  _head == "id,stage,category,target,objective,suggested_value,"
+                           "verification_batches,success_criteria,owner_role,"
+                           "verification_window,side_effects,evidence,signed",
+                  _head[:60])
+    finally:
+        try:
+            import shutil
+            shutil.rmtree(tdir)
+        except Exception:
+            # scan:keep 同上
+            pass
+
+
 if __name__ == "__main__":
     print("newenergy-fde 自检开始")
     test_table()
@@ -5108,6 +5176,7 @@ if __name__ == "__main__":
     test_exclude_invalid_segments()
     test_scope_declaration()
     test_baseline_stability()
+    test_action_cards()
     test_quality_manager_guide()
     print("\n" + "=" * 56)
     print("通过 %d 项，失败 %d 项" % (len(PASS), len(FAIL)))
