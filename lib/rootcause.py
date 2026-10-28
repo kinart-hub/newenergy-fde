@@ -28,6 +28,16 @@ _KB_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__
                         "knowledge", "process_specs.json")
 _KB = None
 
+# 根因排序权重（评审 P1-5）：此前 0.10 的可验证性权重硬编码为 0.5 且未进排序，
+# 现已按候选真实信号动态计算并统一引用这组常量。集中管理便于调参与灵敏度验证，
+# 不随行业/产品固化——调整权重改这里即可，无需触碰评分逻辑。
+ROOTCAUSE_WEIGHTS = {
+    "evidence": 0.40,        # 数据证据强度
+    "prior": 0.35,           # 知识库先验
+    "temporal": 0.15,        # 时序吻合度
+    "verifiability": 0.10,   # 可验证性（按候选真实信号动态计算）
+}
+
 
 def _kb():
     global _KB
@@ -514,7 +524,9 @@ def rank_root_causes(defect_name, table, target_col=None, top=5,
         # 注意：可验证性（P1-5）不再硬编码 0.5，留到 _annotate_evidence 之后
         # 按候选真实信号统一计算并计入总分（见下方 post-annotation 重算段）。
         # 这里先只累加前三项，verifiability 分项在收尾时补全。
-        base = 0.40 * ev + 0.35 * prior + 0.15 * tscore
+        base = (ROOTCAUSE_WEIGHTS["evidence"] * ev
+                + ROOTCAUSE_WEIGHTS["prior"] * prior
+                + ROOTCAUSE_WEIGHTS["temporal"] * tscore)
         gate_note = _evidence_gate(base, det)[1]
         cands.append({
             "param_key": pk,
@@ -572,7 +584,9 @@ def rank_root_causes(defect_name, table, target_col=None, top=5,
             if det.get("column"):
                 tscore, tdet = _temporal_match(table, det["column"], target_col)
             prior = 0.35                       # 先验低于知识库候选，但证据硬
-            base = 0.40 * ev + 0.35 * prior + 0.15 * tscore
+            base = (ROOTCAUSE_WEIGHTS["evidence"] * ev
+                + ROOTCAUSE_WEIGHTS["prior"] * prior
+                + ROOTCAUSE_WEIGHTS["temporal"] * tscore)
             cands.append({
                 "param_key": pk,
                 "param": det.get("column"),
@@ -613,7 +627,10 @@ def rank_root_causes(defect_name, table, target_col=None, top=5,
         _pr = c.get("prior_score") or 0.0
         _ts = c.get("temporal_score") or 0.0
         _vf = _verifiability(c)
-        _final = 0.40 * _ev + 0.35 * _pr + 0.15 * _ts + 0.10 * _vf
+        _final = (ROOTCAUSE_WEIGHTS["evidence"] * _ev
+                  + ROOTCAUSE_WEIGHTS["prior"] * _pr
+                  + ROOTCAUSE_WEIGHTS["temporal"] * _ts
+                  + ROOTCAUSE_WEIGHTS["verifiability"] * _vf)
         _final, _gate = _evidence_gate(_final, c.get("detail") or {})
         c["verifiability_score"] = round(_vf, 3)
         c["score"] = round(_final, 4)

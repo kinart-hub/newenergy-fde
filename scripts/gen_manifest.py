@@ -54,6 +54,24 @@ OPTIONAL_RUNTIME = [
 EXTRA_DIRS = ["examples", "promotion", "assets", "docs", ".github"]
 
 
+def code_version():
+    """从 lib/pipeline.py 抽取 ANALYZER_VERSION，作为唯一版本真源。
+
+    为什么不让 manifest.json 自己写版本：手工维护的派生数字一定会漂——
+    本次实测 manifest.json 停在 2.10.0 而代码已是 2.19.1，打出来的离线包
+    文件名直接错乱，且门禁全程静默。版本真源收敛到代码常量，重建清单时
+    一并同步，谁都不用再记第二处数字。
+    """
+    import re
+    p = os.path.join(ROOT, "lib", "pipeline.py")
+    try:
+        txt = io.open(p, encoding="utf-8").read()
+    except Exception:
+        return None
+    m = re.search(r'ANALYZER_VERSION\s*=\s*["\']([^"\']+)["\']', txt)
+    return m.group(1) if m else None
+
+
 def tracked_files():
     try:
         out = subprocess.run(["git", "ls-files"], cwd=ROOT, capture_output=True,
@@ -140,6 +158,12 @@ def main(argv=None):
     ghost = [f for f in sorted(listed)
              if f not in OPTIONAL_RUNTIME and not os.path.exists(os.path.join(ROOT, f))]
 
+    cv = code_version()
+    if cv and m.get("version") != cv:
+        version_mismatch = True
+    else:
+        version_mismatch = False
+
     if args.check:
         if missing:
             print("缺 %d 个运行时文件，请运行 python scripts/gen_manifest.py 重建清单："
@@ -150,11 +174,18 @@ def main(argv=None):
             print("清单声明了 %d 个仓库里没有的文件：" % len(ghost))
             for f in ghost[:10]:
                 print("   -", f)
-        if not missing and not ghost:
-            print("部署清单 OK：%d 项必需文件齐全，无悬空声明" % len(required))
+        if version_mismatch:
+            print("版本不一致：manifest.json=%s 但代码 ANALYZER_VERSION=%s；"
+                  "运行 python scripts/gen_manifest.py 重建清单以同步版本"
+                  % (m.get("version"), cv))
+        if not missing and not ghost and not version_mismatch:
+            print("部署清单 OK：%d 项必需文件齐全，无悬空声明，版本一致(%s)"
+                  % (len(required), m.get("version")))
             return 0
         return 1
 
+    if cv:
+        m["version"] = cv
     m["repository_files"] = required
     m["deployment"] = {
         "required": required,
@@ -172,11 +203,13 @@ def main(argv=None):
     with io.open(mpath, "w", encoding="utf-8") as f:
         json.dump(m, f, ensure_ascii=False, indent=2)
         f.write("\n")
-    print("已重建部署清单：必需 %d 项（lib=%d scripts=%d knowledge=%d）"
+    ver_note = "（版本已同步为 %s）" % m.get("version") if cv else ""
+    print("已重建部署清单：必需 %d 项（lib=%d scripts=%d knowledge=%d）%s"
           % (len(required),
              sum(1 for x in required if x.startswith("lib/")),
              sum(1 for x in required if x.startswith("scripts/")),
-             sum(1 for x in required if x.startswith("knowledge/"))))
+             sum(1 for x in required if x.startswith("knowledge/")),
+             ver_note))
     return 0
 
 

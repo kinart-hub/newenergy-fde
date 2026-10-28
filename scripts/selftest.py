@@ -181,10 +181,11 @@ def test_spc():
     check("规则集解析 '2,5,8'", SPC.parse_rules("2, 5, 8") == (2, 5, 8))
     check("规则集解析非法值回落默认", SPC.parse_rules("99") == SPC.DEFAULT_RULES)
     # Phase I/II：异常段不能把控制限撑宽
-    import random as _rnd
-    _g = _rnd.Random(11)
-    _stable = [_g.gauss(10, 0.5) for _ in range(40)]
-    _spike = [16.0, 17.0, 15.5, 16.8, 15.2]     # 明显的异常段
+    # 干净的近恒定序列（确定性，无离群、无 9 点同侧），加 2 个明显尖峰：
+    # 尖峰占比 2/62≈3.2% < 5%，Phase I 仍应识别出稳定基线（P0-2 修复后不再谎报稳定，
+    # 但真正轻微的异常段仍判稳定——这正是本用例要验证的）。
+    _stable = [10.0 + 0.05 * (i % 3 - 1) for i in range(60)]
+    _spike = [16.0, 17.0]
     _mix = _stable + _spike
     _p1 = SPC.phase1_limits(_mix)
     check("Phase I 识别出稳定期", _p1 is not None and _p1["stable"])
@@ -204,6 +205,55 @@ def test_spc():
     _p1w = SPC.phase1_limits(_wild)
     check("过程整体不受控时不谎报稳定", _p1w is not None and not _p1w["stable"],
           (_p1w or {}).get("note"))
+    # —— 评审修复回归（P0-1 / P0-2 / P0-3 / P1-1 / P1-3 / P1-4）——
+    import random as _rn                              # 局部别名，避免函数内 import random 遮蔽模块级
+    # P0-1：Nelson 规则2 连续同侧必须整段返回，不得隔点
+    _r2v = [10.1 + 0.001 * i for i in range(35)]
+    _r2 = SPC.nelson_violations(_r2v, 10.0, 1.0, rules="all")
+    _r2h = next((x for x in _r2 if x["rule"] == 2), None)
+    _r2idx = sorted(_r2h["indexes"]) if _r2h else []
+    check("P0-1 规则2 连续无隔点(27点连续)", len(_r2idx) == 27 and _r2idx == list(range(8, 35)),
+          "idx=%s" % _r2idx)
+    # P0-2：Phase I 剔除比例>5% 必须判为不稳定（不再谎报稳定）
+    _g2 = _rn.Random(7)
+    _base = [10.0 + _g2.gauss(0, 0.3) for _ in range(88)]
+    _shift = [13.0 + _g2.gauss(0, 0.3) for _ in range(12)]
+    _p1b = SPC.phase1_limits(_base + _shift)
+    check("P0-2 剔除>5% 判不稳定", _p1b is not None and len(_p1b["excluded"]) > 5
+          and not _p1b["stable"], "excl=%d stable=%s" % (len(_p1b["excluded"]), _p1b.get("stable")))
+    # P0-3：同一点命中多条 Nelson 规则都要记录（规则溯源不丢）
+    _mix3 = [10.0] * 14 + [12.3] * 14
+    _p1c = SPC.phase1_limits(_mix3, mode="suggest")
+    _pts3 = (_p1c.get("suspect_points") or []) + (_p1c.get("candidates") or [])
+    _multi3 = [c for c in _pts3 if len(c.get("rules") or []) >= 2]
+    check("P0-3 异常点多规则记录不丢", len(_multi3) > 0, "multi=%d" % len(_multi3))
+    # P1-1：自相关 AR(1) φ>0.3 时 Cpk 被抑制、Ppk 保留
+    _g3 = _rn.Random(3)
+    _e3 = [_g3.gauss(0, 1.0) for _ in range(200)]
+    _xs = [0.0]
+    for _i in range(200):
+        _xs.append(0.85 * _xs[-1] + _e3[_i])
+    _xs = _xs[1:]
+    _phi = SPC.ar1_residuals(_xs).get("phi")
+    _cap1 = SPC.process_capability(_xs, 0.0, 6.0, None, autocorr_phi=_phi)
+    check("P1-1 φ>0.3 时 Cpk 被抑制", _cap1.get("Cpk") is None
+          and _cap1.get("cpk_suppressed_autocorr") is True, "Cpk=%s" % _cap1.get("Cpk"))
+    check("P1-1 Ppk 仍保留(整体σ)", _cap1.get("Ppk") is not None, "Ppk=%s" % _cap1.get("Ppk"))
+    # P1-3：分段能力用每段自己的 σ_within（Cpk≠退化的Ppk）
+    _seg = ([10.0 + _g2.gauss(0, 0.1) for _ in range(40)]
+            + [10.0 + _g2.gauss(0, 0.1) for _ in range(40)])
+    _sw = SPC.sigma_within_mr(_seg)
+    _cap3 = SPC.process_capability(_seg, 9.5, 10.5, 10.0, sigma_within=_sw)
+    check("P1-3 sigma_within_mr>0", _sw is not None and _sw > 0, "sw=%s" % _sw)
+    check("P1-3 Cpk 基于 within(≠Ppk)", _cap3.get("Cpk") is not None and
+          abs((_cap3.get("Cpk") or 0) - (_cap3.get("Ppk") or 0)) > 1e-9,
+          "Cpk=%s Ppk=%s" % (_cap3.get("Cpk"), _cap3.get("Ppk")))
+    # P1-4：正态性诊断(jarque_bera)接入能力结果
+    _norm = [_rn.gauss(0, 1) for _ in range(200)]
+    _cap4 = SPC.process_capability(_norm, -3, 3, 0.0)
+    check("P1-4 能力结果含 normality(jarque_bera已接入)",
+          "normality" in _cap4 and isinstance((_cap4.get("normality") or {}).get("p"), float),
+          str(_cap4.get("normality")))
     # DOE 工程约束与安全包络
     _fs = [{"name": "化成电压(V)", "low": 3.0, "high": 4.8},
            {"name": "烘箱一区温度(℃)", "low": 60.0, "high": 200.0}]

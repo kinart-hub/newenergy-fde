@@ -169,7 +169,7 @@ if EV is not None and EV.__name__ != "lib.events":
 KB = PP.load_knowledge()
 _fmt = RPT._fmt
 
-ANALYZER_VERSION = "2.19.0"
+ANALYZER_VERSION = "2.19.1"
 
 
 # 空数据排查清单。
@@ -510,6 +510,12 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
     elif industry:
         # 拼错的行业名由 set_industries 记进 notes()，报告 2c 节会显示
         SC.set_industries(industry)
+        need_reload = True
+    else:
+        # 关键：既无租户也无行业时必须显式清空作用域。否则上一次分析设置的行业
+        # （光伏/锂电…）会泄漏到本次，把本次数据按错误行业裁掉、识别率暴跌，
+        # 甚至吐出虚假根因（评审 P0-4）。None = 退回通用作用域。
+        SC.set_industries(None)
         need_reload = True
     if need_reload:
         try:
@@ -1684,6 +1690,16 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
                 _acd = SPC.autocorrelation_diagnosis(vals)
             except Exception as _ac_e:
                 degrade.note("pipeline.spc@autocorr", _ac_e)
+            # AR(1) 系数 φ：自相关拦截（评审 P1-1）要用。与是否"显著"无关——
+            # 不显著时 φ≈0 不会触发抑制；显著分支内部也会再用，这里统一算一次。
+            _acd_phi = None
+            try:
+                _ar1 = SPC.ar1_residuals(vals)
+                _acd_phi = _ar1.get("phi")
+                if isinstance(_acd, dict):
+                    _acd.setdefault("phi", _acd_phi)
+            except Exception as _ar_e:
+                degrade.note("pipeline.spc@ar1", _ar_e)
             if isinstance(_acd, dict) and _acd.get("significant"):
                 # 先拿 ACF 谱，再作图：**控制限要按自相关放大**，不是把数据滤平。
                 #
@@ -1773,7 +1789,8 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
                 _main_seg = max(_seg["segments"], key=lambda s: len(s["indexes"]))
                 _cap_vals = _main_seg["values"]
             _cap_sw = xc.sigma_within if xc else None
-            cap = SPC.process_capability(_cap_vals, lsl, usl, tgt, sigma_within=_cap_sw)
+            cap = SPC.process_capability(_cap_vals, lsl, usl, tgt,
+                                         sigma_within=_cap_sw, autocorr_phi=_acd_phi)
             if cap and _seg is not None and _seg.get("segments"):
                 # 逐段能力：跨版本的数据只有一个总 Cpk 是不够的，
                 # 现场要回答的是"换版前后能力变好了还是变坏了"
@@ -1782,9 +1799,13 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
                     _sv = [v for v in (s.get("values") or []) if v is not None]
                     if len(_sv) < 2:
                         continue
+                    # 评审 P1-3：分段能力必须用该段自己的 σ_within 算 Cpk，
+                    # 否则退化为整体 σ，Cpk 与 Ppk 数值等同、标签失真。
+                    _sv_sw = SPC.sigma_within_mr(_sv)
                     _sc = SPC.process_capability(_sv, (s["spec"] or {}).get("lsl"),
                                                  (s["spec"] or {}).get("usl"),
-                                                 (s["spec"] or {}).get("target"))
+                                                 (s["spec"] or {}).get("target"),
+                                                 sigma_within=_sv_sw)
                     if not _sc:
                         continue
                     _sc["version"] = s.get("version")
@@ -1822,6 +1843,16 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
                                           "该值不代表长期能力")
                 if _spec_src == "知识库推定":
                     cap["caveats"].append("规格为知识库推定值，非企业受控规格，不得用于对外报告")
+                if cap.get("cpk_suppressed_autocorr"):
+                    cap["caveats"].append(
+                        "序列存在显著自相关（AR(1) φ=%.2f），Cpk 已被抑制不报：其基于移动极差的 "
+                        "σ_within 在自相关序列上虚低，Ppk（整体 σ）更可靠"
+                        % (round(_acd_phi or 0.0, 2)))
+                if (cap.get("normality") or {}).get("sig"):
+                    cap["caveats"].append(
+                        "数据显著偏离正态（JB p=%.3f）：Cpk/Ppk 的不合格率与 σ 水平基于正态假设，"
+                        "此处不可直接套用，建议改用非参数能力或分位数法"
+                        % ((cap.get("normality") or {}).get("p") or 0.0))
             spc_res.append({
                 "column": c, "param_key": key, "param_name": spec.get("name", c),
                 "unit": spec.get("unit", ""), "chart_type": "X-MR",

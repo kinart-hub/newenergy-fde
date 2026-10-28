@@ -236,6 +236,22 @@ def selfcheck():
     return fails
 
 
+def code_version():
+    """从 lib/pipeline.py 抽取 ANALYZER_VERSION，作为唯一版本真源。
+
+    manifest.json 的 version 是 package.py 命名 dist zip 的来源。
+    它若手工维护就会漂——实测曾停在 2.10.0 而代码已是 2.19.1，
+    打出来的离线包文件名直接错乱，且此前门禁全程静默。
+    """
+    p = os.path.join(ROOT, "lib", "pipeline.py")
+    try:
+        txt = io.open(p, encoding="utf-8").read()
+    except Exception:
+        return None
+    m = re.search(r'ANALYZER_VERSION\s*=\s*["\']([^"\']+)["\']', txt)
+    return m.group(1) if m else None
+
+
 def check_manifest_coverage():
     """部署清单完整性：manifest 说的必须和仓库实际一致。
 
@@ -307,6 +323,16 @@ def check_manifest_coverage():
     # optional 缺失**刻意不报**：它们本来就是运行期按需生成的，
     # 首次部署必然没有。每次都报，等于训练使用者把所有提醒都划掉，
     # 真需要看的提醒也会被一起划掉——噪音比它传达的信息更贵。
+
+    # --- 版本号必须与代码真源一致 ---
+    # manifest.json 的 version 是 package.py 命名 dist zip 的来源；
+    # 它若手工维护就会漂，且此前门禁全程静默。统一以代码常量为真源。
+    cv = code_version()
+    if cv and m.get("version") != cv:
+        out.append(("BLOCK",
+                    "版本号不一致：manifest.json=%s 但代码 ANALYZER_VERSION=%s；"
+                    "运行 python scripts/gen_manifest.py 重建清单以同步"
+                    % (m.get("version"), cv)))
     return out
 
 

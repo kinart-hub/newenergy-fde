@@ -263,9 +263,7 @@ def phase1_limits(values, max_iter=4, rules=(1, 2, 3), max_drop_ratio=0.25,
         hit = set()
         for v in vios:
             for jj in v["indexes"]:
-                if jj in hit:
-                    continue
-                hit.add(jj)
+                hit.add(jj)                       # 本迭代新命中（用于剔除/终止判定）
                 orig = idxs_all[alive[jj]]
                 d = cand_by_idx.get(orig)
                 if d is None:
@@ -273,6 +271,9 @@ def phase1_limits(values, max_iter=4, rules=(1, 2, 3), max_drop_ratio=0.25,
                     d = {"index": orig, "local_index": alive[jj], "iteration": it + 1,
                          "rules": set(), "value": vals[alive[jj]], "z": z}
                     cand_by_idx[orig] = d
+                # 关键：同一异常点若同时满足多条 Nelson 规则，必须把每条都记上。
+                # 旧逻辑在「已被更早规则命中」时 continue 跳过，导致第二条规则丢失——
+                # 报告里的规则归因、威廉斯诊断据此给出错误结论。
                 d["rules"].add(v["rule"])
         if not hit:
             break
@@ -323,9 +324,20 @@ def phase1_limits(values, max_iter=4, rules=(1, 2, 3), max_drop_ratio=0.25,
                     "当前控制限由全段估计、偏宽，判异灵敏度下降，结论需谨慎使用"
                     % (max_drop_ratio * 100))
         else:
-            stable = True
-            note = ("稳定期由 %d 个点中筛出 %d 个点建立（迭代 %d 轮，剔除非受控点 %d 个），"
-                    "控制限不再受异常段影响" % (n_total, len(alive), iters, len(excluded)))
+            _excl_ratio = (len(excluded) / n_total) if n_total else 0.0
+            # 剔除比例虽未到封顶（25%），但已显著（>5% 或超过 2 个点）——
+            # 说明原始序列存在成段非受控点。基线虽经清洗可用，原始过程本身
+            # 不能算"稳定"，否则报告会写着"已建立稳定基线"而现场全是事。
+            if len(excluded) > max(2, 0.05 * n_total):
+                stable = False
+                note = ("原始序列存在 %d 个（%.1f%%）非受控点，已剔除以建立稳定基线；"
+                        "控制限基于清洗后数据——但若这些点是真实工艺偏移，应作为"
+                        "不稳定信号上报，而非视为稳定过程" %
+                       (len(excluded), _excl_ratio * 100))
+            else:
+                stable = True
+                note = ("稳定期由 %d 个点中筛出 %d 个点建立（迭代 %d 轮，剔除非受控点 %d 个），"
+                        "控制限不再受异常段影响" % (n_total, len(alive), iters, len(excluded)))
     elif mode == "suggest":
         # 不剔除：基线用全段（含候选点），把候选点交给人审
         base_positions = list(range(n_total))
@@ -864,7 +876,7 @@ def nelson_violations(chart_values, center, sigma, rules=None):
 
     # 规则1
     add(1, [i for i, z in enumerate(zs) if z is not None and abs(z) > 3])
-    # 规则2: 连续9点同侧
+    # 规则2: 连续9点同侧 —— 命中即整段连续返回（不得隔点）
     run_side, run_start = None, 0
     hits = []
     for i, z in enumerate(zs):
@@ -872,12 +884,12 @@ def nelson_violations(chart_values, center, sigma, rules=None):
             continue
         s = 1 if z > 0 else (-1 if z < 0 else 0)
         if s == run_side:
-            if i - run_start + 1 >= 9 and (not hits or hits[-1] != i - 1):
+            if i - run_start + 1 >= 9:
                 hits.append(i)
         else:
             run_side, run_start = s, i
     add(2, hits)
-    # 规则3: 连续6点单调
+    # 规则3: 连续6点单调 —— 趋势一旦成型，该方向每点都命中，天然连续
     hits = []
     up = dn = 0
     prev = None
@@ -891,9 +903,9 @@ def nelson_violations(chart_values, center, sigma, rules=None):
                 dn, up = dn + 1, 0
             else:
                 up = dn = 0
-            if up >= 5 and (not hits or hits[-1] != i - 1):
+            if up >= 5:
                 hits.append(i)
-            if dn >= 5 and (not hits or hits[-1] != i - 1):
+            if dn >= 5:
                 hits.append(i)
         prev = v
     add(3, hits)
@@ -910,10 +922,10 @@ def nelson_violations(chart_values, center, sigma, rules=None):
         else:
             alt = 1
         prev_s = s
-        if alt >= 14 and (not hits or hits[-1] != i - 1):
+        if alt >= 14:
             hits.append(i)
     add(4, hits)
-    # 规则5: 连续3点中2点在A区（|z|>2，同侧）
+    # 规则5: 连续3点中2点在A区（|z|>2，同侧）—— 滑动窗重叠，命中天然连续
     hits = []
     for i in range(2, len(zs)):
         w = zs[i - 2:i + 1]
@@ -922,8 +934,7 @@ def nelson_violations(chart_values, center, sigma, rules=None):
         pos = sum(1 for z in w if z > 2)
         neg = sum(1 for z in w if z < -2)
         if pos >= 2 or neg >= 2:
-            if not hits or hits[-1] != i - 1:
-                hits.append(i)
+            hits.append(i)
     add(5, hits)
     # 规则6: 连续5点中4点在B区外（|z|>1，同侧）
     hits = []
@@ -934,8 +945,7 @@ def nelson_violations(chart_values, center, sigma, rules=None):
         pos = sum(1 for z in w if z > 1)
         neg = sum(1 for z in w if z < -1)
         if pos >= 4 or neg >= 4:
-            if not hits or hits[-1] != i - 1:
-                hits.append(i)
+            hits.append(i)
     add(6, hits)
     # 规则7: 连续15点在C区（|z|<1）
     hits = []
@@ -943,7 +953,7 @@ def nelson_violations(chart_values, center, sigma, rules=None):
     for i, z in enumerate(zs):
         if z is not None and abs(z) < 1:
             run += 1
-            if run >= 15 and (not hits or hits[-1] != i - 1):
+            if run >= 15:
                 hits.append(i)
         else:
             run = 0
@@ -955,17 +965,39 @@ def nelson_violations(chart_values, center, sigma, rules=None):
         if any(z is None for z in w):
             continue
         if all(abs(z) > 1 for z in w) and any(z > 0 for z in w) and any(z < 0 for z in w):
-            if not hits or hits[-1] != i - 1:
-                hits.append(i)
+            hits.append(i)
     add(8, hits)
     return out
 
 
 # ------------------------------------------------------------------ 过程能力
 
+def sigma_within_mr(values):
+    """移动极差法（X-MR）估计的 within-σ。
+
+    用于分段能力（评审 P1-3）：每段用自己的 σ_within 算 Cpk，而不是退化为整体 σ
+    ——否则分段 Cpk 与 Ppk 数值等同，标签失真（短期能力被当成长期能力）。
+    """
+    vs = [v for v in (values or []) if v is not None]
+    if len(vs) < 2:
+        return None
+    mrs = [abs(vs[i] - vs[i - 1]) for i in range(1, len(vs))]
+    if not mrs:
+        return None
+    mb = sum(mrs) / len(mrs)
+    if not mb or mb <= 0:
+        return None
+    return mb / D2[2]
+
+
 def process_capability(values, lsl=None, usl=None, target=None,
-                       sigma_within=None, sigma_overall=None):
-    """返回能力指标 dict"""
+                       sigma_within=None, sigma_overall=None,
+                       autocorr_phi=None):
+    """返回能力指标 dict
+
+    autocorr_phi：AR(1) 系数。|φ| > 0.3 时 σ_within（移动极差法）会系统性低估
+    真实短期变差，使 Cpk 虚高，此时抑制 Cpk/Cp，退回用整体 σ 的 Ppk（评审 P1-1）。
+    """
     vals = [v for v in values if v is not None]
     n = len(vals)
     if n < 2:
@@ -975,9 +1007,22 @@ def process_capability(values, lsl=None, usl=None, target=None,
     sw = sigma_within or so
     res = {"n": n, "mean": mu, "sigma_within": sw, "sigma_overall": so,
            "lsl": lsl, "usl": usl, "target": target}
+    # 自相关拦截（评审 P1-1）：σ_within 由移动极差估计，在存在正自相关的序列上会
+    # 系统性低估真实短期变差，使 Cpk 虚高。|φ| > 0.3 时 Cpk/Cp 不可信，
+    # 退回用整体 σ 的长周期能力（Ppk）并明确标注，避免"虚假的高能力"。
+    _autocorr_suppress = (
+        autocorr_phi is not None
+        and abs(autocorr_phi) > 0.3
+        and sw is not None
+    )
     if lsl is None and usl is None:
         return res
-    if sw and sw > 0:
+    if _autocorr_suppress:
+        # 自相关使 σ_within 虚低 → Cpk/Cp 虚高，不报短期能力，沿用 Ppk（整体 σ）。
+        res["Cp"] = None
+        res["Cpk"] = None
+        res["cpk_suppressed_autocorr"] = True
+    elif sw and sw > 0:
         if usl is not None and lsl is not None:
             res["Cp"] = (usl - lsl) / (6 * sw)
             res["Cpk"] = min(usl - mu, mu - lsl) / (3 * sw)
@@ -996,6 +1041,17 @@ def process_capability(values, lsl=None, usl=None, target=None,
             u = usl if usl is not None else lsl
             d = (u - mu) if usl is not None else (mu - lsl)
             res["Ppk"] = d / (3 * so)
+    # 正态性诊断（评审 P1-4）：Cpk/Ppk 的不合格率与 σ 水平由正态假设反推，
+    # 显著非正态时这些数值不可直接套用。jarque_bera 此前定义却从未接入，这里补上，
+    # 把正态性结论写进结果供报告标注。
+    try:
+        _jb_stat, _jb_p = S.jarque_bera(vals)
+        res["normality"] = {
+            "stat": _jb_stat, "p": _jb_p,
+            "sig": (_jb_p is not None and _jb_p < 0.05),
+        }
+    except Exception:
+        res["normality"] = None
     # 预期不合格率（正态假设）
     p_below = S.norm_cdf((lsl - mu) / so) if lsl is not None and so else 0.0
     p_above = 1 - S.norm_cdf((usl - mu) / so) if usl is not None and so else 0.0
@@ -1012,7 +1068,12 @@ def process_capability(values, lsl=None, usl=None, target=None,
     # 判定
     cpk = res.get("Cpk")
     if cpk is None:
-        res["verdict"] = "无双侧规格，仅计算单侧能力"
+        if _autocorr_suppress:
+            res["verdict"] = ("自相关显著（φ=%.2f）：Cpk 基于 σ_within 会被序列惯性虚高，"
+                              "已不报 Cpk，请以 Ppk（整体 σ）为长期能力基准"
+                              % (autocorr_phi if autocorr_phi is not None else 0.0))
+        else:
+            res["verdict"] = "无双侧规格，仅计算单侧能力"
     elif cpk >= 1.67:
         res["verdict"] = "能力充足（A 级）"
     elif cpk >= 1.33:

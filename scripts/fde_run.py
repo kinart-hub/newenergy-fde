@@ -1816,8 +1816,9 @@ def rule_p1_verifiability_weighted():
         return _r(False, "可验证性仍硬编码为 0.5：权重未真正生效")
     if re.search(r"0\.10\s*\*\s*0\.5", t):
         return _r(False, "评分仍写死 0.10*0.5：可验证性未参评")
-    # 3) 收尾段必须把可验证性分项计入总分（正确调用形态：0.10 * _vf）
-    if not re.search(r"0\.10\s*\*\s*_vf", t):
+    # 3) 收尾段必须把可验证性分项计入总分（调用形态：0.10*_vf 或直接引用权重常量）
+    if not (re.search(r"0\.10\s*\*\s*_vf", t)
+            or 'ROOTCAUSE_WEIGHTS["verifiability"] * _vf' in t):
         return _r(False, "总分未含 0.10*_vf：可验证性未计入排序")
     # 4) 候选必须输出分项，且返回体注明权重是启发式非概率
     if '"verifiability_score"' not in t:
@@ -2864,6 +2865,131 @@ def rule_boundary_policy_evidence():
                     "未登记则 warn、无编号/过期的登记被点名，且使用人可指到自家受控清单")
 
 
+# ----------------------------------------------------------------------------
+# 本轮审计修复的 7 条规则（P0-1 / P0-2 / P0-3 / P0-4 / P1-1 / P1-3 / P1-4）。
+# 每条都带反向验证变异：变异注入"修复退化"后，规则必须判不过（FAIL），
+# 否则这条规则只报 OK、实际没验过判别力（比 FAIL 更危险的 SKIP）。
+# 判据落在**调用形态/修复特征**上，不落在描述字样上，避免"删了功能只留注释"蒙混过关。
+# ----------------------------------------------------------------------------
+
+def rule_p0_nelson_run_contiguous():
+    """P0-1：Nelson 规则2（连续9点同侧）必须整段连续返回，不得隔点。
+
+    修复前规则2 带 `and (not hits or hits[-1] != i - 1)` 抑制条件，
+    连续违规段会被切成一段段的，报告里"连续9点同侧"实际只标了首尾零散几点。
+    """
+    t = _read(SPCPy) or ""
+    if "def nelson_violations(" not in t:
+        return _r(False, "缺 nelson_violations：判异逻辑缺失")
+    if "and (not hits or hits[-1] != i - 1)" in t:
+        return _r(False, "规则2 仍残留隔点抑制：连续同侧会隔点返回")
+    if "if i - run_start + 1 >= 9:" not in t:
+        return _r(False, "规则2 的 9 点同侧判定结构缺失")
+    return _r(True, "", {"nelson_run_contiguous": True})
+
+
+def rule_p0_phase1_excl_unstable():
+    """P0-2：Phase I 剔除比例>5%（或>2点）必须判为不稳定，不得谎报稳定。
+
+    修复前只要剔除未到 25% 封顶就 stable=True，原始序列成段非受控点被悄悄剔除，
+    报告写着"已建立稳定基线"而现场全是事。
+    """
+    t = _read(SPCPy) or ""
+    if "def phase1_limits(" not in t:
+        return _r(False, "缺 phase1_limits：SPC 剔除逻辑缺失")
+    if "0.05 * n_total" not in t:
+        return _r(False, "缺失剔除比例>5% 判不稳定：非受控点>5% 仍会谎报稳定")
+    if "len(excluded) > max(2, 0.05 * n_total)" not in t:
+        return _r(False, "剔除比例判据未接 stable：>5% 不会改判不稳定")
+    return _r(True, "", {"phase1_excl_unstable": True})
+
+
+def rule_p0_multi_rule_record():
+    """P0-3：同一点命中多条 Nelson 规则都必须记录（规则溯源不丢）。
+
+    修复前候选点记录循环里 `if jj in hit: continue` 早退，
+    同一异常点若同时满足多条规则，第二条规则被吞掉，根因归因给出错误结论。
+    """
+    t = _read(SPCPy) or ""
+    if "def phase1_limits(" not in t:
+        return _r(False, "缺 phase1_limits：SPC 剔除逻辑缺失")
+    if 'd["rules"].add(v["rule"])' not in t:
+        return _r(False, "候选点规则记录未落实（逐点规则身份缺失）")
+    if "if jj in hit:" in t:
+        return _r(False, "候选记录仍含'已命中即跳过'早退：多规则溯源会丢失")
+    return _r(True, "", {"multi_rule_record": True})
+
+
+def rule_p0_scope_isolation():
+    """P0-4：analyze 无租户/无行业时必须显式清空作用域（SC.set_industries(None)）。
+
+    修复前缺少该 else 分支，上一次分析设置的行业会泄漏到本次，
+    把本次数据按错误行业裁掉、识别率暴跌甚至吐出虚假根因。
+    """
+    tp = _read(PIPELINE_FILE) or ""
+    if "SC.set_industries(None)" not in tp:
+        return _r(False, "analyze 缺少无行业/租户时清空作用域：上一次分析的行业会泄漏到本次")
+    if "SC.set_industries(industry)" not in tp:
+        return _r(False, "行业分支未接线 set_industries：作用域隔离不完整")
+    return _r(True, "", {"scope_isolation": True})
+
+
+def rule_p1_autocorr_cpk_suppress():
+    """P1-1：自相关 AR(1) φ>0.3 时 Cpk 必须被抑制（退回 Ppk），不得虚高报出。
+
+    修复前 process_capability 不接收 autocorr_phi，自相关序列的 σ_within（移动极差）
+    系统性低估真实短期变差，Cpk 虚高——现场据此放行的"高能力"是假的。
+    """
+    t = _read(SPCPy) or ""
+    if "def process_capability(" not in t:
+        return _r(False, "缺 process_capability")
+    if "autocorr_phi=None" not in t:
+        return _r(False, "process_capability 未接收 autocorr_phi：自相关 Cpk 拦截无处接入")
+    if "cpk_suppressed_autocorr" not in t:
+        return _r(False, "缺少 Cpk 抑制标记：自相关序列 Cpk 仍会被虚高报出")
+    if "_autocorr_suppress" not in t:
+        return _r(False, "缺少自相关抑制判定：|φ|>0.3 时不会退回 Ppk")
+    tp = _read(PIPELINE_FILE) or ""
+    if "autocorr_phi=_acd_phi" not in tp:
+        return _r(False, "pipeline 未把 AR(1) φ 传入能力计算：拦截未接线")
+    return _r(True, "", {"autocorr_cpk_suppress": True})
+
+
+def rule_p1_segment_sigma_within():
+    """P1-3：分段能力必须用每段自己的 σ_within 算 Cpk，不得退化为整体 σ。
+
+    修复前分段能力不传 sigma_within，Cpk 与 Ppk 数值等同、标签失真
+    （短期能力被当成长期能力），跨版本能力对比失去意义。
+    """
+    t = _read(SPCPy) or ""
+    if "def sigma_within_mr(" not in t:
+        return _r(False, "缺 sigma_within_mr：分段能力无法用各自 σ_within 算 Cpk")
+    tp = _read(PIPELINE_FILE) or ""
+    if "SPC.sigma_within_mr(_sv)" not in tp:
+        return _r(False, "分段未调用 sigma_within_mr 估计 σ_within")
+    if "sigma_within=_sv_sw" not in tp:
+        return _r(False, "分段能力未传入各自 σ_within：Cpk 退化为 Ppk（标签失真）")
+    return _r(True, "", {"segment_sigma_within": True})
+
+
+def rule_p1_normality_in_capability():
+    """P1-4：正态性诊断（jarque_bera）必须接入能力计算并输出 normality.sig。
+
+    修复前 jarque_bera 定义却从不调用，显著非正态时 Cpk/Ppk 的不合格率与 σ 水平
+    基于正态假设不可信，却无人标注。
+    """
+    t = _read(SPCPy) or ""
+    if "def process_capability(" not in t:
+        return _r(False, "缺 process_capability")
+    if "S.jarque_bera(" not in t:
+        return _r(False, "能力计算未接入 jarque_bera：正态性诊断仍定义却从不调用")
+    if '"normality"' not in t:
+        return _r(False, "能力结果未输出 normality：显著非正态时 Cpk/Ppk 不可信却无人标注")
+    if '"sig"' not in t:
+        return _r(False, "normality 未含 sig 标志：使用者无从判断正态假设是否成立")
+    return _r(True, "", {"normality_in_capability": True})
+
+
 AUDIT_RULES = [
     Rule("LICENSE 与代码事实对齐：Elastic 2.0 正文齐全且无许可密钥条款", rule_license,
          "（1）首行必须是裸文本 'Elastic License 2.0'（带 # 判不过）；"
@@ -3418,9 +3544,8 @@ AUDIT_RULES = [
                   _re_sub(r"^def _verifiability\(",
                           "def _verifiability2(", flags=re.M), ROOTCAUSE_FILE),
           _mutant("总分写死 0.10*0.5（权重不再参评）",
-                  _re_sub(r"0\.40 \* _ev \+ 0\.35 \* _pr \+ 0\.15 \* _ts \+ 0\.10 \* _vf",
-                          "0.40 * _ev + 0.35 * _pr + 0.15 * _ts + 0.10 * 0.5",
-                          flags=re.M), ROOTCAUSE_FILE),
+                  _re_sub(r'ROOTCAUSE_WEIGHTS\["verifiability"\] \* _vf',
+                          "0.10 * 0.5", flags=re.M), ROOTCAUSE_FILE),
           _mutant("候选不再输出可验证性分项",
                   _re_sub(r'c\["verifiability_score"\] = round\(_vf, 3\)',
                           "pass  # 不再输出分项", flags=re.M), ROOTCAUSE_FILE)]),
@@ -3945,6 +4070,68 @@ AUDIT_RULES = [
                   _sub('且 Cpk≥1.33 时使用',
                        '时使用'),
                   PIPELINE_FILE)]),
+    # —— 本轮审计修复的 7 条规则（带反向验证变异）——
+    Rule("Nelson 规则2 连续同侧必须整段返回（不得隔点）",
+         rule_p0_nelson_run_contiguous,
+         "nelson_violations 规则2 不得再含 'and (not hits or hits[-1] != i - 1)' 隔点抑制；"
+         "连续 9 点同侧必须整段连续返回。",
+         SPCPy,
+         [_mutant("规则2 重新引入隔点抑制（修复退化）",
+                  _sub("            if i - run_start + 1 >= 9:",
+                       "            if i - run_start + 1 >= 9 and (not hits or hits[-1] != i - 1):"),
+                  SPCPy)]),
+    Rule("Phase I 剔除比例>5% 必须判为不稳定（不得谎报稳定）",
+         rule_p0_phase1_excl_unstable,
+         "phase1_limits 必须含 'len(excluded) > max(2, 0.05 * n_total)' 判据并据此置 stable=False；"
+         "阈值不得被改大到永不触发。",
+         SPCPy,
+         [_mutant("剔除比例阈值改到 95%（修复退化：>5% 不再判不稳）",
+                  _sub("max(2, 0.05 * n_total)", "max(2, 0.95 * n_total)"),
+                  SPCPy)]),
+    Rule("同一异常点命中多规则都必须记录（规则溯源不丢）",
+         rule_p0_multi_rule_record,
+         "phase1_limits 候选记录必须含 d['rules'].add(v['rule']) 且无 'if jj in hit:' 早退；"
+         "同一点的多条 Nelson 规则不得被吞掉。",
+         SPCPy,
+         [_mutant("候选记录重新引入'已命中即跳过'早退（修复退化：多规则溯源丢失）",
+                  _sub('                d["rules"].add(v["rule"])',
+                       '                if jj in hit:\n                    continue\n                d["rules"].add(v["rule"])'),
+                  SPCPy)]),
+    Rule("无租户/无行业时显式清空作用域（防行业泄漏）",
+         rule_p0_scope_isolation,
+         "pipeline.analyze 必须含 SC.set_industries(None) 的清空分支；"
+         "否则上一次分析的行业会泄漏到本次分析。",
+         PIPELINE_FILE,
+         [_mutant("去掉清空作用域分支（修复退化：行业泄漏）",
+                  _drop_line("SC.set_industries(None)"),
+                  PIPELINE_FILE)]),
+    Rule("自相关 AR(1) φ>0.3 时 Cpk 必须被抑制（退回 Ppk）",
+         rule_p1_autocorr_cpk_suppress,
+         "process_capability 必须接收 autocorr_phi 并据 |φ|>0.3 抑制 Cpk"
+         "（cpk_suppressed_autocorr + _autocorr_suppress）；pipeline 必须传 autocorr_phi=_acd_phi。",
+         SPCPy,
+         [_mutant("process_capability 去掉 autocorr_phi 入参（修复退化：拦截失效）",
+                  _sub("autocorr_phi=None", "_autocorr_phi_unused=None"),
+                  SPCPy)]),
+    Rule("分段能力用各自 σ_within 算 Cpk（不得退化为 Ppk）",
+         rule_p1_segment_sigma_within,
+         "spc.py 必须有 sigma_within_mr；pipeline 分段能力必须调用 SPC.sigma_within_mr(_sv)"
+         "并传入 sigma_within=_sv_sw。",
+         PIPELINE_FILE,
+         [_mutant("分段能力去掉各自 σ_within 传入（修复退化：Cpk≈Ppk）",
+                  _drop_line("sigma_within=_sv_sw"),
+                  PIPELINE_FILE),
+          _mutant("分段去掉 sigma_within_mr 调用（修复退化）",
+                  _drop_line("_sv_sw = SPC.sigma_within_mr(_sv)"),
+                  PIPELINE_FILE)]),
+    Rule("正态性诊断(jarque_bera)接入能力计算并输出 normality.sig",
+         rule_p1_normality_in_capability,
+         "process_capability 必须调用 jarque_bera 并输出 res['normality']（含 sig）；"
+         "否则显著非正态时 Cpk/Ppk 不可信却无人标注。",
+         SPCPy,
+         [_mutant("process_capability 去掉 jarque_bera 调用（修复退化：不诊断正态性）",
+                  _sub("S.jarque_bera(vals)", "S._jb_removed(vals)"),
+                  SPCPy)]),
 ]
 
 
