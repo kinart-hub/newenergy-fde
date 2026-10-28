@@ -169,7 +169,7 @@ if EV is not None and EV.__name__ != "lib.events":
 KB = PP.load_knowledge()
 _fmt = RPT._fmt
 
-ANALYZER_VERSION = "2.18.0"
+ANALYZER_VERSION = "2.19.0"
 
 
 # 空数据排查清单。
@@ -1655,6 +1655,15 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
             # 直接用全段算限的话，异常自己会把 σ 撑大、把控制限撑宽，
             # 结果就是最该报警的那批点反而"在限内"——SPC 失效的头号原因。
             _rules = SPC.parse_rules(rules)
+            # 全规则前置条件（评审 P1-1 验收）：八条 Nelson 全开只适合过程已经
+            # 稳定受控、Cpk≥1.33 的场景——否则"连续 N 点同侧"这类规则会把
+            # 正常漂移当异常，报警刷屏到现场把图关掉。规则集本身不拦，但要明说
+            # 前置条件，让使用者在误报面前知道"是规则开多了，不是工具坏了"。
+            if set(_rules) == set(SPC.ALL_RULES) and len(_rules) == len(SPC.ALL_RULES):
+                result.setdefault("warnings", []).append(
+                    "已启用全量 Nelson 判异规则（8 条）。全规则仅建议在过程已稳定受控"
+                    "且 Cpk≥1.33 时使用——否则序列自相关/常规漂移会触发大量假报警。"
+                    "误报率高时请用 --rules basic 收回基本集。")
             p1 = SPC.phase1_limits(vals, mode=spc_exclusion_mode)
             if p1 and p1.get("stable"):
                 xc, rc = SPC.x_mr_with_limits(vals, p1["center"], p1["sigma"])

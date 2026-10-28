@@ -5218,6 +5218,36 @@ def test_license_notice():
             pass
 
 
+def test_full_rules_precondition():
+    """全量判异规则前置条件（评审 P1-1 验收）。"""
+    print("\n[全规则前置条件]")
+    import tempfile as _tmp, os as _os
+    from lib import pipeline as PL, spc as SPC
+    check("默认规则集是低误报基本集（不是全规则）",
+          SPC.DEFAULT_RULES == (1, 2, 3, 5), str(SPC.DEFAULT_RULES))
+    check("all 预设是全部 8 条",
+          SPC.RULE_PRESETS["all"] == SPC.ALL_RULES, str(SPC.RULE_PRESETS["all"]))
+    f1 = os.path.join(ROOT, "examples", "01_涂布工艺数据.csv")
+    if not os.path.exists(f1):
+        check("示例 01 存在（全规则前置）", False, f1)
+        return
+    tdir = _tmp.mkdtemp(prefix="fullrules-")
+    try:
+        r = PL.analyze([f1], outdir=os.path.join(tdir, "out"), rules="all",
+                       export_xlsx=False, export_docx=False, export_pdf=False)
+        check("启用全规则时给前置条件告警",
+              any("全量 Nelson" in w for w in (r.get("warnings") or [])), "")
+        check("前置条件提到 Cpk≥1.33 与过程稳定（前提写全）",
+              any("Cpk≥1.33" in w and "稳定受控" in w for w in (r.get("warnings") or [])), "")
+    finally:
+        try:
+            import shutil
+            shutil.rmtree(tdir)
+        except Exception:
+            # scan:keep 同上
+            pass
+
+
 if __name__ == "__main__":
     print("newenergy-fde 自检开始")
     test_table()
@@ -5271,6 +5301,7 @@ if __name__ == "__main__":
     test_action_cards()
     test_process_fallback()
     test_license_notice()
+    test_full_rules_precondition()
     test_quality_manager_guide()
     print("\n" + "=" * 56)
     print("通过 %d 项，失败 %d 项" % (len(PASS), len(FAIL)))

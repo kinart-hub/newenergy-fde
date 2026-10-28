@@ -2551,6 +2551,32 @@ def rule_license_notice():
     return _r(True, "", {"n_checks": 5})
 
 
+def rule_full_rules_precondition():
+    """全量判异规则必须有前置条件提示（默认低误报，全规则需稳定 + Cpk≥1.33）。
+
+    八条 Nelson 全开只适合过程已稳定受控、Cpk≥1.33 的场景——否则序列自相关/
+    常规漂移会触发大量假报警，现场把图一关，比没有图更糟。规则集本身不拦
+    （内部自用不被误拦），但必须明说前置条件，让使用者在误报面前知道
+    "是规则开多了，不是工具坏了"。
+    """
+    p = _read(PIPELINE_FILE) or ""
+    g = _read(SPCPy) or ""
+    if not p or not g:
+        return _r(False, "读不到 lib/pipeline.py 或 lib/spc.py")
+    # 1) 全规则必须提示前置条件
+    if "已启用全量 Nelson 判异规则（8 条）" not in p:
+        return _r(False, "全规则没有前置条件提示：使用者会把自相关误报当工具坏了")
+    # 2) 前置条件必须是"稳定 + Cpk≥1.33"（这是统计上的正确前提，不能只写一半）
+    if "且 Cpk≥1.33 时使用" not in p:
+        return _r(False, "前置条件没有提 Cpk≥1.33：稳定受控这个前提被丢掉")
+    if "过程已稳定受控" not in p:
+        return _r(False, "前置条件没有提过程稳定：只写 Cpk 丢了一半前提")
+    # 3) 默认仍是低误报基本集（不是把全规则当默认）
+    if "DEFAULT_RULES = (1, 2, 3, 5)" not in g:
+        return _r(False, "默认规则集不是低误报基本集：默认就全开会误报泛滥")
+    return _r(True, "", {"n_checks": 4})
+
+
 def rule_lot_segment():
     """批号里提取的分组维度，不能是流水号。
 
@@ -3904,6 +3930,20 @@ AUDIT_RULES = [
           _mutant("对外服务场景不提提醒（内部/外部边界被糊掉）",
                   _sub('请先确认商业授权状态。本报告自身不因此限制内部使用。',
                        '本报告不因此限制使用。'),
+                  PIPELINE_FILE)]),
+    Rule("全量判异规则必须有前置条件提示（默认低误报，全规则需稳定+Cpk≥1.33）",
+         rule_full_rules_precondition,
+         "（1）启用全部 8 条 Nelson 规则时必须提示前置条件（稳定 + Cpk≥1.33）；"
+         "（2）提示是 warn 不是硬阻断（内部自用不被误拦）；"
+         "（3）默认规则集保持低误报（basic 基本集，不是全规则）",
+         PIPELINE_FILE,
+         [_mutant("全规则不提示前置条件（使用者把自相关误报当工具坏了）",
+                  _sub('已启用全量 Nelson 判异规则（8 条）。全规则仅建议在过程已稳定受控',
+                       '已启用全量 Nelson 判异规则（8 条）。'),
+                  PIPELINE_FILE),
+          _mutant("前置条件不提 Cpk≥1.33（稳定受控这个前提被丢掉）",
+                  _sub('且 Cpk≥1.33 时使用',
+                       '时使用'),
                   PIPELINE_FILE)]),
 ]
 
