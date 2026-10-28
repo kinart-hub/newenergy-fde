@@ -9,7 +9,7 @@
 ![License](https://img.shields.io/badge/license-Elastic--2.0-blue)
 ![Python](https://img.shields.io/badge/python-3.8%2B-blue)
 ![Dependencies](https://img.shields.io/badge/dependencies-0-brightgreen)
-![Self-test](https://img.shields.io/badge/selftest-874%20passing-brightgreen)
+![Self-test](https://img.shields.io/badge/selftest-878%20passing-brightgreen)
 
 ![newenergy-fde](assets/social-preview.png)
 
@@ -24,7 +24,7 @@
 git clone https://github.com/kinart-hub/newenergy-fde.git
 cd newenergy-fde
 
-python scripts/selftest.py          # 874 项端到端自检，应全部通过
+python scripts/selftest.py          # 878 项端到端自检，应全部通过
 python scripts/fde_run.py analyze -i examples/01_涂布工艺数据.csv -o output/try
 ```
 
@@ -41,7 +41,7 @@ python scripts/fde_run.py analyze -i examples/01_涂布工艺数据.csv -o outpu
 
 > 报告拿到手不知道怎么读、或者要拿去开会/答复客户：
 > 看 [`docs/报告解读入门-给质量经理.md`](docs/报告解读入门-给质量经理.md)——
-> 五分钟版只看四处、每节要做哪个决定、六个会导致错误决定的读法、术语与打印清单。
+> 五分钟版只看四处、每节要做哪个决定、八个会导致错误决定的读法、术语与打印清单。
 > 那一份不需要统计基础。
 > 想知道某条评审建议到底做没做：看 [`docs/评审报告-落实台账.md`](docs/评审报告-落实台账.md)
 > ——9 条逐条带落点、commit 与可直接复制运行的复核命令。
@@ -187,7 +187,7 @@ python scripts/fde_run.py analyze --input data.csv \
 python scripts/fde_run.py analyze --input data.csv \
        --exclude-recovery 3 --outdir out
 
-# 自检（874 项，含设备适配层、跨工序追溯、多企业隔离、行业作用域、基线热更新、设备记忆与知识库演进）
+# 自检（878 项，含设备适配层、跨工序追溯、多企业隔离、行业作用域、基线热更新、设备记忆与知识库演进）
 python scripts/selftest.py
 ```
 
@@ -247,7 +247,7 @@ newenergy-fde/
 │       ├── kb_manage.py              知识库管理台（status/list/propose/intake/harvest/
 │   │                             review/sync/verify/cases/devices/industries/update/rollback/patch）
 │   ├── make_device_samples.py    生成多厂商版式的对照样例（同一真值、不同导出）
-│   └── selftest.py               874 项端到端自检（含设备适配层、跨工序追溯、多企业隔离、行业作用域、基线热更新、设备记忆与知识库演进）
+│   └── selftest.py               878 项端到端自检（含设备适配层、跨工序追溯、多企业隔离、行业作用域、基线热更新、设备记忆与知识库演进）
 └── examples/
     ├── *.csv                     九类示例数据（6 类工况 + 私有列名 + 跨规格版本 + 批号分组）
     └── devices/*.csv             六类设备导出样例（竖表/双行表头/单位行/合计行/未知设备)

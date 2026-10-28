@@ -394,6 +394,38 @@ def test_pipeline():
     check("『隐裂』匹配 EL 隐裂计数而非不良率",
           PP.match_param("隐裂", prefer_process="pv_cell_el") == "el_crack",
           str(PP.match_param("隐裂", prefer_process="pv_cell_el")))
+    # ── P1-2（外部审计报告 v2.12 基线）：列名匹配过于宽松，单字符/反向包含导致误配 ──
+    # 复现结论：报告举的实例（T/温/度/烘箱温度/温度）在当前代码里已不复现，但**不能据此
+    # 写断言**——实测把这三条变异（拆 ≥3 护栏 / 拆 0.6 门槛 / 门槛改 0.95）逐个注入，
+    # 那 5 条实例断言**全部照样通过**（数据碰巧不命中，不是护栏在挡）。这种用例看着绿、
+    # 实则零保护，等于给门禁刷假星。此处改用**对单条护栏逐一敏感**的合成用例：
+    #   ① 短名护栏   ：target='不良' ↔ 别名'不良率'    → 只在拆 ≥3 护栏时变
+    #   ② 比分门槛   ：target='面密度' ↔ 别名'极片面密度测量值' → 只在拆 0.6 门槛时变
+    #   ③ 门槛不过紧 ：target='EL不良率' ↔ 别名'不良率' → 只在门槛变紧时变
+    # 三条合成用例彼此正交，任一条防护被改坏都有对应用例失败，不存在"全绿但没守护"。
+    _guard_ok = PP._search_param(PP._norm_name("不良"),
+                                 {"p1": {"name": "不良率", "aliases": []}})[0] is None
+    check("P1-2 短名护栏：『不良』不得子串误配『不良率』", _guard_ok,
+          str(PP._search_param(PP._norm_name("不良"),
+                               {"p1": {"name": "不良率", "aliases": []}})[0]))
+    _score_ok = PP._search_param(PP._norm_name("面密度"),
+                                 {"p1": {"name": "极片面密度测量值", "aliases": []}})[0] is None
+    check("P1-2 比分门槛：长度悬殊的『面密度』不得误配长参数名", _score_ok,
+          str(PP._search_param(PP._norm_name("面密度"),
+                               {"p1": {"name": "极片面密度测量值", "aliases": []}})[0]))
+    _ratio_ok = PP._search_param(PP._norm_name("EL不良率"),
+                                 {"p1": {"name": "不良率", "aliases": []}})[0] == "p1"
+    check("P1-2 门槛不过紧：长度比 0.75 的正常子串仍要命中", _ratio_ok,
+          str(PP._search_param(PP._norm_name("EL不良率"),
+                               {"p1": {"name": "不良率", "aliases": []}})[0]))
+    # 候选去重：同一参数可能在多个作用域里都被命中并被重复列出，
+    # 不去重会出现"伪多候选"（26 个别名受影响，如 不良率 ->
+    # ['defect_rate_generic', 'defect_rate_generic']），误导人工确认环节。
+    # 例：不用『EL不良率』——实测它本来就不重复，用它断言等于没查。
+    _cds = PP._match_one("不良率").get("candidates") or []
+    _cd_keys = [c["key"] for c in _cds]
+    check("P1-2 候选按 key 去重（无重复参数）",
+          len(_cd_keys) == len(set(_cd_keys)) and _cd_keys, str(_cd_keys))
 
 
 def _col_mean(tb, col):

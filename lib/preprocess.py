@@ -259,19 +259,23 @@ def _match_one(col_name, prefer_process=None):
     scopes.append(("global", params))
 
     rec = None
-    cands = []
+    cands = {}
     for scope_name, subset in scopes:
         k, via, sc, src = _search_param(target, subset)
         if k:
-            cands.append({"key": k, "score": round(sc, 3),
-                          "source": "exact" if src == "exact" else scope_name})
+            sc_r = round(sc, 3)
+            # 同一 key 可能跨作用域（process_scoped / generic / global）被多次列出，
+            # 按 key 去重保留最高分，避免候选列表出现重复 key 造成"伪多候选"误导。
+            if k not in cands or sc_r > cands[k]["score"]:
+                cands[k] = {"key": k, "score": sc_r,
+                            "source": "exact" if src == "exact" else scope_name}
             if rec is None:
                 rec = {"key": k, "source": "exact" if src == "exact" else scope_name,
                        "matched_via": via, "score": sc, "candidates": None}
     if rec is None:
         rec = {"key": None, "source": "unmatched", "matched_via": None,
                "score": 0.0, "candidates": None}
-    rec["candidates"] = sorted(cands, key=lambda x: -x["score"])[:3]
+    rec["candidates"] = sorted(cands.values(), key=lambda x: -x["score"])[:3]
     rec["unit_hint"] = _unit_hint(col_name)
     rec["unit_risk"] = _unit_mismatch(rec, col_name, params)
     rec["confidence"] = _confidence(rec)

@@ -620,6 +620,8 @@ AUDIT_FILES = [
     os.path.join("lib", "context.py"),
     os.path.join("lib", "actioncard.py"),
     os.path.join("lib", "preprocess.py"),
+    # 入门文档的"数字陷阱"规则要在这份文件里注入缺陷；缺了会静默 SKIP。
+    os.path.join("docs", "报告解读入门-给质量经理.md"),
     os.path.join("lib", "hotswap.py"),
     os.path.join("lib", "kbstore.py"),
     os.path.join("lib", "tenancy.py"),
@@ -1124,6 +1126,7 @@ EXCLUDE_FILE = os.path.join("lib", "exclude.py")
 CONTEXT_FILE = os.path.join("lib", "context.py")
 ACTIONCARD_FILE = os.path.join("lib", "actioncard.py")
 PREPROCESS_FILE = os.path.join("lib", "preprocess.py")
+INTRO_DOC = os.path.join("docs", "报告解读入门-给质量经理.md")
 SPCPy = os.path.join("lib", "spc.py")
 CONTRACT_FILE = os.path.join("lib", "contract.py")
 VIEWS_FILE = os.path.join("lib", "views.py")
@@ -2990,6 +2993,69 @@ def rule_p1_normality_in_capability():
     return _r(True, "", {"normality_in_capability": True})
 
 
+def rule_p1_2_column_match_guards():
+    """P1-2：列名→参数匹配必须同时具备「短名护栏」与「相似度门槛」且真的被调用。
+
+    为什么两条都要判（三条变异必须各倒一条）：
+    实测把报告中举的实例（T/温/度/烘箱温度/温度）写成断言全会导致假绿——
+    注入"拆 ≥3 护栏""拆 0.6 门槛""门槛改 0.95"三种变异，那五条断言全部照样通过，
+    因为真正让它们不命中"碰巧是知识库里没有那条别名"。门禁是用来抓改变的，
+    不是用来复述现状的。护栏本身的存在性必须直接锁：
+      - ≥3 字符短名护栏（缺失 → 「不良」误配「不良率」）
+      - 0.6 相似度门槛（缺失 → 「面密度」误配「极片面密度测量值」）
+      - 子串分支必须真的调用 _substring_ok（定义了摆在旁边不用等于没有）
+    """
+    t = _read(PREPROCESS_FILE) or ""
+    if "def _substring_ok(" not in t:
+        return _r(False, "缺 _substring_ok：子串匹配没有长度/词边界护栏")
+    if "def _search_param(" not in t:
+        return _r(False, "缺 _search_param：相似度门槛无处可落")
+    if "if len(short) < 3:" not in t:
+        return _r(False, "缺 ≥3 字符短名护栏：单/双字列名会子串误配到带该片段的参数")
+    if "if best_score >= 0.6:" not in t:
+        return _r(False, "缺 0.6 相似度门槛：长度悬殊的列名会被当成有效子串匹配")
+    if "_substring_ok(a, target)" not in t:
+        return _r(False, "子串分支未调用 _substring_ok：护栏定义了却不过它，等于没护栏")
+    return _r(True, "", {"column_match_guards": True})
+
+
+def rule_p1_2_candidates_dedup():
+    """P1-2：候选列表必须按 key 去重择优，不能同一参数反复出现造成"伪多候选"。
+
+    同一参数会同时落进 process_scoped / generic 等作用域，不去重时
+    26 个别名的候选里出现重复 key（如 不良率 -> ['defect_rate_generic',
+    'defect_rate_generic']），人工确认环节会误以为"有两个候选在打架"。
+    """
+    t = _read(PREPROCESS_FILE) or ""
+    if "cands = {}" not in t:
+        return _r(False, "候选容器不是以 key 为下标的字典：同一参数会被重复列出")
+    if 'if k not in cands or sc_r > cands[k]["score"]:' not in t:
+        return _r(False, "候选未按 key 去重择优（保留最高分）：会出现伪多候选")
+    if 'sorted(cands.values()' not in t:
+        return _r(False, "候选输出未取字典 values：去重结果没有落到 candidates")
+    return _r(True, "", {"candidates_dedup": True})
+
+
+def rule_intro_doc_number_traps():
+    """报告解读入门必须讲清三个数字陷阱：自相关 Cpk / 小样本 / 规格来源。
+
+    这三个坑的共同点是：报告上不会报错、数字照常印出来，质量经理照常拿去决策。
+    写在测试用例里没用——它必须写进使用者真的会读的那份文档。
+    自相关这条尤其关键：本工具在 |φ|>0.3 时**故意不输出 Cpk**，
+    文档若不说清楚，使用者会以为工具坏了。
+    """
+    t = _read(INTRO_DOC) or ""
+    if not t:
+        return _r(False, "缺 %s" % INTRO_DOC)
+    need = {"自相关": "自相关序列上的 Cpk 不可信（且工具会故意不给 Cpk）",
+            "Jarque-Bera": "小样本下正态性验证不了，样本<30 不得下结论",
+            "企业规格书": "规格来源决定这张表能不能用来判合格"}
+    miss = [v for k, v in need.items() if k not in t]
+    if miss:
+        return _r(False, "入门文档没讲清这些数字陷阱：%s" % "；".join(miss))
+    return _r(True, "", {"number_traps": len(need)})
+
+
 AUDIT_RULES = [
     Rule("LICENSE 与代码事实对齐：Elastic 2.0 正文齐全且无许可密钥条款", rule_license,
          "（1）首行必须是裸文本 'Elastic License 2.0'（带 # 判不过）；"
@@ -4132,6 +4198,52 @@ AUDIT_RULES = [
          [_mutant("process_capability 去掉 jarque_bera 调用（修复退化：不诊断正态性）",
                   _sub("S.jarque_bera(vals)", "S._jb_removed(vals)"),
                   SPCPy)]),
+    Rule("列名→参数匹配的双护栏：≥3 短名护栏 + 0.6 相似度门槛，且子串分支真的过护栏",
+         rule_p1_2_column_match_guards,
+         "_substring_ok 必须有 ≥3 字符短名护栏（缺则「不良」误配「不良率」）；"
+         "_search_param 必须有 best_score>=0.6 门槛（缺则「面密度」误配「极片面密度测量值」）；"
+         "子串分支必须显式调用 _substring_ok（定义了不用=没有）。"
+         "三条各配一个变异，任一条被拆此规则必须判不过。",
+         PREPROCESS_FILE,
+         [_mutant("拆掉 ≥3 短名护栏（修复退化：单双字列名子串误配）",
+                  _re_sub(r"if len\(short\) < 3:", "if len(short) < 0:"),
+                  PREPROCESS_FILE),
+          _mutant("拆掉 0.6 相似度门槛（修复退化：长度悬殊子串误配）",
+                  _re_sub(r"if best_score >= 0\.6:", "if best_score >= 0.0:"),
+                  PREPROCESS_FILE),
+          _mutant("子串分支绕过 _substring_ok（护栏定义了却不过它）",
+                  _sub("(a in target or target in a) and _substring_ok(a, target)",
+                       "(a in target or target in a)"),
+                  PREPROCESS_FILE)]),
+    Rule("候选列表按 key 去重择优（防伪多候选误导人工确认）",
+         rule_p1_2_candidates_dedup,
+         "候选必须以 key 为下标去重保留最高分并输出字典 values；"
+         "否则同一参数跨作用域重复出现（实测 26 个别名受影响），"
+         "人工确认环节会误判为多候选冲突。",
+         PREPROCESS_FILE,
+         [_mutant("去掉去重条件（修复退化：候选里重复列出同一参数）",
+                  _sub('if k not in cands or sc_r > cands[k]["score"]:',
+                       "if True:"),
+                  PREPROCESS_FILE),
+          _mutant("候选容器退回列表（去重结构消失）",
+                  _re_sub(r"cands = \{\}", "cands = []"),
+                  PREPROCESS_FILE)]),
+    Rule("报告解读入门必须写明三个数字陷阱：自相关 Cpk / 小样本 / 规格来源",
+         rule_intro_doc_number_traps,
+         "入门文档必须出现『自相关』（含工具故意不给 Cpk 的说明）、"
+         "『Jarque-Bera』（小样本正态性验证不了）、『企业规格书』（规格来源决定能否判合格）；"
+         "这三条的共同点是报告不会报错但数字照常被拿去决策，不写进使用者会读的文档等于没防。",
+         INTRO_DOC,
+         # 注意：变异正则**不能用前瞻做终止符**。_re_sub 会把正则再跑一次 sub
+         # 到"已匹配片段"上，而片段里不含前瞻要看的那个终止符，二次匹配必然失败
+         # → 返回原串 → 判据显示"没改动任何内容"退化成 SKIP（本次实测踩到）。
+         # 正确写法：把终止符吃进匹配，再用替换串把它还原回去。
+         [_mutant("删掉『自相关 Cpk』陷阱一节（修复退化：使用者以为 Cpk 留空是工具坏了）",
+                  _re_sub(r"### ⑦[^\n]*\n[\s\S]*?### ⑧", "### ⑧"),
+                  INTRO_DOC),
+          _mutant("删掉『样本量<30』陷阱一节（修复退化：小样本结论照样被拿去决策）",
+                  _re_sub(r"### ⑧[^\n]*\n[\s\S]*?\n---\n", "\n---\n"),
+                  INTRO_DOC)]),
 ]
 
 
