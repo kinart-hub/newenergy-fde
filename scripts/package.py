@@ -33,9 +33,8 @@ EXCLUDE_DIRS = {"output", "dist", "__pycache__", ".git", ".vscode", ".idea",
                 "backups", "tenants", "promotion", ".lock", "_private",
                 "pandas_reference"}
 EXCLUDE_EXT = {".pyc", ".pyo", ".DS_Store"}
-# prepublish_audit.py 是仓库/CI 侧的治理工具，不属于 Skill 运行时；
-# 而且它内部就带着一整套「不许出现的东西」的正则字面量，随包分发会污染接收方的扫描。
-EXCLUDE_FILES = {"inbox.jsonl", "prepublish_audit.py"}
+# inbox.jsonl 可能夹带客户现场的待审候选，任何情况下都不随包外发。
+EXCLUDE_FILES = {"inbox.jsonl"}
 
 
 def main():
@@ -98,6 +97,12 @@ def main():
     version = meta.get("version", "0.0.0")
     name = meta.get("name", "skill")
 
+    dep = meta.get("deployment") or {}
+    # 不随包外发的仓库侧治理工具由 manifest 单一真源声明（原先在 EXCLUDE_FILES 里
+    # 又硬编码一份，导致 manifest 声称「部署必需」而包里没有，按清单核验的人拿到假缺件）。
+    not_deployed = set(dep.get("not_deployed") or []) | EXCLUDE_FILES
+    deploy_required = list(dep.get("required") or [])
+
     dist = os.path.join(ROOT, "dist")
     if not os.path.isdir(dist):
         os.makedirs(dist)
@@ -107,23 +112,62 @@ def main():
     for dirpath, dirnames, filenames in os.walk(ROOT):
         dirnames[:] = [d for d in dirnames if d not in EXCLUDE_DIRS]
         for fn in filenames:
-            if os.path.splitext(fn)[1] in EXCLUDE_EXT or fn in EXCLUDE_FILES:
+            if os.path.splitext(fn)[1] in EXCLUDE_EXT:
                 continue
             full = os.path.join(dirpath, fn)
-            rel = os.path.relpath(full, ROOT)
+            rel = os.path.relpath(full, ROOT).replace("\\", "/")
+            if rel in not_deployed or fn in EXCLUDE_FILES:
+                continue
             files.append((full, rel))
     files.sort(key=lambda x: x[1])
+    packed = {rel for _full, rel in files}
 
-    with zipfile.ZipFile(zpath, "w", zipfile.ZIP_DEFLATED) as z:
+    # 先写临时文件、核对通过再落位：直接写到 dist/<name>-<ver>.zip 的话，
+    # 核对失败时 dist 里会躺着一个缺件的包，下一个拿到它的人不知道它不完整。
+    tmp = zpath + ".tmp"
+    with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as z:
         for full, rel in files:
             z.write(full, os.path.join(name, rel))
 
-    size = os.path.getsize(zpath)
-    with open(zpath, "rb") as f:
+    size = os.path.getsize(tmp)
+    with open(tmp, "rb") as f:
         sha = hashlib.sha256(f.read()).hexdigest()[:16]
 
+    # 【打包后强制核对】只打印文件数是不够的：verify 的第 8 步曾长期「打包成功即通过」，
+    # 于是清单声称 81 项、包内实为 80 项这种缺件无人发现。这里按 deployment.required
+    # 逐项核包内齐全性，并禁止 not_deployed 出现在包里——不一致就非 0 退出，让门禁真能拦。
+    problems = []
+    if deploy_required:
+        lack = [r for r in deploy_required if r not in packed]
+        if lack:
+            problems.append("包内缺 %d 个部署必需文件：%s%s"
+                            % (len(lack), "、".join(lack[:8]),
+                               " …" if len(lack) > 8 else ""))
+        leak = sorted(packed & set(dep.get("not_deployed") or []))
+        if leak:
+            problems.append("包内出现 %d 个不随包外发的治理工具：%s"
+                            % (len(leak), "、".join(leak[:8])))
+    else:
+        problems.append("manifest.json 缺 deployment.required，无法核对包内容齐全性")
+    if problems:
+        print("\n× 包内容与 manifest 声明不一致，拒绝交付：")
+        for p in problems:
+            print("   - " + p)
+        print("   修法：python scripts/gen_manifest.py 重建清单，"
+              "或补上被打包排除规则误伤的必需文件。")
+        try:
+            os.remove(tmp)
+        except OSError as exc:
+            # 不静默：删不掉会在 dist 里留一个 *.zip.tmp，下一个人可能误当成品。
+            print("   ! 临时文件清理失败，请手工删除：%s（%s）" % (tmp, exc))
+        return None
+    os.replace(tmp, zpath)
+    # 「打包完成」必须等核对通过、文件真正落位之后才说：
+    # 原先在核对前就打印，失败时使用者会以为包已经好了，而 dist 里躺着的是上一版。
     print("打包完成：%s" % zpath)
     print("文件数：%d    大小：%.1f KB    sha256:%s" % (len(files), size / 1024.0, sha))
+    print("核对：部署必需 %d 项全部在包内；不随包外发 %d 项已排除"
+          % (len(deploy_required), len(not_deployed)))
     print("\n导入方式：")
     print("  1) 解压到 ~/.workbuddy/skills/%s/" % name)
     print("  2) 或在 WorkBuddy 中选「导入 Skill」并选择该 zip")
@@ -132,4 +176,6 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    # 必须把返回值转成退出码：verify 第 8 步靠退出码判定，
+    # 只 print 不 exit 的话「包内容缺件」也会被记成 OK。
+    sys.exit(0 if main() else 2)
