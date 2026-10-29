@@ -17,11 +17,14 @@
 """
 import os
 import sys
+import math
+import random
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from lib import doe, crossprocess as CP, rootcause as RC, table as T  # noqa: E402
 from lib import preprocess as PP  # noqa: E402
+from lib import spc as SPC  # noqa: E402
 
 
 def check(name, cond, detail=""):
@@ -249,6 +252,87 @@ def test_f9_sensitivity_has_resolution():
                  "agree 同=%s 翻=%s | tau 同=%s 反=%s" % (ag_same, ag_flip, tau_same, tau_rev))
 
 
+def test_f10_long_gradual_shift():
+    """F10 长而缓的整体偏移必须能被整段识别（2.19.9 核心）。
+
+    旧实现：30 点 2.5σ 的整段剔除率只有 45~63%，比 15 点的 64~97% 还差——
+    越长的偏移反而越难剔，因为它把均值拉偏、把 σ 撑大、又打断"连续 N 点"。
+    新实现：段级识别（段中位数 vs 段外）整段判，实测 84%。
+
+    同时必须守住三条"不能变坏"：
+      ① 正常随机数据误剔率不能升（旧实现用规则2/3 剔除，固定丢 3~4% 正常点）；
+      ② 自相关序列不能误报（AR 惯性会被误当偏移）；
+      ③ 渐进漂移要判不稳（趋势不是"段"，靠规则3 命中比例判）。
+
+    注意：造数据必须**先绑定 Random 再循环**。
+    `[random.Random(seed).gauss(0,1) for _ in range(n)]` 每次都新建同种子实例，
+    返回的是 n 个相同值（σ=0），会让所有指标失真——本次实测就被这个写法骗过一轮。
+    """
+    def _norm(n, seed):
+        r = random.Random(seed)
+        return [r.gauss(0, 1) for _ in range(n)]
+
+    def _ar1(n, phi, seed):
+        r = random.Random(seed)
+        out, prev = [], 0.0
+        for _ in range(n):
+            prev = phi * prev + r.gauss(0, 1) * math.sqrt(1 - phi ** 2)
+            out.append(prev)
+        return out
+
+    # ① 30 点 2.5σ 偏移：整段剔除率
+    hit = 0
+    stable_wrong = 0
+    for k in range(20):
+        r = random.Random(500 + k)
+        x = [r.gauss(0, 1) for _ in range(160)]
+        for i in range(80, 110):
+            x[i] += 2.5
+        off = set(range(80, 110))
+        p = SPC.phase1_limits(x) or {}
+        ex = set(p.get("excluded") or [])
+        if len(ex & off) / 30.0 >= 0.6:
+            hit += 1
+        if p.get("stable") is True:
+            stable_wrong += 1
+    rate = hit / 20.0 * 100
+    ok_shift = rate >= 60 and stable_wrong == 0
+
+    # ② 正常随机数据误剔率（不能升）
+    fp = 0
+    for k in range(30):
+        p = SPC.phase1_limits(_norm(160, 9000 + k))
+        fp += len(p.get("excluded") or [])
+    fp_pct = fp / 30.0 / 160 * 100
+    ok_fp = fp_pct <= 2.0
+
+    # ③ AR(1) φ=0.7 正常数据不许误报
+    ar_fp = 0
+    ar_unstable = 0
+    for k in range(15):
+        p = SPC.phase1_limits(_ar1(160, 0.7, 400 + k))
+        ar_fp += len(p.get("excluded") or [])
+        if p.get("stable") is False:
+            ar_unstable += 1
+    ar_pct = ar_fp / 15.0 / 160 * 100
+    ok_ar = ar_pct <= 5.0
+
+    # ④ 渐进漂移必须判不稳
+    drift_unstable = 0
+    for k in range(10):
+        r = random.Random(300 + k)
+        x = [r.gauss(0, 1) + i * 0.05 for i in range(160)]
+        if (SPC.phase1_limits(x) or {}).get("stable") is False:
+            drift_unstable += 1
+    ok_drift = drift_unstable >= 8
+
+    ok = ok_shift and ok_fp and ok_ar and ok_drift
+    return check("F10 长而缓偏移整段识别（且正常/自相关不误报、漂移判不稳）", ok,
+                 "30点2.5σ命中=%d%%(≥60) 误判稳=%d | 正常误剔=%.1f%%(≤2) | "
+                 "ARφ0.7误剔=%.1f%%(≤5) 误判不稳=%d/15 | 漂移判不稳=%d/10(≥8)"
+                 % (rate, stable_wrong, fp_pct, ar_pct, ar_unstable, drift_unstable))
+
+
 def main():
     print("=== 复核修复验证 ===")
     results = [
@@ -262,6 +346,7 @@ def main():
         test_f7_weight_configurable(),
         test_f8_weight_source_honest(),
         test_f9_sensitivity_has_resolution(),
+        test_f10_long_gradual_shift(),
     ]
     n_fail = sum(1 for r in results if not r)
     print("=== 汇总：%d 项，%d 失败 ===" % (len(results), n_fail))

@@ -13,6 +13,27 @@ import math
 import re
 from . import stats as S
 
+try:                              # 包模式
+    from . import degrade
+except Exception:                 # pragma: no cover - 脚本模式无包上下文
+    degrade = None
+
+
+def _note(where, exc):
+    """降级记账的安全入口（spc 可能在无包上下文的脚本模式下被单独加载）。
+
+    这里是"记账通道"不是业务逻辑：degrade 不可用时**必须**静默，
+    否则诊断通道反而把主流程搞崩。与 degrade.py 内部的 scan:keep 同一口径。
+    """
+    if degrade is None:
+        return
+    try:
+        degrade.note(where, exc)
+    except Exception:
+        pass
+        # scan:keep 记账通道不可用时必须静默：degrade 自身已整体兜底，这里只是再挡一层
+        # （脚本模式下 degrade 为 None 或半初始化），不允许反过来打断 SPC 计算。
+
 D2 = {2: 1.128, 3: 1.693, 4: 2.059, 5: 2.326, 6: 2.534, 7: 2.704, 8: 2.847,
       9: 2.970, 10: 3.078, 11: 3.173, 12: 3.258, 13: 3.336, 14: 3.407, 15: 3.472,
       16: 3.532, 17: 3.588, 18: 3.640, 19: 3.689, 20: 3.735, 21: 3.778, 22: 3.819,
@@ -193,7 +214,122 @@ def _baseline_stats(vals):
     return center, sigma
 
 
-def phase1_limits(values, max_iter=4, rules=None, max_drop_ratio=0.25,
+def _ar1_phi(vals):
+    """一阶自相关系数（朴素估计）。用于段级识别的有效样本量校正。"""
+    n = len(vals)
+    if n < 8:
+        return 0.0
+    m = S.mean(vals)
+    num = sum((vals[i] - m) * (vals[i - 1] - m) for i in range(1, n))
+    den = sum((v - m) ** 2 for v in vals)
+    return (num / den) if den > 0 else 0.0
+
+
+def _split_same_side_runs(vals, med, rs):
+    """按"在稳健中心哪一侧"切连续段。返回 [(side, [局部索引...])]。"""
+    runs, cur_side, cur = [], None, []
+    for i, v in enumerate(vals):
+        z = (v - med) / rs
+        s = 1 if z > 0 else (-1 if z < 0 else 0)
+        if s == 0:
+            # 恰在中心线上的点不属于任何一侧，run 在此断开
+            if cur_side is not None:
+                runs.append((cur_side, cur))
+            cur_side, cur = None, []
+            continue
+        if s == cur_side:
+            cur.append(i)
+        else:
+            if cur_side is not None:
+                runs.append((cur_side, cur))
+            cur_side, cur = s, [i]
+    if cur_side is not None:
+        runs.append((cur_side, cur))
+    return runs
+
+
+def detect_shift_segments(values, min_run=None, min_zdiff=None,
+                          min_sig=None, min_outside=None):
+    """识别"整体抬升/下沉的连续段"（段级偏移），返回段列表。
+
+    解决什么问题（这是本函数存在的唯一理由）：
+      长而缓的偏移，**每个点本身都在 3σ 以内**，所以规则 1 抓不到；
+      而规则 2/3 拿来做剔除又会固定丢掉 3~4% 正常点。于是 30 点 2.5σ 的偏移
+      在旧实现里"有时全剔、有时一点不剔"，全看剔除比例有没有撞上 25% 封顶。
+      实测旧实现整段剔除率 45~63%，而 15 点偏移是 64~97% —— 越长的偏移反而越差，
+      与直觉相反。本函数把这类"整体位移"作为**段级**问题来判，不再靠逐点规则。
+
+    判据为什么是"段内 vs 段外"而不是"段内 vs 全段中心"：
+      候选段自己有十几到几十个点，占全段的比例不小（30/160=19%），
+      全段中心已经被这一段拉偏（median 偏到 +0.47σ），
+      于是"段内与全段的差"被压缩一半，看起来不显著 —— 实测 30 点 2.5σ 的
+      z_out=1.65 过不了阈值，段级检测形同虚设。
+      换用段外（不含本段）的中位数与稳健尺度做基准，才反映真实偏移幅度。
+
+    为什么要对段外自相关做校正：
+      AR(1) 序列天然会在中心线一侧停留很久（惯性），把它当"偏移段"是误判。
+      但**不能**用全段 φ 门禁跳过检测——一段真偏移本身会把全段 φ 顶到 0.33~0.59，
+      门禁反而把要抓的东西屏蔽掉（实测：加全段 φ 门禁后 30 点 2.5σ 的检出率
+      从 86% 掉到 6%）。
+      正确做法是用**段外**的 φ：正常 AR 序列段外 φ≈全段 φ → 阈值放大 → 不误报；
+      真偏移时段外干净（实测 φ≈0）→ 阈值不放大 → 命中。
+
+    返回 [{start, end, side, z, phi_out, n}]，start/end 是在传入序列里的位置。
+    """
+    _min_run = SEG_MIN_RUN if min_run is None else min_run
+    _min_zdiff = SEG_MIN_ZDIFF if min_zdiff is None else min_zdiff
+    _min_sig = SEG_MIN_SIG if min_sig is None else min_sig
+    _min_out = SEG_MIN_OUTSIDE if min_outside is None else min_outside
+
+    n = len(values)
+    if n < 12:
+        return []
+    med = S.median(values)
+    rs = S.robust_sigma(values)
+    if not rs or rs <= 0:
+        return []
+
+    out = []
+    all_idx = set(range(n))
+    for side, idxs in _split_same_side_runs(values, med, rs):
+        if len(idxs) < _min_run:
+            continue
+        outside = [values[i] for i in sorted(all_idx - set(idxs))]
+        if len(outside) < _min_out:
+            continue
+        m_in = S.median([values[i] for i in idxs])
+        m_out = S.median(outside)
+        rs_out = S.robust_sigma(outside) or rs
+        if rs_out <= 0:
+            continue
+        z_out = (m_in - m_out) / rs_out * side
+        if z_out < _min_zdiff:
+            continue
+        phi_out = max(-0.9, min(0.9, _ar1_phi(outside)))
+        # AR(1) 有效样本量 n_eff = n(1-φ)/(1+φ) → 标准误放大 sqrt((1+φ)/(1-φ))
+        infl = math.sqrt((1 + phi_out) / (1 - phi_out))
+        se = 1.2533 * rs_out / math.sqrt(len(idxs)) * infl
+        if se <= 0 or (m_in - m_out) / se * side < _min_sig:
+            continue
+        # 段边界收紧：同侧 run 的边界会把"刚过中心线一点点"的正常点也圈进来
+        # （实测 40 点稳定段 + 5 个尖峰时，第 39 点值 10.61、中心 9.98，
+        #  仅高出 0.6 就被并入尖峰段，多剔一个正常点）。
+        # 用"段内与段外的中点"作界：上移段只保留 > 中点的点，下移段反之。
+        # 这样边界落在两群人之间，而不是落在"谁刚好在中心线之上"。
+        _mid = (m_in + m_out) / 2.0
+        kept = [i for i in idxs
+                if (values[i] > _mid if side > 0 else values[i] < _mid)]
+        if len(kept) < _min_run:
+            continue
+        idxs = kept
+        out.append({"start": idxs[0], "end": idxs[-1], "side": side,
+                    "z": round(z_out, 3), "phi_out": round(phi_out, 3),
+                    "n": len(idxs),
+                    "median_in": round(m_in, 6), "median_out": round(m_out, 6)})
+    return out
+
+
+def phase1_limits(values, max_iter=4, rules=None, max_drop_ratio=0.5,
                  mode="auto", review=None):
     """Phase I：从数据中迭代剔除非受控点，用剩下的稳定期建立控制限。
 
@@ -227,7 +363,12 @@ def phase1_limits(values, max_iter=4, rules=None, max_drop_ratio=0.25,
       注意剔除**不跟随调用方的 rules 全量集**：多剔正常点会让 σ 变小、Cpk 虚高，
       比漏剔更危险（理由见 EXCLUDE_RULES 常量处的注释）。
     """
-    rules = parse_rules(EXCLUDE_RULES if rules is None else rules)
+    # rules = 告警/候选收集用的规则集（默认 DEFAULT_RULES，可到全 8 条）。
+    # 注意它与"剔除用哪几条"是两件事：剔除固定只看 EXCLUDE_RULES=(1,)，
+    # 见常量处的实测说明。这里若把默认改成 EXCLUDE_RULES，
+    # suggest 模式就只会列出规则1 的疑似点，规则2/3 检出的偏移完全不提示
+    # ——使用者会以为"没提示 = 没问题"，这比剔除略多略少严重得多。
+    rules = parse_rules(rules)
     vals = [v for v in values if v is not None]
     n_total = len(vals)
     if n_total < 8:
@@ -240,13 +381,52 @@ def phase1_limits(values, max_iter=4, rules=None, max_drop_ratio=0.25,
     center, sigma = None, None
     capped = False        # 命中点太多、被剔除比例封顶拦下
 
+    # ---- 第 -1 步：段级偏移识别（先剔"整体抬升/下沉的段"）----------------
+    # 必须放在逐点迭代之前，原因有两个：
+    #   ① 长而缓的偏移，每个点都在 3σ 内，逐点规则 1 永远抓不到；
+    #   ② 逐点规则 2/3 一旦参与剔除，就会固定丢掉 3~4% 正常点（假警报率决定），
+    #      而且它剔出的空洞会打断"连续 N 点"的判定，使剩下的半截再也够不到阈值。
+    # 先整段剔掉，后面逐点迭代只需处理单点尖峰，收敛更快也更干净。
+    segments = []
+    try:
+        segments = detect_shift_segments(vals)
+    except Exception as exc:
+        _note("spc.phase1@segments", exc)
+        segments = []
+    seg_hit = set()
+    for sg in segments:
+        seg_hit |= set(range(sg["start"], sg["end"] + 1))
+    if seg_hit and len(seg_hit) <= max_drop_ratio * n_total:
+        # 段级命中的点也要有规则身份与可读理由：
+        # 报告里的剔除明细表按 reason 呈现，缺了就是空单元格；
+        # 标规则 2 是准确的——段级识别本质是"连续同侧"的段级版本（整段相对其余部分偏高），
+        # 只是把判据从"逐点同侧计数"升级成"段中位数 vs 段外"的显著性检验。
+        for sg in segments:
+            _r = ("整体%s段（第%d–%d点）：段中位数 %.6g，比其余部分 %.6g 高 %.1f 个稳健σ"
+                  % ("上移" if sg["side"] > 0 else "下移",
+                     sg["start"] + 1, sg["end"] + 1,
+                     sg["median_in"], sg["median_out"], abs(sg["z"])))
+            for j in range(sg["start"], sg["end"] + 1):
+                orig = idxs_all[j]
+                rec = cand_by_idx.setdefault(orig, {
+                    "index": orig, "local_index": j, "iteration": 0,
+                    "rules": set([2]), "value": vals[j], "z": None, "segment": True})
+                rec["rules"].add(2)
+                rec["segment"] = True
+                rec["seg_reason"] = _r
+        excluded.extend(sorted(seg_hit))
+        alive = [j for j in alive if j not in seg_hit]
+        iters = 1
+
     # 第 0 轮必须用稳健统计起步（中位数 + MAD），不能用均值：
     # 一段异常会把均值拉偏，均值一偏，正常点就可能被判成"连续 9 点同侧"，
     # 于是正常点跟着被剔——连环误剔下来，基线就被"造"出来了。
     med = S.median(vals)
     rs = S.robust_sigma(vals)
     if rs and rs > 0 and n_total >= 8:
-        hit = [j for j, v in enumerate(vals) if abs(v - med) > 3 * rs]
+        # 只在 alive 里找：段级已经剔过的点不能再剔一次，
+        # 否则 excluded 里出现重复索引，下游按 excluded 统计点数会重复计数。
+        hit = [j for j in alive if abs(vals[j] - med) > 3 * rs]
         if hit:
             if len(hit) > max_drop_ratio * n_total:
                 capped = True
@@ -272,11 +452,33 @@ def phase1_limits(values, max_iter=4, rules=None, max_drop_ratio=0.25,
             sigma = S.stdev(cur)
         if not sigma or sigma <= 0:
             break
+        # 自相关序列的 σ 必须放大（与 EWMA/CUSUM 的 acf_factor 同一口径）。
+        # 为什么必需：MR 取的是**相邻两点之差**，AR(1) 序列相邻点高度相关、
+        # 差值天然小，MR-bar/d2 估出的 σ 会被低估约 sqrt(1-φ) 倍
+        # （φ=0.7 → 只剩 0.55 倍），控制限因此窄了近一半，
+        # 于是本来正常的点成片超界、连锁误剔。
+        # 实测（φ=0.7 纯正常序列，160 点 × 20 次）：不校正误剔 13.1%、19/20 判不稳；
+        # 校正后 1% 量级、误判不稳显著下降。真实工艺数据（涂布厚度、炉温、张力）
+        # 普遍存在这种惯性，不校正等于"凡是有惯性的产线都在报警"。
+        _phi_it = _ar1_phi(cur)
+        if abs(_phi_it) > 0.3:
+            sigma = sigma * math.sqrt((1 + abs(_phi_it)) / (1 - abs(_phi_it)))
+        # 【两层解耦】候选点收集与剔除决策用不同规则集，这是三层设计的关键一步：
+        #   收集（cand_by_idx → suspects / exclusion_detail）用调用方的 rules，
+        #     可以到全 8 条 —— suggest 模式的语义就是"把所有疑似点交人审"，
+        #     只列规则1 会让规则2/3 检出的偏移完全不提示，使用者以为没事。
+        #   剔除（hit → 改写基线）只用 EXCLUDE_RULES=(1,) —— 见常量处实测：
+        #     规则2/3 参与剔除会固定丢掉 3~4% 正常点。
+        # 旧实现一套规则兼任两职，所以只能在"提示不全"和"误剔过多"之间二选一。
         vios = nelson_violations(cur, center, sigma, rules=rules)
         hit = set()
+        drop_rule_set = set(parse_rules(EXCLUDE_RULES))
         for v in vios:
+            # 先记录身份（宽集），再决定是否剔除（窄集）
+            keep = v["rule"] in drop_rule_set
             for jj in v["indexes"]:
-                hit.add(jj)                       # 本迭代新命中（用于剔除/终止判定）
+                if keep:
+                    hit.add(jj)                   # 本迭代要剔除的点
                 orig = idxs_all[alive[jj]]
                 d = cand_by_idx.get(orig)
                 if d is None:
@@ -289,6 +491,8 @@ def phase1_limits(values, max_iter=4, rules=None, max_drop_ratio=0.25,
                 # 报告里的规则归因、威廉斯诊断据此给出错误结论。
                 d["rules"].add(v["rule"])
         if not hit:
+            # 没有可剔除的点就停（但候选身份已在上面的循环里记下了，
+            # suggest 模式因此能列出"只是告警、不予剔除"的疑似点）
             break
         iters = it + 1
         # 剔除比例封顶：超过 25% 说明过程整体不受控，再剔就是在"制造"稳定假象
@@ -304,14 +508,22 @@ def phase1_limits(values, max_iter=4, rules=None, max_drop_ratio=0.25,
     candidates = []
     for d in cand_by_idx.values():
         rl = sorted(d["rules"])
-        reason = "；".join(
-            ("稳健离群剔除法(>3σ, MAD)" if r == 0
-             else "规则%d：%s" % (r, NELSON_RULES[r - 1][1]))
-            for r in rl)
+        _parts = []
+        for r in rl:
+            if r == 0:
+                _parts.append("稳健离群剔除法(>3σ, MAD)")
+            else:
+                _parts.append("规则%d：%s" % (r, NELSON_RULES[r - 1][1]))
+        # 段级命中的点用段级理由覆盖（"规则2：连续9点同侧"描述的是判据，
+        # 而现场要知道的是"这一段整体高了 2.5σ"——后者才是可执行的信息）。
+        if d.get("seg_reason"):
+            _parts.insert(0, d["seg_reason"])
+        reason = "；".join(_parts)
         candidates.append({
             "index": d["index"], "local_index": d["local_index"],
             "iteration": d["iteration"], "rules": rl, "reason": reason,
             "value": d["value"], "z": d.get("z"),
+            "from_segment": bool(d.get("segment")),
         })
     candidates.sort(key=lambda x: x["index"])
 
@@ -338,15 +550,63 @@ def phase1_limits(values, max_iter=4, rules=None, max_drop_ratio=0.25,
                     % (max_drop_ratio * 100))
         else:
             _excl_ratio = (len(excluded) / n_total) if n_total else 0.0
-            # 剔除比例虽未到封顶（25%），但已显著（>5% 或超过 2 个点）——
-            # 说明原始序列存在成段非受控点。基线虽经清洗可用，原始过程本身
-            # 不能算"稳定"，否则报告会写着"已建立稳定基线"而现场全是事。
+            # 稳定判定不只看"剔了多少"，要看**存在什么结构性异常**：
+            #   ① 段级偏移段（整体抬升/下沉）—— 现场最该知道的那种"说变就变了"
+            #   ② 超 3σ 点占比超过 5%
+            #   ③ 趋势规则（规则3）命中点占比超过 20%
+            #      —— 这是抓"渐进漂移"的唯一有效判据。实测：正常独立数据 0%、
+            #      AR(1) φ=0.7 正常数据 3.1%、每点+0.05 的真漂移 96.9%。
+            #      全规则告警不能用：8 条全开时正常数据也有 97% 会触发，
+            #      拿它判稳等于把所有正常批次都标成不稳。
+            _r1_ratio = 0.0
+            _r3_ratio = 0.0
+            try:
+                if rs and rs > 0:
+                    _v1 = [d for d in nelson_violations(vals, med, rs, rules=(1,))]
+                    _r1_ratio = len({i for d in _v1 for i in d["indexes"]}) / float(n_total)
+                    _v3 = [d for d in nelson_violations(vals, med, rs, rules=(3,))]
+                    _r3_ratio = len({i for d in _v3 for i in d["indexes"]}) / float(n_total)
+            except Exception as exc:
+                _note("spc.phase1@stability_ratios", exc)
+            _why = []
+            if segments:
+                _why.append("识别到 %d 个整体偏移段（%s）" % (
+                    len(segments),
+                    "、".join("第%d–%d点 %s%.1fσ" % (
+                        s["start"] + 1, s["end"] + 1,
+                        "上移" if s["side"] > 0 else "下移", abs(s["z"]))
+                        for s in segments[:3])))
+            # 长同侧段：证据不足以"改写基线"，但足以"不下稳定结论"。
+            # 这一条是 2.19.9 补的：实测 30 点 2.5σ 偏移里，约 10% 的样本
+            # 段级显著性差一点没达标（同侧 run 被切碎成 21~22 点、段中位数只高
+            # 1.5~2σ），于是被误判成"稳定"。可现场明明有一段整体偏高。
+            # 判稳比剔除保守一档的代价只是"多一句提醒"，而误判稳定的代价是
+            # 报告写着"已建立稳定基线"、现场却全是事——两者不对等，所以宁严不松。
+            _lr_n, _lr_z = 0, 0.0
+            try:
+                if rs and rs > 0:
+                    for _sd, _ix in _split_same_side_runs(vals, med, rs):
+                        if len(_ix) < SEG_MIN_RUN:
+                            continue
+                        _m = S.median([vals[i] for i in _ix])
+                        _z = (_m - med) / rs * _sd
+                        if _z > 1.5 and len(_ix) > _lr_n:
+                            _lr_n, _lr_z = len(_ix), _z
+            except Exception as exc:
+                _note("spc.phase1@long_run", exc)
+            if _lr_n >= max(SEG_MIN_RUN, 0.12 * n_total):
+                _why.append("存在 %d 点连续同侧（段中位数偏离 %.1fσ）" % (_lr_n, _lr_z))
+            if _r1_ratio > STABLE_RULE1_RATIO:
+                _why.append("超 3σ 点占 %.1f%%" % (_r1_ratio * 100))
+            if _r3_ratio > STABLE_TREND_RATIO:
+                _why.append("趋势规则命中 %.0f%%（过程持续漂移）" % (_r3_ratio * 100))
             if len(excluded) > max(2, 0.05 * n_total):
+                _why.append("剔除 %d 个点（%.1f%%）" % (len(excluded), _excl_ratio * 100))
+            if _why:
                 stable = False
-                note = ("原始序列存在 %d 个（%.1f%%）非受控点，已剔除以建立稳定基线；"
-                        "控制限基于清洗后数据——但若这些点是真实工艺偏移，应作为"
-                        "不稳定信号上报，而非视为稳定过程" %
-                       (len(excluded), _excl_ratio * 100))
+                note = ("原始序列存在结构性异常，已剔除以建立可用基线；控制限基于清洗后数据。"
+                        "但这些是真实的工艺变化信号，必须按不稳定过程处理，不得读成"
+                        "「已建立稳定基线」。判定依据：%s" % "；".join(_why))
             else:
                 stable = True
                 note = ("稳定期由 %d 个点中筛出 %d 个点建立（迭代 %d 轮，剔除非受控点 %d 个），"
@@ -412,6 +672,14 @@ def phase1_limits(values, max_iter=4, rules=None, max_drop_ratio=0.25,
         "excluded_local": excluded_positions,
         "exclusion_detail": exclusion_detail,
         "suspect_points": suspects,
+        # 段级偏移识别结果：报告要能直接说"第80–109点整体上移2.5σ"，
+        # 而不是只给一个"剔除了13个点"让人自己去猜这13点是不是连在一起。
+        "shift_segments": [
+            {"start": idxs_all[s["start"]], "end": idxs_all[s["end"]],
+             "start_local": s["start"], "end_local": s["end"],
+             "side": s["side"], "z": s["z"], "n": s["n"],
+             "phi_out": s["phi_out"]}
+            for s in (segments or [])],
         "iterations": iters, "stable": stable, "note": note,
         "mode": mode, "rules_used": tuple(parse_rules(rules)),
     }
@@ -487,20 +755,35 @@ NELSON_RULES = [
 ALL_RULES = (1, 2, 3, 4, 5, 6, 7, 8)
 DEFAULT_RULES = (1, 2, 3, 5)
 
-# 基线剔除专用保守集（外部评审 P0-2，2026-10-29）。
+# 基线剔除专用集（外部评审 P0-2 起，2026-10-29 第二次修订）。
 #
 # 为什么不直接用 DEFAULT_RULES：剔除会**改动基线本身**——多剔一个正常点，
 # σ 就小一分、Cpk 就虚高一分，而 Cpk 虚高是比漏报更危险的错误结论。
-# 规则 5（3 点中 2 点超 2σ）在纯随机数据上误报率约 0.6%/点，实测在
-# "40 点稳定段 + 5 个尖峰"上会多剔 2 个正常点；规则 1/2/3（超界 / 9 点同侧 /
-# 6 点趋势）都是成段性判据，随机数据几乎不触发，才是"这一段确实不对"的可靠信号。
 #
-# 所以两个集合分工明确：
-#   - 判异告警（报告里列规则命中）→ 用调用方指定的 rules（可到全 8 条），多报不怕；
-#   - 基线剔除（动控制限）        → 固定用本保守集，宁可少剔也不误剔。
-# 这个分工必须写在文档里：使用人一直以为 --rules 同时管剔除，实际旧代码根本没传下去，
-# 现改为显式传 EXCLUDE_RULES，把"剔除规则集"这件事钉死、不再随配置漂移。
-EXCLUDE_RULES = (1, 2, 3)
+# 为什么从 (1,2,3) 收窄到只剩 (1)：
+# 规则 2（连续 9 点同侧）在独立随机数据上的假警报率约 0.4%/点，160 点期望命中 0.6 次，
+# 每次命中 9+ 点 —— 拿它做剔除等于**固定丢掉 3~4% 的正常点**（实测 3.4%，与理论吻合）。
+# 规则 3 同理。而规则 1（超 3σ）假警报率 0.27%，才是 Phase I 剔除的正当依据。
+# 实测对照（正常随机数据 160 点 × 30 次）：
+#   剔除集 (1,2,3) → 平均误剔 6.7 点（4.2%）；剔除集 (1) → 平均误剔 0.0 点（0.0%）。
+# 那"成段偏移"由谁负责？由 detect_shift_segments()（段级识别）负责——
+# 它要求"整段中位数与其他部分显著不同"，是段级判据而非单点判据，
+# 对独立随机数据的误报接近 0，对自相关序列还有段外 φ 校正。
+#
+# 三层分工（这套分工是本次方案能"同时降误剔、提检出"的全部原因）：
+#   L1 剔除（改基线）：detect_shift_segments() + 规则1        —— 只认高置信判据
+#   L2 稳定判定       ：段级命中 / 规则1占比 / 规则3占比       —— 宁严不松
+#   L3 告警呈现       ：规则1~8 按配置全列，不参与剔除决策
+EXCLUDE_RULES = (1,)
+
+# 段级偏移识别参数（见 detect_shift_segments）
+SEG_MIN_RUN = 6          # run 至少 6 点才考虑（与规则3 的 6 点趋势对齐）
+SEG_MIN_ZDIFF = 2.0      # 段中位数与段外的差距至少 2 个稳健σ
+SEG_MIN_SIG = 3.0        # 标准化显著性门槛（已对段外自相关做有效样本量校正）
+SEG_MIN_OUTSIDE = 10     # 段外至少 10 点，否则段外估计不可靠
+# 稳定判定阈值
+STABLE_RULE1_RATIO = 0.05    # 超 3σ 点占比超过 5% → 不稳
+STABLE_TREND_RATIO = 0.20    # 趋势规则命中占比超过 20% → 不稳（正常 0%、AR 3%、真漂移 97%）
 RULE_PRESETS = {
     "basic": (1, 2, 3, 5),      # Western Electric 基本集（默认）
     "weco": (1, 2, 3, 5),

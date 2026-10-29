@@ -175,7 +175,7 @@ if EV is not None and EV.__name__ != "lib.events":
 KB = PP.load_knowledge()
 _fmt = RPT._fmt
 
-ANALYZER_VERSION = "2.19.8"
+ANALYZER_VERSION = "2.19.9"
 
 
 # 空数据排查清单。
@@ -1893,6 +1893,10 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
                     "mode": spc_exclusion_mode,
                     "excluded_detail": (p1 or {}).get("exclusion_detail", []),
                     "suspect_points": (p1 or {}).get("suspect_points", []),
+                    # 段级偏移识别结果（2.19.9）：长而缓的整体偏移靠它表达。
+                    # 只给"剔除了 13 个点"，使用者没法判断这 13 点是散落噪声
+                    # 还是第 80–109 点整段偏了 —— 后者才是要去找原因的那种事。
+                    "shift_segments": (p1 or {}).get("shift_segments", []),
                 },
                 "values": vals,
             })
@@ -3419,6 +3423,26 @@ def build_report(res, work, spc_res, corr, assoc, pare, root, gaps, conf,
                         "warn")
         elif _bl.get("stable") is None:
             rep.text(s4, "**基线稳定性**：样本不足，未做稳定性检查。")
+        # 整体偏移段（2.19.9）：长而缓的偏移每个点都在 3σ 内，逐点规则抓不到，
+        # 但对使用者最有价值的恰恰是"第 80–109 点整段高了 2.5σ"这句话
+        # ——它直接指向"那段时间发生了什么"（换料/换班/设备调整）。
+        # 只报"剔除了 13 个点"等于把这条线索藏起来。
+        _segs = [x for x in ((d.get("exclusion_review") or {}).get("shift_segments") or [])
+                 if isinstance(x, dict)]
+        if _segs:
+            _rows = []
+            for _s in _segs[:5]:
+                _rows.append([
+                    "第 %s–%s 点" % ((_s.get("start") or 0) + 1, (_s.get("end") or 0) + 1),
+                    "%d 点" % (_s.get("n") or 0),
+                    ("上移 +%.2fσ" % abs(_s.get("z") or 0)) if (_s.get("side") or 1) > 0
+                    else ("下移 -%.2fσ" % abs(_s.get("z") or 0)),
+                ])
+            rep.table(s4, ["位置", "长度", "相对其余部分的偏移"], _rows,
+                      caption="%s：识别到的整体偏移段（段中位数与其余部分对比）" % title)
+            rep.text(s4, "这几段不是单点尖峰，而是**连续一段时间整体偏高/偏低**——"
+                     "请对照该时间段的生产记录（换料、换班、设备参数调整、"
+                     "量具更换），而不是按随机离群点忽略。")
         add_chart(s4, CH.control_chart(d["values"], d["center"], d["lcl"], d["ucl"],
                                        title=title + " X-MR 控制图",
                                        ylabel="测量值 %s" % d["unit"],
