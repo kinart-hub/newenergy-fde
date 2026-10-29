@@ -183,18 +183,37 @@ def build_design(kind, n_factors, levels=2, param=None):
 
 def decode_design(matrix, factor_specs):
     """coded/水平矩阵 -> 实际工艺参数值。
-    factor_specs: [{"name":..,"low":..,"high":..,"mid":..(可选),"unit":..}]"""
+    factor_specs: [{"name":..,"low":..,"high":..,"mid":..(可选),"unit":..}]
+
+    水平号约定（1-based）：1=低, 2=中, 3=高, 0=中点, 负=编码值。
+    关键：2 水平设计只有 1/2 两个水平号，此时 2 **就是高**而非中点；
+    3 水平设计里 2 才是中点。原实现把 v==2 一律当中点，导致 2 水平设计
+    （full_factorial(2^k) / Taguchi L8/L16，即默认推荐路径）永远解不出高角点，
+    整条默认 DOE 只在「低/中」上做实验——这是默认 DOE 的正确性缺陷。
+    修复：按各因子在矩阵里出现的最高水平号区分（max<=2 → 2 即高）。
+    """
+    max_lv = [3] * len(factor_specs)
+    if matrix:
+        for ci in range(len(factor_specs)):
+            vals = [float(row[ci]) for row in matrix if ci < len(row)]
+            if vals:
+                max_lv[ci] = max(vals)
     out = []
     for row in matrix:
         rec = {}
-        for spec, lv in zip(factor_specs, row):
+        for ci, (spec, lv) in enumerate(zip(factor_specs, row)):
             v = float(lv)
             if v == 1:
                 rec[spec["name"]] = spec.get("low")
-            elif v == 2:
-                rec[spec["name"]] = spec.get("mid", (spec.get("low", 0) + spec.get("high", 0)) / 2.0)
             elif v == 3:
                 rec[spec["name"]] = spec.get("high")
+            elif v == 2:
+                # 2 水平设计：水平号只有 1/2，2 就是高；3 水平设计：2 是中点
+                if max_lv[ci] <= 2:
+                    rec[spec["name"]] = spec.get("high")
+                else:
+                    rec[spec["name"]] = spec.get(
+                        "mid", (spec.get("low", 0) + spec.get("high", 0)) / 2.0)
             elif v == 0:
                 rec[spec["name"]] = spec.get("mid", (spec.get("low", 0) + spec.get("high", 0)) / 2.0)
             elif v < 0:

@@ -15,6 +15,34 @@
 
 ---
 
+## 2.19.5 — 2026-10-29｜重点复核发现的 4 处真实缺陷修复
+
+本轮对用户点名的六项复核范围（完整性 / 逐文件审查 / 缺陷逻辑 / 测试 / 与上一版建议对照 / 整改清单）
+做重点复核，除外部审计 9 条、上版 5 专项已在 2.19.1~2.19.4 落实外，新发现并修复 4 处真实缺陷：
+
+- **P0 rootcause 诚实降级泄漏**：`rank_root_causes` 在无任何候选拿到数据支撑时（target=None、
+  INSUFFICIENT_DATA、n<8 等），仍输出带分数的 Top 榜单，下游 `honest_degraded=None` 把假榜单渲染进报告。
+  修复：守卫改为「只要零数据支撑就清空 candidates/all_candidates，降级为 prior_only_hints」。
+  验收：`scripts/verify_rev_fixes.py` F1（candidates=0、prior_only_hints>0）。
+- **P1 rootcause 时序反证死分支**：`_temporal_match` 旧实现不返回 `verdict` 键，消费方 820 行
+  `beforeafter.get("verdict")` 永远读不到，时序反证整段是死分支。修复：显式返回
+  `verdict`("支持"/"不支持") 与 `note`，消费方据 "不支持" 生成时序反证。
+  验收：`verify_rev_fixes.py` F2（反相→不支持、且经 `_annotate_evidence` 产出"时序上不支持"反证）。
+- **P1 doe 2 水平高端点缺失**：`decode_design` 把水平号 2 一律当中点，导致 2 水平设计
+  （full_factorial(2^k)/Taguchi L8/L16，即默认推荐路径）永远解不出高角点，整条默认 DOE 只在低/中上做实验。
+  修复：按矩阵各列最高水平号区分（max≤2 → 2 即高）。3 水平设计中点语义不变。
+  验收：`verify_rev_fixes.py` F3（2 水平解出 high、3 水平 1/2/3→低/中/高仍正确）。
+- **P1 crossprocess 参考量程拿不到**：`probe_margin` 写死 `_base_param_of(param_col, [{}])` 只剥裸列名，
+  当列名是中文别名（裸名≠知识库键）时永远查不到参考量程，提示恒定缺失。修复：接入 `trace` 已按真实
+  `table_meta` 解析出的 `pkey`。该修复首轮因一次缩进编辑引入语法错误（`elif` 误嵌 `if` 体内），
+  已还原并复验。
+  验收：`verify_rev_fixes.py` F4（真实 pkey 拿到参考量程、旧空 meta 兜底为 None）。
+
+配套：`scripts/verify_rev_fixes.py`（入库、`--check` 门禁）覆盖上述 4 处；版本号升 2.19.5，
+`gen_manifest.py` 同步 manifest.json。
+
+---
+
 ## 2.19.4 — 2026-10-29｜横向展开/永久措施/预防三块能力从来没有出现在报告里
 
 起因是用户的质问："每次都说改好了，为什么还是漏洞百出"。这次不辩解，

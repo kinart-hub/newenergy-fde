@@ -394,8 +394,19 @@ def _temporal_match(table, param_col, target_col):
     both = sum(1 for a, b in zip(xs, ys)
                if abs(a - mx) > 1.5 * sx and abs(b - my) > 1.5 * sy)
     ratio = both / len(pairs)
-    return min(1.0, ratio * 3), {"both_abnormal": both, "n": len(pairs),
-                                 "ratio_pct": ratio * 100}
+    score = min(1.0, ratio * 3)
+    # 时序判定：参数与指标同时异常占比高 → 时序吻合（支持因果时序）；
+    # 占比低 → 本批数据里两者异常不重合，对"同节拍因果"主张构成时序层面的不支持。
+    # 必须显式给出 verdict，否则消费方 820 行查不存在的 verdict 键，整段证据逻辑是死分支。
+    verdict = "支持" if score >= 0.3 else "不支持"
+    note = ("参数与指标同时异常占比 %.1f%%（%d/%d），时序吻合"
+            % (ratio * 100, both, len(pairs))) if verdict == "支持" \
+        else ("本批数据里参数与指标异常时段不重合（同时异常占比 %.1f%%），"
+              "对「同节拍因果」主张构成时序层面的不支持"
+              % (ratio * 100))
+    return score, {"both_abnormal": both, "n": len(pairs),
+                   "ratio_pct": ratio * 100, "score": score,
+                   "verdict": verdict, "note": note}
 
 
 def _evidence_gate(score, det):
@@ -663,7 +674,11 @@ def rank_root_causes(defect_name, table, target_col=None, top=5,
     # 未经本批数据验证的线索（prior_only_hints），不得当作本批数据的结论。
     # 注意 all_candidates 同样要清空：views.py 有 `candidates or all_candidates`
     # 的兜底取法，只清前者会被那条路径原样泄露出去。
-    if not suf.get("n_data_backed") and (suf.get("n_effective") or 0) >= MIN_N_FOR_RANKING:
+    if not suf.get("n_data_backed"):
+        # 只要零候选拿到数据支撑（无论样本够不够/有没有目标列），就不得输出根因榜单。
+        # 原守卫叠加了 n_effective>=MIN_N 的门槛，漏掉了 target_col=None 与 n<8 的
+        # INSUFFICIENT_DATA 场景——这两类同样"没查到"，却仍吐出带分数的 Top 榜单，
+        # 下游 views.py 因 honest_degraded=None 把假榜单渲染进报告（评审 E07 同类缺陷）。
         return {
             "defect": defect_name,
             "process": proc,
@@ -817,7 +832,7 @@ def _annotate_evidence(cands, table, target_col, info, confound_top=3):
             data_backed = False
 
         beforeafter = (c.get("temporal") or {})
-        if beforeafter.get("verdict") in ("不符", "不支持"):
+        if beforeafter.get("verdict") == "不支持":
             counter.append("时序上不支持：%s" % beforeafter.get("note", ""))
 
         c["missing_evidence"] = missing

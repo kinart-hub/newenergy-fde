@@ -436,7 +436,8 @@ def binary_split(table, target_col, mode="quartile", judge_col=None):
 
 # ------------------------------------------------------------------ 裕度探针
 
-def probe_margin(table, param_col, bad_idx, good_idx, spec=None, kb_params=None):
+def probe_margin(table, param_col, bad_idx, good_idx, spec=None, kb_params=None,
+                  pkey=None):
     """
     情形 C 的判据：把样本按目标好坏二分，比较该参数的均值差异，
     并核对差异是否仍落在它自己的规格窗口内。
@@ -478,7 +479,9 @@ def probe_margin(table, param_col, bad_idx, good_idx, spec=None, kb_params=None)
         out["reason"] = "好坏两组的均值差异不显著（p=%.3f），该参数对本次不良无区分力" % (p or 1)
     elif not have_spec:
         # 拿不到规格就不能判"合格但边缘"——否则所有没规格的场景都会被误报成上游问题
-        ref = _kb_reference(_base_param_of(param_col, [{}]), kb_params)
+        # 用调用方已按真实 table_meta 解析出的参数键查知识库，而不是写死的空 meta
+        # （空 meta 只能剥出裸列名，永远查不到参数键，参考量程提示恒定缺失）。
+        ref = _kb_reference(pkey or _base_param_of(param_col, [{}]), kb_params)
         out["reference"] = ref
         out["verdict"] = "no_spec_cannot_clear"
         out["reason"] = ("好坏两组差异显著（Δ=%.4g, p=%.4f），但没有拿到该参数的**企业规格/内控线**，"
@@ -592,7 +595,8 @@ def trace(tables, table_meta, target_col, current_process, defect=None,
         probe = None
         if bad_idx:
             sp = _pick_spec(spec, c, table_meta, params)
-            probe = probe_margin(aligned, c, bad_idx, good_idx, sp, kb_params=params)
+            probe = probe_margin(aligned, c, bad_idx, good_idx, sp,
+                                 kb_params=params, pkey=pkey)
             if probe:
                 probe["param_process"] = pproc      # 责任工序要精确到参数所属的那一道
                 probe["reference"] = _kb_reference(pkey, params)
