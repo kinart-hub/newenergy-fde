@@ -15,6 +15,40 @@
 
 ---
 
+## 2.19.6 — 2026-10-29｜收口重点复核遗留的 P2 项（歧义检测 + DOE 安全门禁下沉）
+
+上一轮把 P2-1（preprocess 列名匹配）、P2-2（DOE 安全门禁）标成"残留"就丢下，
+违背"同类缺陷必须全量排查、不许只修被点名的那一个"的铁律。本版把两条尾巴真正修掉并验证。
+
+- **P2-1 preprocess 列名匹配歧义坍缩**：根因是 `_search_param` 在返回前把多个并列候选
+  坍缩成单一最佳，`_match_one` 拿到时只剩 1 个候选，于是「区温度」同时命中一/二/三/末区温度
+  被静默取第一个，把数据挂到错误的工艺参数上做分析。修复：让 `_search_param` 返回**全部候选**
+  （5 元组第 5 项），`_match_one` 合并跨作用域候选后做歧义检测——第二高分与最高分差距
+  ≤0.15 即标 `ambiguous=True`、降置信度为 low、`apply_map_policy` 把歧义列当作低置信处置
+  （auto 标红、block 判未匹配）。明确列名（如「一区温度」唯一胜出）不受影响。
+  验收：`verify_rev_fixes.py` F5（区温度→ambiguous、候选≥2）/ F5b（一区温度不误判歧义）。
+- **P2-2 DOE 安全门禁仅 pipeline 层兜底**：`decode_design` 自身不校验约束，绕过 pipeline 直调 lib
+  时越界实验方案不会被拦截（`build_constraints`/`check_point` 只被 `optimize_rsm_constrained` 用到）。
+  修复：`decode_design` 新增 `constraints` 形参，传入后逐点过 `check_point`，越界点在记录上挂
+  `_safety_ok=False`/`_safety_violations`；pipeline 调用处传入已算好的 `_cons` 并在解码后汇总
+  越界运行号进 warnings（纵深防御）。不传 constraints 时行为不变（不挂字段，避免误报）。
+  验收：`verify_rev_fixes.py` F6（高角点 5.0V 越 4.5V 上限被标记；无约束时不挂字段）。
+
+配套：`scripts/verify_rev_fixes.py` 扩至 F1~F6（含 F5b 阴性对照证判据有分辨力）；版本号升 2.19.6，
+`gen_manifest.py` 同步 manifest.json。
+
+- **门禁自身退化：审计规则 45 变异注入失效（SKIP）**。重构 `apply_map_policy` 后，
+  `audit --selftest` 由 152/0 退化为 151/0 + **1 个 SKIP**——变异体目标串
+  `if policy == "block" and conf == "low":` 已随结构改动消失，注入失败被记 SKIP。
+  SKIP 比 FAIL 更危险：失败会喊，跳过只会让人以为门禁是好的。
+  修复两侧：① 判据加不变量「`if policy == "block":` 之后必须紧跟 `key = None`」，
+  只认"block 真的清空 key"这个动作，不钉死字样（判据停在 `policy == "block"` 字样上时，
+  把分支体改成空转仍会判过）；② 变异体目标改到该动作（`key = None` → `pass`）。
+  改完 `audit --selftest` 恢复 152/0/**0 SKIP**，该规则 3 个变异全部被抓。
+  教训固化：**跑门禁必须看 SKIP 计数，不能只看"失败 0"**。
+
+---
+
 ## 2.19.5 — 2026-10-29｜重点复核发现的 4 处真实缺陷修复
 
 本轮对用户点名的六项复核范围（完整性 / 逐文件审查 / 缺陷逻辑 / 测试 / 与上一版建议对照 / 整改清单）

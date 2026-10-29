@@ -213,25 +213,40 @@ def _confidence(rec):
     return "low"
 
 
+# 歧义容差（P2-1 根因修复）：第二高分的参数与最高分差距 ≤ 此值即视为"无法唯一判定"。
+# 行业无关、参数无关——纯几何判据，不钉任何具体列名/参数。
+AMBIG_TOLERANCE = 0.15
+
+
 def _search_param(target, params):
     """在给定参数子集中做别名匹配，返回 (key, 命中别名, 相似度, 来源)。"""
     best, best_score, best_via, best_src = None, 0, None, None
+    # allc：每个参数取其最佳别名匹配分（用于歧义检测，避免多个并列参数被静默坍缩）。
+    allc = {}
     for key, spec in params.items():
         for alias in spec.get("aliases", []) + [spec.get("name", ""), key]:
             a = _norm_name(alias)
             if not a:
                 continue
             if a == target:
-                return key, alias, 1.0, "exact"
+                allc[key] = 1.0
+                if 1.0 > best_score:
+                    best, best_score, best_via, best_src = key, 1.0, alias, "exact"
+                continue
             # 护栏：子串匹配要求较短一方至少 4 个字符。否则「Visc」会误配「isc」、
             # 「电池列」会误配泛化别名「电池」，导致工序与参数同时判错（v1.10 修复）。
             if (a in target or target in a) and _substring_ok(a, target):
                 score = min(len(a), len(target)) / max(len(a), len(target))
+                if key not in allc or score > allc[key]:
+                    allc[key] = score
                 if score > best_score:
                     best, best_score, best_via, best_src = key, score, alias, "substring"
     if best_score >= 0.6:
-        return best, best_via, best_score, best_src
-    return None, None, 0.0, "unmatched"
+        all_cands = [{"key": kk, "score": round(ss, 3),
+                     "source": "exact" if ss >= 1.0 else "substring"}
+                    for kk, ss in allc.items() if ss >= 0.6]
+        return best, best_via, best_score, best_src, all_cands
+    return None, None, 0.0, "unmatched", []
 
 
 def _match_one(col_name, prefer_process=None):
@@ -261,11 +276,15 @@ def _match_one(col_name, prefer_process=None):
     rec = None
     cands = {}
     for scope_name, subset in scopes:
-        k, via, sc, src = _search_param(target, subset)
+        k, via, sc, src, allc = _search_param(target, subset)
+        # 合并本作用域内全部候选（每个参数取最佳别名分），恢复被底层坍缩掉的歧义信息。
+        for ac in allc:
+            akey, asc = ac["key"], ac["score"]
+            if akey not in cands or asc > cands[akey]["score"]:
+                cands[akey] = {"key": akey, "score": asc,
+                               "source": "exact" if ac["source"] == "exact" else scope_name}
         if k:
             sc_r = round(sc, 3)
-            # 同一 key 可能跨作用域（process_scoped / generic / global）被多次列出，
-            # 按 key 去重保留最高分，避免候选列表出现重复 key 造成"伪多候选"误导。
             if k not in cands or sc_r > cands[k]["score"]:
                 cands[k] = {"key": k, "score": sc_r,
                             "source": "exact" if src == "exact" else scope_name}
@@ -275,16 +294,32 @@ def _match_one(col_name, prefer_process=None):
     if rec is None:
         rec = {"key": None, "source": "unmatched", "matched_via": None,
                "score": 0.0, "candidates": None}
+    # 歧义检测（P2-1 根因）：匹配器必须区分"唯一胜出"与"多个并列"。
+    # 典型危险场景：列名"区温度"同时命中一/二/三/末区温度（各自 0.75），
+    # 旧逻辑静默取循环里第一个，把数据挂到错误的工艺参数上做分析。
+    # 此处不假装能判定——标 ambiguous、降置信度、把候选全列出来供人工/下游消歧。
+    _scores = sorted((c["score"] for c in cands.values()), reverse=True)
+    _ambiguous = bool(len(_scores) >= 2 and (_scores[0] - _scores[1]) <= AMBIG_TOLERANCE)
+    rec["ambiguous"] = _ambiguous
     rec["candidates"] = sorted(cands.values(), key=lambda x: -x["score"])[:3]
     rec["unit_hint"] = _unit_hint(col_name)
     rec["unit_risk"] = _unit_mismatch(rec, col_name, params)
     rec["confidence"] = _confidence(rec)
-    # 量纲风险一律把置信度下调一级（high->medium, medium->low）
-    if rec["unit_risk"]:
-        rec["confidence"] = {"high": "medium", "medium": "low"}.get(
-            rec["confidence"], rec["confidence"])
     rec["confirmed"] = False
-    rec["policy_action"] = "accept"
+    if _ambiguous:
+        # 多义并列 → 一律按低置信处理，逼出人工确认，而不是替使用者拍板选一个。
+        rec["confidence"] = "low"
+        rec["policy_action"] = "review"
+        rec["ambiguity_note"] = (
+            "列名命中 %d 个参数且得分接近（最高 %.2f / 次高 %.2f），无法唯一判定；"
+            "请补全列名（如\"一区温度\"）或在 analyze 时指定 prefer_process"
+            % (len(_scores), _scores[0], _scores[1]))
+    else:
+        # 量纲风险一律把置信度下调一级（high->medium, medium->low）
+        if rec["unit_risk"]:
+            rec["confidence"] = {"high": "medium", "medium": "low"}.get(
+                rec["confidence"], rec["confidence"])
+        rec["policy_action"] = "accept"
     return rec
 
 
@@ -312,15 +347,19 @@ def apply_map_policy(detailed, policy=MAP_POLICY):
     out, low = {}, []
     for col, rec in detailed.items():
         key = rec.get("key")
-        conf = rec.get("confidence")
+        # 歧义列与低置信列同等对待：都不许"猜了就用"，必须暴露出来让人确认。
+        ambiguous = bool(rec.get("ambiguous"))
+        conf = "low" if ambiguous else rec.get("confidence")
         action = "accept"
-        if policy == "block" and conf == "low":
-            key = None
-            action = "block"
-        elif conf == "low":
-            action = "review" if policy == "review" else "accept"
-            low.append({"col": col, "key": key, "confidence": conf,
-                        "source": rec.get("source"), "unit_risk": rec.get("unit_risk")})
+        if ambiguous or conf == "low":
+            if policy == "block":
+                key = None
+                action = "block"
+            else:
+                action = "review" if policy == "review" else "accept"
+                low.append({"col": col, "key": key, "confidence": conf,
+                            "ambiguous": ambiguous,
+                            "source": rec.get("source"), "unit_risk": rec.get("unit_risk")})
         out[col] = key
         rec["policy_action"] = action
     return out, low

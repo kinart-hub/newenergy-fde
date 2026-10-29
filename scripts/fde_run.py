@@ -1854,6 +1854,11 @@ def rule_p1_field_mapping_confidence():
         return _r(False, "缺少 apply_map_policy：低置信度无法被阻断/确认")
     if 'policy == "block"' not in t:
         return _r(False, "apply_map_policy 不支持 block：低置信列无法判未匹配")
+    # 只认"block 分支真的把 key 清空"这个动作，不钉死具体写法——
+    # 判据停在 `policy == "block"` 字样上时，把分支体改成空转（key 照样被采用）
+    # 依然判过，等于没锁住"低置信可阻断"这件事本身。
+    if not re.search(r'if policy == "block":[ \t]*\n\s+key = None', t):
+        return _r(False, "block 分支未真正清空 key：低置信列仍会被采用（阻断形同虚设）")
     if "def _unit_mismatch(" not in t:
         return _r(False, "缺少 _unit_mismatch：跨量纲误映射只能靠白名单碰巧挡住")
     if '"unit_risk"' not in t:
@@ -3637,9 +3642,9 @@ AUDIT_RULES = [
           _mutant("量纲风险检测被关掉（跨量纲误映射不再可见）",
                   _re_sub(r'return not \(col_hints & decl_hints\)',
                           'return False', flags=re.M), PREPROCESS_FILE),
-          _mutant("去掉 block 政策分支（低置信无法阻断）",
-                  _re_sub(r'if policy == "block" and conf == "low":',
-                          'if False and conf == "low":', flags=re.M), PREPROCESS_FILE)]),
+          _mutant("block 分支空转（低置信仍被采用）",
+                  _re_sub(r'if policy == "block":[ \t]*\n(\s+)key = None',
+                          'if policy == "block":\n\\1pass', flags=re.M), PREPROCESS_FILE)]),
     Rule("SPC 剔除必须可审计：可切换仅建议/审核、逐点带规则身份与审核人",
          rule_p1_spc_exclusion_review,
          "P1-2。phase1_limits 必须支持 mode=auto/suggest/review 与 review 入参；"

@@ -2,11 +2,14 @@
 """
 复核修复验证（rev fix verification）—— 审计证据脚本，可入库。
 
-覆盖本轮 4 处真实缺陷修复：
+覆盖本轮真实缺陷修复：
   F1  rootcause 诚实降级泄漏：无数据支撑时不得输出根因榜单（只降级为 prior_only_hints）
   F2  rootcause 时序反证死分支：_temporal_match 必须返回 verdict，消费方读得到并出反证
   F3  doe decode_design 2 水平高端点：默认 2 水平 DOE 解不出高角点
   F4  crossprocess probe_margin 参考量程：用真实 pkey 而非写死空 meta 拿参考量程
+  F5  preprocess 歧义检测：多义列名（"区温度"）必须标 ambiguous，不得静默取第一个
+  F5b preprocess 阴性对照：唯一胜出（"一区温度"）不得误判歧义
+  F6  doe decode_design 安全门禁：传入 constraints 后越界点必须被标记 _safety_ok=False
 
 用法：
   python scripts/verify_rev_fixes.py            # 仅打印
@@ -18,6 +21,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from lib import doe, crossprocess as CP, rootcause as RC, table as T  # noqa: E402
+from lib import preprocess as PP  # noqa: E402
 
 
 def check(name, cond, detail=""):
@@ -107,6 +111,46 @@ def test_f4_probe_margin_pkey():
     return check("F4 probe_margin 真实 pkey 拿参考量程", ok, detail)
 
 
+def test_f5_ambiguity_detection():
+    """多义列名必须被标 ambiguous，不可静默取第一个参数（P2-1 根因）。"""
+    tb = T.Table(["区温度", "良率"], [[100.0, 0.9], [110.0, 0.85]])
+    rec = PP._match_one("区温度")
+    n_cand = len(rec.get("candidates") or [])
+    ok = (rec.get("ambiguous") is True) and (n_cand >= 2) and (rec.get("confidence") == "low")
+    return check("F5 多义列名标 ambiguous（区温度→多温度参数并列）", ok,
+                 "ambiguous=%s candidates=%d conf=%s"
+                 % (rec.get("ambiguous"), n_cand, rec.get("confidence")))
+
+
+def test_f5b_unique_no_false_ambiguity():
+    """唯一胜出列名不得误判歧义（证明判据有分辨力，不是一律标歧义）。"""
+    rec = PP._match_one("一区温度")
+    ok = (rec.get("ambiguous") is not True) and (rec.get("key") is not None) \
+        and (rec.get("confidence") in ("high", "medium"))
+    return check("F5b 唯一胜出不误判歧义（一区温度→明确参数）", ok,
+                 "ambiguous=%s key=%s conf=%s"
+                 % (rec.get("ambiguous"), rec.get("key"), rec.get("confidence")))
+
+
+def test_f6_decode_safety_envelope():
+    """decode_design 传入 constraints 后，越界点必须被标 _safety_ok=False（P2-2）。"""
+    fs = [{"name": "化成电压", "low": 3.0, "high": 5.0}]
+    # 用内置安全包络构造约束：化成电压上限 4.5V，使高角点 5.0 越界
+    cons = doe.build_constraints(fs, spec_overrides={"化成电压": {"safety": {
+        "limit": "max", "value": 4.5, "unit": "V"}}})
+    mat = doe.full_factorial([2])  # [[1],[2]] → 低=3.0 / 高=5.0
+    dec = doe.decode_design(mat, fs, cons)
+    low_ok = dec[0].get("_safety_ok") is True
+    high_bad = dec[1].get("_safety_ok") is False and bool(dec[1].get("_safety_violations"))
+    # 对照：不传 constraints 时不应挂安全字段（避免误报）
+    dec_noconst = doe.decode_design(mat, fs)
+    no_const_field = "_safety_ok" not in dec_noconst[0]
+    ok = low_ok and high_bad and no_const_field
+    return check("F6 decode 越界点被安全门禁拦截", ok,
+                 "low_ok=%s high_bad=%s no_const_field=%s"
+                 % (low_ok, high_bad, no_const_field))
+
+
 def main():
     print("=== 复核修复验证 ===")
     results = [
@@ -114,6 +158,9 @@ def main():
         test_f2_temporal_verdict(),
         test_f3_doe_decode(),
         test_f4_probe_margin_pkey(),
+        test_f5_ambiguity_detection(),
+        test_f5b_unique_no_false_ambiguity(),
+        test_f6_decode_safety_envelope(),
     ]
     n_fail = sum(1 for r in results if not r)
     print("=== 汇总：%d 项，%d 失败 ===" % (len(results), n_fail))

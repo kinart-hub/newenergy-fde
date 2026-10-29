@@ -175,7 +175,7 @@ if EV is not None and EV.__name__ != "lib.events":
 KB = PP.load_knowledge()
 _fmt = RPT._fmt
 
-ANALYZER_VERSION = "2.19.5"
+ANALYZER_VERSION = "2.19.6"
 
 
 # 空数据排查清单。
@@ -2392,7 +2392,7 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
                 opts = DOE.recommend_design(len(factors), levels=2, budget=32)
                 chosen = opts[0]
                 matrix = DOE.build_design(chosen["kind"], len(factors), 2, chosen.get("param"))
-                plan = DOE.decode_design(matrix, factors) if matrix else []
+                plan = DOE.decode_design(matrix, factors, _cons) if matrix else []
                 # P1-7：矩阵只是"做哪些组合"，不是可执行方案。随机化顺序、重复、
                 # 区组、别名结构、样本量功效这五件事不写出来，现场只能靠习惯补。
                 _struct = None
@@ -2408,6 +2408,15 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
                 doe_plan = {"factors": factors, "options": opts, "excluded": excluded,
                             "chosen": chosen, "matrix": matrix, "run_plan": plan,
                             "constraints": _cons, "clamped": _clamped}
+                # 纵深防御：decode 阶段已逐点过 _cons，汇总越界运行号（理论上 clamp 后应无，
+                # 但 lib 层门禁保证任何调用路径都不会把越界方案当成合法下发）。
+                _unsafe = [i + 1 for i, r in enumerate(plan)
+                           if r.get("_safety_ok") is False]
+                if _unsafe:
+                    doe_plan["safety_violations_runs"] = _unsafe
+                    result.setdefault("warnings", []).append(
+                        "DOE 解码后有 %d 个运行号超出安全/工艺约束（%s），请复核水平设置"
+                        % (len(_unsafe), "、".join(map(str, _unsafe[:5]))))
                 doe_plan["boundaries"] = _bounds
                 doe_plan["boundary_gate"] = _gate
                 if _struct:

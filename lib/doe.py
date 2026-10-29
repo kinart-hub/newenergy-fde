@@ -181,9 +181,12 @@ def build_design(kind, n_factors, levels=2, param=None):
     return None
 
 
-def decode_design(matrix, factor_specs):
+def decode_design(matrix, factor_specs, constraints=None):
     """coded/水平矩阵 -> 实际工艺参数值。
     factor_specs: [{"name":..,"low":..,"high":..,"mid":..(可选),"unit":..}]
+    constraints: 可选，{参数名: build_constraints 返回的结构}；传入后逐点过 check_point，
+        越界点在该条记录上挂 _safety_ok=False / _safety_violations，使 lib 层自带安全门禁——
+        不再只有 pipeline 层 clamp 兜底，绕过 pipeline 直调 decode_design 也能拦住越界方案。
 
     水平号约定（1-based）：1=低, 2=中, 3=高, 0=中点, 负=编码值。
     关键：2 水平设计只有 1/2 两个水平号，此时 2 **就是高**而非中点；
@@ -224,6 +227,11 @@ def decode_design(matrix, factor_specs):
                 mid = spec.get("mid", (spec.get("low", 0) + spec.get("high", 0)) / 2.0)
                 half = (spec.get("high", 0) - spec.get("low", 0)) / 2.0
                 rec[spec["name"]] = mid + (v - 1) * half
+        if constraints:
+            # lib 层安全门禁：解码后立刻逐点核验，越界点不让"看起来像合法方案"溜过去。
+            _ok, _viol = check_point(rec, constraints)
+            rec["_safety_ok"] = _ok
+            rec["_safety_violations"] = _viol
         out.append(rec)
     return out
 
