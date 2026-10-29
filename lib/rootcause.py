@@ -31,12 +31,87 @@ _KB = None
 # 根因排序权重（评审 P1-5）：此前 0.10 的可验证性权重硬编码为 0.5 且未进排序，
 # 现已按候选真实信号动态计算并统一引用这组常量。集中管理便于调参与灵敏度验证，
 # 不随行业/产品固化——调整权重改这里即可，无需触碰评分逻辑。
+#
+# 外部评审 P1-5（2026-10-29）：权重只有硬编码、没有配置文件也没有敏感性分析脚本，
+# 于是"发现更优权重也改不了"，更没法说明这组数是验证过的还是手调的。
+# 现在权重可从 lib/config_rootcause.json 覆盖，但**内置默认值仍是唯一兜底**，
+# 且配置读不出来必须显式告知（不许静默回落——静默回落等于让人以为按企业口径配好了）。
 ROOTCAUSE_WEIGHTS = {
     "evidence": 0.40,        # 数据证据强度
     "prior": 0.35,           # 知识库先验
     "temporal": 0.15,        # 时序吻合度
     "verifiability": 0.10,   # 可验证性（按候选真实信号动态计算）
 }
+
+_WEIGHT_KEYS = ("evidence", "prior", "temporal", "verifiability")
+_WEIGHTS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             "config_rootcause.json")
+
+
+def normalize_weights(raw):
+    """校验并归一化权重。返回 (weights, error)。
+
+    校验不通过一律返回 (None, 原因)，**不做"缺哪个就补默认"的静默修补**：
+    缺一个键的配置说明写配置的人漏了，补默认等于把他没做的决定替他做了，
+    而他永远不会知道。宁可报错让他看见。
+    """
+    if not isinstance(raw, dict):
+        return None, "权重不是字典"
+    lack = [k for k in _WEIGHT_KEYS if k not in raw]
+    if lack:
+        return None, "缺权重项：%s" % "、".join(lack)
+    try:
+        vals = {k: float(raw[k]) for k in _WEIGHT_KEYS}
+    except (TypeError, ValueError) as exc:
+        return None, "权重含非数值：%s" % exc
+    neg = [k for k, v in vals.items() if v < 0]
+    if neg:
+        return None, "权重不得为负：%s" % "、".join(neg)
+    tot = sum(vals.values())
+    if tot <= 0:
+        return None, "权重之和必须大于 0（当前 %g）" % tot
+    return {k: v / tot for k, v in vals.items()}, None
+
+
+def load_weights(path=None):
+    """读取根因权重配置，返回 (weights, source_note)。
+
+    source_note 是给报告用的**人话**，必须让读者知道这次排序用的是哪套权重：
+      - 配置文件读到且合法 → "配置文件（路径）"
+      - 文件不存在        → "内置默认（未提供配置文件）"
+      - 文件存在但读不出/不合法 → "内置默认（配置文件有问题：…）"
+    第三种情况最要紧：它是事故而不是事实，必须能被看见。
+    """
+    p = path or _WEIGHTS_PATH
+    if not os.path.isfile(p):
+        w, _ = normalize_weights(ROOTCAUSE_WEIGHTS)
+        return w, "内置默认（未提供配置文件 %s）" % os.path.basename(p)
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+    except Exception as exc:
+        # 不在这里再包 try：degrade.note 自身已整体兜底（它的注释写明
+        # "诊断通道不许搞崩主流程"），外层再吞一层就变成静默——S1 静态扫描会抓。
+        degrade.note("rootcause.load_weights@read", exc)
+        w, _ = normalize_weights(ROOTCAUSE_WEIGHTS)
+        return w, "内置默认（配置文件读取失败：%s）" % exc
+    raw = cfg.get("scoring_weights") if isinstance(cfg, dict) else None
+    w, err = normalize_weights(raw)
+    if err:
+        degrade.note("rootcause.load_weights@schema", ValueError(err))
+        w2, _ = normalize_weights(ROOTCAUSE_WEIGHTS)
+        return w2, "内置默认（配置文件不合规：%s）" % err
+    return w, "配置文件 %s" % os.path.basename(p)
+
+
+def weights_note(w, source):
+    """把权重渲染成一句可核对的说明（不手工维护数字，全部由实际权重生成）。"""
+    labels = {"evidence": "数据证据", "prior": "知识先验",
+              "temporal": "时序吻合", "verifiability": "可验证性"}
+    order = ("evidence", "prior", "temporal", "verifiability")
+    parts = ["%.2f %s" % (w[k], labels[k]) for k in order if k in w]
+    return "综合得分为排序启发式权重之和（%s；来源：%s），不是概率" % (
+        " + ".join(parts), source)
 
 
 def _kb():
@@ -475,7 +550,8 @@ def _chain_processes(proc):
     return out
 
 def rank_root_causes(defect_name, table, target_col=None, top=5,
-                     col_map=None, process=None, exclude_cols=None):
+                     col_map=None, process=None, exclude_cols=None,
+                     weights=None, weights_path=None):
     """返回候选根因排序 list
 
     候选有两个来源，缺一不可：
@@ -506,6 +582,20 @@ def rank_root_causes(defect_name, table, target_col=None, top=5,
     if top <= 0:
         raise ValueError("top 必须为正整数（当前 %r）；想要全部候选请传足够大的值" % top)
 
+    # 权重来源（外部评审 P1-5）：调用方显式传入 > 配置文件 > 内置默认。
+    # 无论走哪条路，最终都会把"这次用了哪套权重、从哪来"写进结果的 weights_source，
+    # 供报告直接引用——排序依据不可见，读者就只能信或不信，没法核对。
+    if weights is not None:
+        _w, _werr = normalize_weights(weights)
+        if _werr:
+            raise ValueError("调用方传入的根因权重不合规：%s" % _werr)
+        _wsrc = "调用方显式传入"
+    else:
+        _w, _wsrc = load_weights(weights_path)
+    if not _w:
+        # 内置默认都坏掉只可能是代码被人改错，属于程序 bug，不能当成"数据不足"糊过去
+        raise ValueError("根因权重无法确定：内置默认权重不合规")
+
     info = kb["defect_rootcause"].get(defect_name)
     proc = process or (info or {}).get("process")
     if not info and not col_map:
@@ -535,9 +625,9 @@ def rank_root_causes(defect_name, table, target_col=None, top=5,
         # 注意：可验证性（P1-5）不再硬编码 0.5，留到 _annotate_evidence 之后
         # 按候选真实信号统一计算并计入总分（见下方 post-annotation 重算段）。
         # 这里先只累加前三项，verifiability 分项在收尾时补全。
-        base = (ROOTCAUSE_WEIGHTS["evidence"] * ev
-                + ROOTCAUSE_WEIGHTS["prior"] * prior
-                + ROOTCAUSE_WEIGHTS["temporal"] * tscore)
+        base = (_w["evidence"] * ev
+                + _w["prior"] * prior
+                + _w["temporal"] * tscore)
         gate_note = _evidence_gate(base, det)[1]
         cands.append({
             "param_key": pk,
@@ -595,9 +685,9 @@ def rank_root_causes(defect_name, table, target_col=None, top=5,
             if det.get("column"):
                 tscore, tdet = _temporal_match(table, det["column"], target_col)
             prior = 0.35                       # 先验低于知识库候选，但证据硬
-            base = (ROOTCAUSE_WEIGHTS["evidence"] * ev
-                + ROOTCAUSE_WEIGHTS["prior"] * prior
-                + ROOTCAUSE_WEIGHTS["temporal"] * tscore)
+            base = (_w["evidence"] * ev
+                + _w["prior"] * prior
+                + _w["temporal"] * tscore)
             cands.append({
                 "param_key": pk,
                 "param": det.get("column"),
@@ -633,19 +723,27 @@ def rank_root_causes(defect_name, table, target_col=None, top=5,
 
     # P1-5：可验证性权重此前硬编码 0.5、不算进排序、不随候选输出。
     # 现在统一按候选真实信号计算，并计入总分 + 输出分项（verifiability_score）。
+    # 外部评审 P1-5（2026-10-29）：权重必须可配置、且**用了哪套要能被核对**，
+    # 所以每条候选同时带 weights_used 与 score_breakdown——读者能自己乘一遍验算，
+    # 而不是只能"信这个分数"。
     for c in cands:
         _ev = c.get("evidence_score") or 0.0
         _pr = c.get("prior_score") or 0.0
         _ts = c.get("temporal_score") or 0.0
         _vf = _verifiability(c)
-        _final = (ROOTCAUSE_WEIGHTS["evidence"] * _ev
-                  + ROOTCAUSE_WEIGHTS["prior"] * _pr
-                  + ROOTCAUSE_WEIGHTS["temporal"] * _ts
-                  + ROOTCAUSE_WEIGHTS["verifiability"] * _vf)
+        _parts = {
+            "evidence": _w["evidence"] * _ev,
+            "prior": _w["prior"] * _pr,
+            "temporal": _w["temporal"] * _ts,
+            "verifiability": _w["verifiability"] * _vf,
+        }
+        _final = sum(_parts.values())
         _final, _gate = _evidence_gate(_final, c.get("detail") or {})
         c["verifiability_score"] = round(_vf, 3)
         c["score"] = round(_final, 4)
         c["gate_note"] = _gate
+        c["weights_used"] = {k: round(v, 4) for k, v in _w.items()}
+        c["score_breakdown"] = {k: round(v, 4) for k, v in _parts.items()}
     # 排序分区：**在表里指得到列、且拿到数据支撑**的候选永远排在前，
     # 指不到列的纯先验候选一律在后。
     #
@@ -707,6 +805,9 @@ def rank_root_causes(defect_name, table, target_col=None, top=5,
             ],
             "score_note": "本批数据未能支撑任何根因候选，故不给出排序；"
                           "prior_only_hints 为知识库常见候选，属待核实线索而非结论",
+            # 即便没有榜单，也如实交代"如果排序会用哪套权重"，便于复核配置是否生效
+            "weights_used": {k: round(v, 4) for k, v in _w.items()},
+            "weights_source": _wsrc,
         }
     return {
         "defect": defect_name,
@@ -720,10 +821,13 @@ def rank_root_causes(defect_name, table, target_col=None, top=5,
         "history_cases": [hist[k] for k in hist],
         "status": suf["status"],
         "data_sufficiency": suf,
-        # P1-5：明确权重是排序启发式而非概率，避免被读成"该参数确为根因的概率"
-        "score_note": ("综合得分为排序启发式权重之和"
-                       "（0.40 数据证据 + 0.35 知识先验 + 0.15 时序吻合 + 0.10 可验证性），"
-                       "不是概率，不代表该参数确为根因的概率；可验证性分项见各候选 verifiability_score"),
+        # P1-5：明确权重是排序启发式而非概率，避免被读成"该参数确为根因的概率"。
+        # 权重数字**由实际使用的权重生成**，不手写常数——否则一旦改成配置文件，
+        # 这句话就会继续报着旧数字，变成一条看起来精确的假信息。
+        "weights_used": {k: round(v, 4) for k, v in _w.items()},
+        "weights_source": _wsrc,
+        "score_note": weights_note(_w, _wsrc) + "；不代表该参数确为根因的概率，"
+                       "各候选可验证性分项见 verifiability_score、分项贡献见 score_breakdown",
     }
 
 

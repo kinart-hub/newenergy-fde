@@ -151,6 +151,104 @@ def test_f6_decode_safety_envelope():
                  % (low_ok, high_bad, no_const_field))
 
 
+def test_f7_weight_configurable():
+    """F7 根因权重可配置且可核对（外部评审 P1-5）。
+
+    要锁的三件事：
+      ① 权重真的参与计分（把 prior 权重置 0，分项里 prior 贡献必须为 0）；
+      ② 候选带 weights_used / score_breakdown，且分项之和 == 总分（能自己验算）；
+      ③ 非法权重被拒绝，而不是"缺哪个补哪个"静默修补。
+    """
+    import random as _r
+    _g = _r.Random(11)
+    rows = []
+    for _i in range(60):
+        _solid = 60 + _g.gauss(0, 2.0)          # 先验靠前，但与 y 无关
+        _speed = 40 + _g.gauss(0, 2.0)          # 与 y 强相关
+        _y = 2.0 + 0.5 * (_speed - 40) + _g.gauss(0, 0.05)
+        rows.append([_solid, _speed, _y])
+    tb = T.Table(["浆料固含", "涂布速度", "面密度"], rows)
+
+    pure_ev = {"evidence": 1.0, "prior": 0.0, "temporal": 0.0, "verifiability": 0.0}
+    res = RC.rank_root_causes("面密度超差", tb, "面密度", top=5, weights=pure_ev)
+    cands = (res or {}).get("candidates") or []
+    ok_used = bool(cands) and cands[0].get("weights_used", {}).get("prior") == 0.0
+    bd = (cands[0].get("score_breakdown") or {}) if cands else {}
+    ok_zero = bool(bd) and abs(bd.get("prior", 1)) < 1e-9 and bd.get("evidence", 0) > 0
+    # 分项之和应≈总分（gate 可能再缩放，所以只要求同向且量级一致）
+    _sum = sum(bd.values()) if bd else 0
+    ok_sum = bool(bd) and abs(_sum - (cands[0].get("score") or 0)) < 0.25
+
+    # 非法权重必须抛错（而不是静默修补）
+    bad = 0
+    for w in ({"prior": 1.0},
+              {"evidence": -1, "prior": 1, "temporal": 1, "verifiability": 1},
+              {"evidence": 0, "prior": 0, "temporal": 0, "verifiability": 0}):
+        try:
+            RC.rank_root_causes("面密度超差", tb, "面密度", top=5, weights=w)
+        except ValueError:
+            bad += 1
+    ok = ok_used and ok_zero and ok_sum and bad == 3
+    return check("F7 权重可配置/参与计分/可核对/非法值被拒", ok,
+                 "weights_used.prior=%s prior贡献=%s 分项和=%.3f 总分=%.3f 非法拒绝=%d/3"
+                 % (cands[0].get("weights_used", {}).get("prior") if cands else None,
+                    bd.get("prior"), _sum, (cands[0].get("score") if cands else 0), bad))
+
+
+def test_f8_weight_source_honest():
+    """F8 权重的来源必须如实告知（不许静默回落）。
+
+    三种情况各验一次：配置文件存在且合法 / 不存在 / 存在但坏了。
+    第三种最要紧——它是事故不是事实，必须写在 weights_source 里被人看见。
+    """
+    import json as _j
+    import tempfile
+    w0, src0 = RC.load_weights()
+    ok_conf = ("配置文件" in src0) and abs(sum(w0.values()) - 1.0) < 1e-9
+
+    tmpd = tempfile.mkdtemp()
+    _missing = os.path.join(tmpd, "nope.json")
+    w1, src1 = RC.load_weights(_missing)
+    ok_missing = ("内置默认" in src1) and abs(sum(w1.values()) - 1.0) < 1e-9
+
+    _badp = os.path.join(tmpd, "bad.json")
+    with open(_badp, "w", encoding="utf-8") as f:
+        _j.dump({"scoring_weights": {"prior": 0.5}}, f)   # 缺三项
+    w2, src2 = RC.load_weights(_badp)
+    ok_bad = ("内置默认" in src2) and ("不合规" in src2) and abs(sum(w2.values()) - 1.0) < 1e-9
+    try:
+        os.remove(_badp)
+        os.rmdir(tmpd)
+    except OSError as exc:
+        print("   ! 临时文件清理失败，请手工删除 %s（%s）" % (tmpd, exc))
+
+    ok = ok_conf and ok_missing and ok_bad
+    return check("F8 权重来源如实交代（含配置损坏时出声）", ok,
+                 "配置=%s | 缺失=%s | 损坏=%s" % (src0[:18], src1[:14], src2[:26]))
+
+
+def test_f9_sensitivity_has_resolution():
+    """F9 敏感性判据有分辨力（不能永远报"稳健"）。
+
+    用合成排名序列验证：全一致 → 1.00 且判"稳健"；全翻转 → 低分且判"不稳"。
+    只测真实数据是不够的——那份数据恰好很稳，判据翻不动也看不出来。
+    """
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "scripts"))
+    import sensitivity_analysis as SA
+
+    same = [[("A", 1.0), ("B", 0.8)], [("A", 0.9), ("B", 0.7)]]
+    flip = [[("A", 1.0), ("B", 0.8)], [("B", 0.9), ("A", 0.7)]]
+    ag_same = SA.top1_agree(same)[0]
+    ag_flip = SA.top1_agree(flip)[0]
+    tau_same = SA.kendall_tau(["A", "B", "C"], ["A", "B", "C"])
+    tau_rev = SA.kendall_tau(["A", "B", "C"], ["C", "B", "A"])
+    ok = (ag_same == 1.0 and ag_flip == 0.5
+          and tau_same == 1.0 and tau_rev == -1.0)
+    return check("F9 敏感性判据有分辨力（一致/翻转可区分）", ok,
+                 "agree 同=%s 翻=%s | tau 同=%s 反=%s" % (ag_same, ag_flip, tau_same, tau_rev))
+
+
 def main():
     print("=== 复核修复验证 ===")
     results = [
@@ -161,6 +259,9 @@ def main():
         test_f5_ambiguity_detection(),
         test_f5b_unique_no_false_ambiguity(),
         test_f6_decode_safety_envelope(),
+        test_f7_weight_configurable(),
+        test_f8_weight_source_honest(),
+        test_f9_sensitivity_has_resolution(),
     ]
     n_fail = sum(1 for r in results if not r)
     print("=== 汇总：%d 项，%d 失败 ===" % (len(results), n_fail))

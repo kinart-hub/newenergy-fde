@@ -1,0 +1,13 @@
+{
+  "_comment": "根因排序权重配置（可选）。删除本文件即回落内置默认，行为与不提供本文件完全一致。",
+  "_read_by": "lib/rootcause.py 的 load_weights()；由 rank_root_causes 在每次排序时读取（可用 weights_path 指向别处）",
+  "_validation": "四键必须齐全、非负、和>0；任一条不满足即整体回落内置默认，并在结果的 weights_source 里写明回落原因。不采用『缺哪个补哪个』的静默修补——补默认等于替写配置的人做他没做的决定，而他永远不会知道。",
+  "_weights_source": "工程默认值（与 lib/rootcause.py 的 ROOTCAUSE_WEIGHTS 一致）。该组数值来自排序启发式的经验设定，**尚未在任何客户真实案例上做过统计验证**；如贵司有已验证的权重，改这里即可，结果中的 weights_source 会随之变化，报告里也会写明这次用的是哪套。",
+  "_how_to_validate": "python scripts/sensitivity_analysis.py --input <数据> --target <目标列> 会扫权重网格并给出『排序对权重是否敏感』的结论。它只能回答『换个权重排名会不会翻』，不能证明某套权重『正确』——后者必须要现场真值。",
+  "scoring_weights": {
+    "evidence": 0.4,
+    "prior": 0.35,
+    "temporal": 0.15,
+    "verifiability": 0.1
+  }
+}

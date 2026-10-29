@@ -1819,10 +1819,18 @@ def rule_p1_verifiability_weighted():
         return _r(False, "可验证性仍硬编码为 0.5：权重未真正生效")
     if re.search(r"0\.10\s*\*\s*0\.5", t):
         return _r(False, "评分仍写死 0.10*0.5：可验证性未参评")
-    # 3) 收尾段必须把可验证性分项计入总分（调用形态：0.10*_vf 或直接引用权重常量）
-    if not (re.search(r"0\.10\s*\*\s*_vf", t)
-            or 'ROOTCAUSE_WEIGHTS["verifiability"] * _vf' in t):
-        return _r(False, "总分未含 0.10*_vf：可验证性未计入排序")
+    # 3) 收尾段必须把可验证性分项计入总分。
+    # 判据口径纠偏（2026-10-29，外部评审 P1-5）：原判据钉死两种写法
+    # （`0.10 * _vf` / `ROOTCAUSE_WEIGHTS["verifiability"] * _vf`）。
+    # 权重改成可配置（`_w["verifiability"] * _vf`）后，两种都不匹配 ——
+    # 代码更好了，判据反而判红。这正是"判据停在字样层"的老坑。
+    # 改为认不变量：可验证性必须被某个**非零**权重乘进总分（写法随便），
+    # 且不得写死 0.5 / 0.10*0.5（上面两条已挡）。
+    _m = re.search(r"([A-Za-z_][\w\[\]\"'\.]*)\s*\*\s*_vf\b", t)
+    if not _m:
+        return _r(False, "总分未引用可验证性（找不到 *_vf）：可验证性未计入排序")
+    if re.fullmatch(r"0(?:\.0+)?", _m.group(1).strip()):
+        return _r(False, "可验证性被乘上 0：权重被置零，等于没参评")
     # 4) 候选必须输出分项，且返回体注明权重是启发式非概率
     if '"verifiability_score"' not in t:
         return _r(False, "候选未输出 verifiability_score：使用者看不到这一项")
@@ -2894,14 +2902,29 @@ def rule_p0_nelson_run_contiguous():
 
     修复前规则2 带 `and (not hits or hits[-1] != i - 1)` 抑制条件，
     连续违规段会被切成一段段的，报告里"连续9点同侧"实际只标了首尾零散几点。
+
+    2026-10-29 判据口径纠偏：原判据还要求源码里出现
+    `if i - run_start + 1 >= 9:` 这一行。那是**旧实现的写法**，而旧实现本身有 bug
+    ——它只认 run 达标之后的尾部，run 头 8 个点永远不算命中，于是 15 点连续偏移
+    只报后 7 个点（迭代后剩 5 个、占 4.2%），刚好卡在 5% 阈值下面判成 stable=True。
+    钉死这一行等于把 bug 当规范：正确修复（按 run 分段、整段并入）反而被判红。
+    现改为认「整段并入」这个动作——任何等价写法都能过，而退化成逐点 append
+    （只报尾点、或只报最后一点）仍会被抓。
     """
     t = _read(SPCPy) or ""
     if "def nelson_violations(" not in t:
         return _r(False, "缺 nelson_violations：判异逻辑缺失")
     if "and (not hits or hits[-1] != i - 1)" in t:
         return _r(False, "规则2 仍残留隔点抑制：连续同侧会隔点返回")
-    if "if i - run_start + 1 >= 9:" not in t:
-        return _r(False, "规则2 的 9 点同侧判定结构缺失")
+    m2 = re.search(r"# 规则2[\s\S]*?# 规则3", t)
+    seg2 = m2.group(0) if m2 else ""
+    if not seg2:
+        return _r(False, "找不到规则2 的实现段（# 规则2 … # 规则3），无法核验整段返回")
+    # 判"并入的是一个整段变量"，而不是"出现过 extend"：
+    # `hits.extend([idxs[0], idxs[-1]])` 这种只报首尾的写法同样含 extend，
+    # 只查关键字会被它蒙混过关（变异体实测）。允许变量改名，只禁切片/索引形式。
+    if not re.search(r"hits\.extend\(\s*[A-Za-z_]\w*\s*\)", seg2):
+        return _r(False, "规则2 未把整段 run 并入命中（只取部分点会漏掉 run 头部）")
     return _r(True, "", {"nelson_run_contiguous": True})
 
 
@@ -3623,8 +3646,11 @@ AUDIT_RULES = [
          [_mutant("可验证性计算函数改名（消掉定义）",
                   _re_sub(r"^def _verifiability\(",
                           "def _verifiability2(", flags=re.M), ROOTCAUSE_FILE),
+          _mutant("可验证性权重被置零（等于不参评）",
+                  _re_sub(r'(_w\["verifiability"\]|ROOTCAUSE_WEIGHTS\["verifiability"\]|0\.10)\s*\*\s*_vf',
+                          "0.0 * _vf", flags=re.M), ROOTCAUSE_FILE),
           _mutant("总分写死 0.10*0.5（权重不再参评）",
-                  _re_sub(r'ROOTCAUSE_WEIGHTS\["verifiability"\] \* _vf',
+                  _re_sub(r'(_w\["verifiability"\]|ROOTCAUSE_WEIGHTS\["verifiability"\])\s*\*\s*_vf',
                           "0.10 * 0.5", flags=re.M), ROOTCAUSE_FILE),
           _mutant("候选不再输出可验证性分项",
                   _re_sub(r'c\["verifiability_score"\] = round\(_vf, 3\)',
@@ -4153,13 +4179,16 @@ AUDIT_RULES = [
     # —— 本轮审计修复的 7 条规则（带反向验证变异）——
     Rule("Nelson 规则2 连续同侧必须整段返回（不得隔点）",
          rule_p0_nelson_run_contiguous,
-         "nelson_violations 规则2 不得再含 'and (not hits or hits[-1] != i - 1)' 隔点抑制；"
-         "连续 9 点同侧必须整段连续返回。",
+         "nelson_violations 规则2 不得含隔点抑制；连续 9 点同侧必须整段并入命中，"
+         "不得退化为逐点 append（那会漏掉 run 头部）。",
          SPCPy,
-         [_mutant("规则2 重新引入隔点抑制（修复退化）",
-                  _sub("            if i - run_start + 1 >= 9:",
-                       "            if i - run_start + 1 >= 9 and (not hits or hits[-1] != i - 1):"),
-                  SPCPy)]),
+         [_mutant("规则2 退化为只报首尾（等同隔点返回）",
+                  _sub("            hits.extend(idxs)",
+                       "            hits.extend([idxs[0], idxs[-1]] if len(idxs) > 1 else idxs)"),
+                  SPCPy),
+          _mutant("规则2 退化为逐点 append（run 头部被漏掉）",
+                  _re_sub(r"(# 规则2[\s\S]*?)hits\.extend\(idxs\)",
+                          r"\1hits.append(idxs[-1])"), SPCPy)]),
     Rule("Phase I 剔除比例>5% 必须判为不稳定（不得谎报稳定）",
          rule_p0_phase1_excl_unstable,
          "phase1_limits 必须含 'len(excluded) > max(2, 0.05 * n_total)' 判据并据此置 stable=False；"

@@ -175,7 +175,7 @@ if EV is not None and EV.__name__ != "lib.events":
 KB = PP.load_knowledge()
 _fmt = RPT._fmt
 
-ANALYZER_VERSION = "2.19.7"
+ANALYZER_VERSION = "2.19.8"
 
 
 # 空数据排查清单。
@@ -1677,7 +1677,13 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
                     "已启用全量 Nelson 判异规则（8 条）。全规则仅建议在过程已稳定受控"
                     "且 Cpk≥1.33 时使用——否则序列自相关/常规漂移会触发大量假报警。"
                     "误报率高时请用 --rules basic 收回基本集。")
-            p1 = SPC.phase1_limits(vals, mode=spc_exclusion_mode)
+            # 基线剔除固定用保守集 EXCLUDE_RULES，**不跟随 --rules**：
+            # 剔除会改动基线本身，多剔一个正常点就 σ 小一分、Cpk 虚高一分，
+            # 比漏剔更危险。--rules 只控制判异告警（下方 nelson_violations）。
+            # 显式传参而不是靠默认值：旧代码这里压根不传，若哪天 phase1_limits
+            # 的默认值又被人改回 DEFAULT_RULES，剔除就会悄悄变严而无人发现。
+            p1 = SPC.phase1_limits(vals, mode=spc_exclusion_mode,
+                                   rules=SPC.EXCLUDE_RULES)
             if p1 and p1.get("stable"):
                 xc, rc = SPC.x_mr_with_limits(vals, p1["center"], p1["sigma"])
             else:
@@ -3425,6 +3431,38 @@ def build_report(res, work, spc_res, corr, assoc, pare, root, gaps, conf,
                       caption="%s 触发的 Nelson 判异规则" % title)
         else:
             rep.text(s4, "%s：未触发判异规则，过程处于统计受控状态。" % title)
+        # 剔除点逐条身份（外部评审 P0-3，2026-10-29）。
+        # 数据链其实早就通了：phase1 逐点记 rules/reason → exclusion_detail
+        # → pipeline 收进 exclusion_review，但**报告层从不渲染**。
+        # 于是使用者只看到"剔除了 5 个点"，不知道是哪 5 个、被哪条规则剔的，
+        # 也就没法核对是不是把正常点误剔了——而误剔会让 σ 变小、Cpk 虚高。
+        # 这是"可解释"落地的最后一公里，缺它前面所有字段都白造。
+        #
+        # 不采用"把候选点塞进 suspect_points"的改法：suspect 的语义是"待审核
+        # 未处置"，auto 模式这些点已经剔了，混进去会让下游分不清"已剔除"和
+        # "还在数据里"。exclusion_detail / suspect_points 本来就是为这两种状态
+        # 分别设计的载体，报告层按模式取对应那个即可。
+        _xr = d.get("exclusion_review") or {}
+        _ed = [r for r in (_xr.get("excluded_detail") or []) if isinstance(r, dict)]
+        _sp = [r for r in (_xr.get("suspect_points") or []) if isinstance(r, dict)]
+        _srows, _sis_excluded = (_ed, True) if _ed else (_sp, False)
+        if _srows:
+            _show = _srows[:20]
+            rep.table(
+                s4, ["点位", "命中规则", "判定依据", "取值", "z"],
+                [[("第 %s 点" % (r.get("index") + 1) if isinstance(r.get("index"), int) else "—"),
+                  "、".join("规则%d" % x for x in (r.get("rules") or [])
+                           if isinstance(x, int) and 1 <= x <= 8) or "稳健离群(>3σ)",
+                  (r.get("reason") or "")[:60],
+                  _fmt(r.get("value")),
+                  ("%+.2f" % r["z"]) if isinstance(r.get("z"), (int, float)) else "—"]
+                 for r in _show],
+                caption=("%s：基线剔除明细（控制限已排除这些点，以下逐条给出命中规则）"
+                         % title) if _sis_excluded else
+                        ("%s：疑似非受控点（仅标记、未剔除，请逐点复核后决定）" % title))
+            if len(_srows) > len(_show):
+                rep.text(s4, "另有 %d 个点未列出（共 %d 个）。"
+                         % (len(_srows) - len(_show), len(_srows)))
         # 自相关 → EWMA/CUSUM：这段紧跟在该参数的 X-MR 之后，
         # 因为它的作用是修正读者刚看到的那些判异结论
         _acd = d.get("autocorrelation")

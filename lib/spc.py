@@ -193,7 +193,7 @@ def _baseline_stats(vals):
     return center, sigma
 
 
-def phase1_limits(values, max_iter=4, rules=(1, 2, 3), max_drop_ratio=0.25,
+def phase1_limits(values, max_iter=4, rules=None, max_drop_ratio=0.25,
                  mode="auto", review=None):
     """Phase I：从数据中迭代剔除非受控点，用剩下的稳定期建立控制限。
 
@@ -214,7 +214,20 @@ def phase1_limits(values, max_iter=4, rules=(1, 2, 3), max_drop_ratio=0.25,
 
     逐点身份（P1-2 关键）：每条被标记的点都记录命中的 Nelson 规则号与可读理由，
     不再只保留全局 rules_used，解决"谁触发了哪个点的剔除"不可追溯的问题。
+
+    规则集 rules（外部评审 P0-2，2026-10-29）：
+      默认取 EXCLUDE_RULES（(1,2,3) 保守剔除集），**与判异用的 DEFAULT_RULES 分开**。
+      旧实现有三处默认值各自为政（本函数 (1,2,3)、DEFAULT_RULES (1,2,3,5)、
+      pipeline 调用时压根不传），于是"基线剔除"和"判异"各说各话。
+      但真正的病根不在默认值，而在规则 2 的实现：它只标记 run 长度达标之后的尾部，
+      run 头 8 个点不算命中，所以 15 点连续偏移只报后 7 个点（迭代后剩 5 个、
+      占 4.2%），刚好卡在 5% 阈值下面判成 stable=True。**阈值不是根因。**
+      规则 2 修好后同一份数据整段 15 点全剔（12.5%），stable 正确翻为 False，
+      中心回到 10.0 附近，控制限不再被偏移段撑宽；正常受控数据仍 stable=True。
+      注意剔除**不跟随调用方的 rules 全量集**：多剔正常点会让 σ 变小、Cpk 虚高，
+      比漏剔更危险（理由见 EXCLUDE_RULES 常量处的注释）。
     """
+    rules = parse_rules(EXCLUDE_RULES if rules is None else rules)
     vals = [v for v in values if v is not None]
     n_total = len(vals)
     if n_total < 8:
@@ -473,6 +486,21 @@ NELSON_RULES = [
 # 所以默认只开 Western Electric 基本集（超界 / 偏移 / 趋势 / 2-of-3 超 2σ）。
 ALL_RULES = (1, 2, 3, 4, 5, 6, 7, 8)
 DEFAULT_RULES = (1, 2, 3, 5)
+
+# 基线剔除专用保守集（外部评审 P0-2，2026-10-29）。
+#
+# 为什么不直接用 DEFAULT_RULES：剔除会**改动基线本身**——多剔一个正常点，
+# σ 就小一分、Cpk 就虚高一分，而 Cpk 虚高是比漏报更危险的错误结论。
+# 规则 5（3 点中 2 点超 2σ）在纯随机数据上误报率约 0.6%/点，实测在
+# "40 点稳定段 + 5 个尖峰"上会多剔 2 个正常点；规则 1/2/3（超界 / 9 点同侧 /
+# 6 点趋势）都是成段性判据，随机数据几乎不触发，才是"这一段确实不对"的可靠信号。
+#
+# 所以两个集合分工明确：
+#   - 判异告警（报告里列规则命中）→ 用调用方指定的 rules（可到全 8 条），多报不怕；
+#   - 基线剔除（动控制限）        → 固定用本保守集，宁可少剔也不误剔。
+# 这个分工必须写在文档里：使用人一直以为 --rules 同时管剔除，实际旧代码根本没传下去，
+# 现改为显式传 EXCLUDE_RULES，把"剔除规则集"这件事钉死、不再随配置漂移。
+EXCLUDE_RULES = (1, 2, 3)
 RULE_PRESETS = {
     "basic": (1, 2, 3, 5),      # Western Electric 基本集（默认）
     "weco": (1, 2, 3, 5),
@@ -877,17 +905,41 @@ def nelson_violations(chart_values, center, sigma, rules=None):
     # 规则1
     add(1, [i for i, z in enumerate(zs) if z is not None and abs(z) > 3])
     # 规则2: 连续9点同侧 —— 命中即整段连续返回（不得隔点）
-    run_side, run_start = None, 0
-    hits = []
+    #
+    # 旧实现按 `i - run_start + 1 >= 9` 逐点判断，只有 run 长度达标之后的点才算命中，
+    # **run 的头 8 个点永远不算命中**。于是一段 15 点的连续偏移只报后 7 个点，
+    # 剔除比例 5.8% 刚好卡在 5% 阈值边缘，换个数据就掉到 4.2% 判成 stable=True，
+    # 报告写着"已建立稳定基线"而偏移段还在基线里把中心拉偏、把控制限撑宽
+    # （外部评审 P0-2，2026-10-29；用户反馈"15 点偏移只剔 5 个"）。
+    # 正确语义：run 一旦达到 9 点，整段 run 全部命中——规则讲的是"这一段都不对"，
+    # 不是"从第 9 个点开始不对"。
+    runs = []
+    cur_side, cur_idx = None, []
     for i, z in enumerate(zs):
         if z is None:
             continue
         s = 1 if z > 0 else (-1 if z < 0 else 0)
-        if s == run_side:
-            if i - run_start + 1 >= 9:
-                hits.append(i)
+        if s == 0:
+            # 恰好落在中心线上的点不属于任何一侧，run 在此断开。
+            # 不这么处理的话，一批 zp=0 的点会被算成同一侧（s=0 相同），
+            # 于是「20 点中心 + 35 点偏移 + 20 点中心」这种最干净的阶跃，
+            # 会把 75 个点全判成"连续同侧"——比漏报更难解释的误报。
+            if cur_side is not None:
+                runs.append(cur_idx)
+            cur_side, cur_idx = None, []
+            continue
+        if s == cur_side:
+            cur_idx.append(i)
         else:
-            run_side, run_start = s, i
+            if cur_side is not None:
+                runs.append(cur_idx)
+            cur_side, cur_idx = s, [i]
+    if cur_side is not None:
+        runs.append(cur_idx)
+    hits = []
+    for idxs in runs:
+        if len(idxs) >= 9:
+            hits.extend(idxs)
     add(2, hits)
     # 规则3: 连续6点单调 —— 趋势一旦成型，该方向每点都命中，天然连续
     hits = []

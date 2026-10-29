@@ -208,12 +208,31 @@ def test_spc():
     # —— 评审修复回归（P0-1 / P0-2 / P0-3 / P1-1 / P1-3 / P1-4）——
     import random as _rn                              # 局部别名，避免函数内 import random 遮蔽模块级
     # P0-1：Nelson 规则2 连续同侧必须整段返回，不得隔点
+    #
+    # 断言口径纠偏（2026-10-29 外部评审 P0-2）：旧断言要求 `len==27 and
+    # _r2idx==range(8,35)`，即"35 点全同侧却只报 index 8..34"。这恰恰把
+    # 「run 头 8 个点不算命中」这个 bug 当成了规范钉死——判据把错误旧形态
+    # 固化后，任何正确修复都会被它判红。规则2 讲的是"这一整段都不对"，
+    # 所以 35 点全同侧就该 35 点全命中。改为按不变量断言：
+    # 命中集合 == 整段连续区间，且起点必须落在 run 的第一个点。
     _r2v = [10.1 + 0.001 * i for i in range(35)]
     _r2 = SPC.nelson_violations(_r2v, 10.0, 1.0, rules="all")
     _r2h = next((x for x in _r2 if x["rule"] == 2), None)
     _r2idx = sorted(_r2h["indexes"]) if _r2h else []
-    check("P0-1 规则2 连续无隔点(27点连续)", len(_r2idx) == 27 and _r2idx == list(range(8, 35)),
-          "idx=%s" % _r2idx)
+    check("P0-1 规则2 连续无隔点(35点全同侧→35点全命中)",
+          _r2idx == list(range(0, 35)), "命中共 %d 点，起止=%s" %
+          (len(_r2idx), (_r2idx[0], _r2idx[-1]) if _r2idx else None))
+    # P0-2 追加：run 头不得漏（本轮真修的那个 bug 的守护断言）
+    # 15 点偏移必须是 15 点全中；8 点不足阈值则一个都不该中。
+    _r2b = SPC.nelson_violations([10.0] * 20 + [11.5] * 15 + [10.0] * 20,
+                                 10.0, 1.0, rules=(2,))
+    _r2bidx = sorted(next(x for x in _r2b if x["rule"] == 2)["indexes"])
+    check("P0-2 规则2 不漏 run 头部（15点偏移→20..34 全中）",
+          _r2bidx == list(range(20, 35)), "idx=%s..%s n=%d" %
+          (_r2bidx[0] if _r2bidx else None, _r2bidx[-1] if _r2bidx else None, len(_r2bidx)))
+    _r2c = SPC.nelson_violations([10.0] * 20 + [11.5] * 8 + [10.0] * 20,
+                                 10.0, 1.0, rules=(2,))
+    check("P0-2 规则2 不足9点不误报", not [x for x in _r2c if x["rule"] == 2], "")
     # P0-2：Phase I 剔除比例>5% 必须判为不稳定（不再谎报稳定）
     _g2 = _rn.Random(7)
     _base = [10.0 + _g2.gauss(0, 0.3) for _ in range(88)]
