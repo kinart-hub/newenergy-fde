@@ -808,6 +808,12 @@ def rank_root_causes(defect_name, table, target_col=None, top=5,
             # 即便没有榜单，也如实交代"如果排序会用哪套权重"，便于复核配置是否生效
             "weights_used": {k: round(v, 4) for k, v in _w.items()},
             "weights_source": _wsrc,
+            # 2.19.10 闭合剩余风险 #5：权重数值本身未经现场真值验证，必须显式标注，
+            # 不得让人误以为"排序高 = 权重已被证明正确"。
+            "weights_validation_status": (
+                "工程默认值，尚未在客户真实案例上统计验证，须以现场真值复核"
+                if "内置默认" in (_wsrc or "") else
+                "用户配置文件提供，仍须以现场真值复核后方可视为已校准"),
         }
     return {
         "defect": defect_name,

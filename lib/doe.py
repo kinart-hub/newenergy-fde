@@ -166,8 +166,8 @@ def recommend_design(n_factors, levels=2, budget=None):
     return opts
 
 
-def build_design(kind, n_factors, levels=2, param=None):
-    """返回 coded/水平矩阵 list[list]"""
+def _make_matrix(kind, n_factors, levels=2, param=None):
+    """纯矩阵构造（不含任何工程约束校验），返回 coded/水平矩阵 list[list]"""
     if kind == "full_factorial":
         return full_factorial([levels] * n_factors)
     if kind == "taguchi_2level":
@@ -179,6 +179,35 @@ def build_design(kind, n_factors, levels=2, param=None):
     if kind == "ccd":
         return ccd(n_factors)
     return None
+
+
+def build_design(kind, n_factors, levels=2, param=None, factor_specs=None,
+                 constraints=None):
+    """返回 coded/水平矩阵（list[list]），或生成侧已校验的包裹结构。
+
+    2.19.10 闭合剩余风险 #3：生成侧此前不收 constraints，越界风险只落在解码侧
+    （decode_design 已拦）。但当调用方同时传入 factor_specs 与 constraints 时，
+    本函数在生成后立刻逐点解码并过 check_point，把越界运行挂到返回结构里——
+    绕过 pipeline 直调 lib 也能在「生成阶段」就发现越界方案，不再只靠解码侧兜底。
+
+    返回：
+      - 不传 factor_specs / constraints：仍只返回水平矩阵（**向后兼容**原契约）；
+      - 传了：返回 {"matrix": 水平矩阵, "unsafe_runs": [运行号...],
+                     "any_violation": bool, "violations": {运行号: [原因...]}}。
+    """
+    matrix = _make_matrix(kind, n_factors, levels, param)
+    if matrix is None:
+        return None
+    if not factor_specs or not constraints:
+        return matrix
+    decoded = decode_design(matrix, factor_specs, constraints)
+    unsafe, viol = [], {}
+    for i, rec in enumerate(decoded):
+        if rec.get("_safety_ok") is False:
+            unsafe.append(i)
+            viol[i] = rec.get("_safety_violations") or []
+    return {"matrix": matrix, "unsafe_runs": unsafe,
+            "any_violation": bool(unsafe), "violations": viol}
 
 
 def decode_design(matrix, factor_specs, constraints=None):
@@ -771,6 +800,27 @@ def build_constraints(factor_specs, spec_overrides=None, kb_control=None):
                        sf["value"], sf.get("unit") or "",
                        sf["looser_than_default"]["builtin"],
                        sf["looser_than_default"].get("unit") or ""))
+        # 规格合法性自检（2.19.10 闭合剩余风险 #2）：安全包络只拦「已声明的界」，
+        # 若规格本身矛盾或缺失，门禁必须出声——否则会静默放大误差或静默放行。
+        if c["min"] is not None and c["max"] is not None:
+            if c["min"] > c["max"]:
+                c.setdefault("warnings", []).append(
+                    "规格下限 %.4g 高于上限 %.4g：安全门禁会把所有点判越界，"
+                    "请核对规格后再生成方案" % (c["min"], c["max"]))
+            elif c["max"] - c["min"] <= 0:
+                c.setdefault("warnings", []).append(
+                    "规格区间宽度为零或负，不存在可行窗口，请核对规格")
+        elif c["min"] is None and c["max"] is None:
+            # 既无工艺规格也无安全包络：没有任何边界来源，越界风险无法被门禁拦截。
+            c.setdefault("warnings", []).append(
+                "参数「%s」没有任何边界来源（工艺规格/安全包络均无）："
+                "安全门禁无从拦截越界方案，须先登记该参数的受控边界" % name)
+        if c["safety"] and (c["min"] is None or c["max"] is None):
+            # 有内置安全包络但没写工艺规格：门禁实际按内置行业参考值兜底执行，
+            # 但「用哪套数」必须以本机/本产品档案为准，必须明示依赖关系。
+            c.setdefault("warnings", []).append(
+                "参数「%s」未提供工艺规格，安全包络仅按内置行业参考值兜底，"
+                "请以本机/本产品档案为准" % name)
         out[name] = c
     return out
 

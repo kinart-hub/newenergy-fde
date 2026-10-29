@@ -333,6 +333,89 @@ def test_f10_long_gradual_shift():
                  % (rate, stable_wrong, fp_pct, ar_pct, ar_unstable, drift_unstable))
 
 
+def test_f11_build_design_constraints():
+    """F11 生成侧安全门禁（2.19.10 闭合剩余风险 #3）。
+
+    build_design 传入 factor_specs + constraints 后，生成阶段就应按安全限
+    标记越界运行（高角点 5.0V 超 4.5V 安全限）；不传约束时仍返回矩阵，
+    保持向后兼容（selftest 里大量旧调用不受影响）。
+    """
+    fs = [{"name": "化成电压", "low": 3.0, "high": 5.0}]
+    cons = doe.build_constraints(fs, spec_overrides={"化成电压": {"safety": {
+        "limit": "max", "value": 4.5, "unit": "V"}}})
+    bd = doe.build_design("full_factorial", 1, 2, None,
+                          factor_specs=fs, constraints=cons)
+    ok_dict = (isinstance(bd, dict) and bd.get("any_violation") is True
+               and 1 in (bd.get("unsafe_runs") or []))
+    bd2 = doe.build_design("full_factorial", 1, 2, None)   # 旧契约：只返回矩阵
+    ok_compat = isinstance(bd2, list) and len(bd2) == 2
+    ok = ok_dict and ok_compat
+    return check("F11 build_design 生成侧安全门禁 + 向后兼容", ok,
+                 "包裹结构=%s 越界运行=%s | 旧契约返回矩阵=%s"
+                 % (isinstance(bd, dict), bd.get("unsafe_runs") if isinstance(bd, dict) else None, ok_compat))
+
+
+def test_f11b_constraint_sanity():
+    """F11b 规格合法性自检（2.19.10 闭合剩余风险 #2）。
+
+    安全包络只拦「已声明的界」——若规格矛盾（下限>上限）或无任何边界来源，
+    门禁必须出声，不能静默放大误差或静默放行。
+    """
+    cons_bad = doe.build_constraints([{"name": "温度", "low": 100.0, "high": 50.0}])
+    w_bad = cons_bad["温度"].get("warnings") or []
+    ok_bad = any("下限" in w and "上限" in w for w in w_bad)
+    cons_none = doe.build_constraints([{"name": "涂布速度"}])   # 无规格无安全包络
+    w_none = cons_none["涂布速度"].get("warnings") or []
+    ok_none = any("没有任何边界来源" in w for w in w_none)
+    cons_ok = doe.build_constraints([{"name": "温度", "low": 50.0, "high": 100.0}])
+    ok_ok = not (cons_ok["温度"].get("warnings"))
+    ok = ok_bad and ok_none and ok_ok
+    return check("F11b 规格合法性自检（矛盾/无来源出声、正常无告警）", ok,
+                 "矛盾告警=%s 无来源告警=%s 正常无告警=%s" % (ok_bad, ok_none, ok_ok))
+
+
+def test_f12_short_shift_unstable():
+    """F12 小幅短偏移必须判不稳、不得谎称稳定（2.19.10 闭合剩余风险 #4）。
+
+    旧实现：6~18 点的短段完全不查（段级识别 min_run 之下、又短于长同侧段阈值 0.12n），
+    导致「小幅短偏移」被谎称 stable=True。新实现：短段（<0.12n）中位数偏离
+    ≥SHORT_RUN_Z(2.2σ) 即判不稳——但**不剔除**（统计分辨力下限，避免误剔正常点），
+    控制限偏宽、如实提醒。
+
+    两条护城河（用正确方式造数据：先绑定单个 Random 再循环）：
+      ① 清晰可识别的短偏移（10 点 3σ）必须稳定判不稳（≥75% 命中，留足种子方差余量）；
+      ② 正常随机数据 20/20 必须仍 stable=True（短段门槛不得误伤正常波动）。
+    ≤1.5σ 的短偏移处于统计分辨力下限，允许判稳——那是诚实下限，不算漏报。
+    """
+    def _series(seed, n=160, length=10, mag=3.0, start=70, shift=True):
+        r = random.Random(seed)
+        x = [r.gauss(0, 1) for _ in range(n)]
+        if shift:
+            for i in range(start, start + length):
+                x[i] += mag
+        return x
+
+    # ① 清晰可识别的短偏移（10 点 3σ）：多数必须判不稳
+    hit = 0
+    for k in range(20):
+        p = SPC.phase1_limits(_series(5000 + k, length=10, mag=3.0)) or {}
+        if p.get("stable") is False:
+            hit += 1
+    ok_short = hit >= 15
+
+    # ② 正常数据 20 次必须全 stable=True（不得误伤）
+    fp_unstable = 0
+    for k in range(20):
+        pr = SPC.phase1_limits(_series(7000 + k, shift=False)) or {}
+        if pr.get("stable") is not True:
+            fp_unstable += 1
+    ok_normal = fp_unstable == 0
+
+    ok = ok_short and ok_normal
+    return check("F12 小幅短偏移判不稳（正常数据不误伤）", ok,
+                 "10点3σ判不稳=%d/20(≥15) | 正常误判不稳=%d/20" % (hit, fp_unstable))
+
+
 def main():
     print("=== 复核修复验证 ===")
     results = [
@@ -347,6 +430,9 @@ def main():
         test_f8_weight_source_honest(),
         test_f9_sensitivity_has_resolution(),
         test_f10_long_gradual_shift(),
+        test_f11_build_design_constraints(),
+        test_f11b_constraint_sanity(),
+        test_f12_short_shift_unstable(),
     ]
     n_fail = sum(1 for r in results if not r)
     print("=== 汇总：%d 项，%d 失败 ===" % (len(results), n_fail))

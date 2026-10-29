@@ -583,6 +583,7 @@ def phase1_limits(values, max_iter=4, rules=None, max_drop_ratio=0.5,
             # 判稳比剔除保守一档的代价只是"多一句提醒"，而误判稳定的代价是
             # 报告写着"已建立稳定基线"、现场却全是事——两者不对等，所以宁严不松。
             _lr_n, _lr_z = 0, 0.0
+            _sr_n, _sr_z = 0, 0.0
             try:
                 if rs and rs > 0:
                     for _sd, _ix in _split_same_side_runs(vals, med, rs):
@@ -590,12 +591,22 @@ def phase1_limits(values, max_iter=4, rules=None, max_drop_ratio=0.5,
                             continue
                         _m = S.median([vals[i] for i in _ix])
                         _z = (_m - med) / rs * _sd
+                        # 长段（≥0.12n）：偏离 ≥1.5σ 即判不稳（趋势/整体抬升）
                         if _z > 1.5 and len(_ix) > _lr_n:
                             _lr_n, _lr_z = len(_ix), _z
+                        # 短段（<0.12n 但 ≥SEG_MIN_RUN）：处于统计分辨力下限附近，
+                        # 只有偏离显著才敢判——否则会把正常波动当偏移。
+                        # 2.19.10 补：旧实现对 6~18 点短段完全不查，
+                        # 导致"小幅短偏移"被谎称稳定（剩余风险 #4）。
+                        if len(_ix) < 0.12 * n_total and _z > SHORT_RUN_Z and _z > _sr_z:
+                            _sr_n, _sr_z = len(_ix), _z
             except Exception as exc:
                 _note("spc.phase1@long_run", exc)
             if _lr_n >= max(SEG_MIN_RUN, 0.12 * n_total):
                 _why.append("存在 %d 点连续同侧（段中位数偏离 %.1fσ）" % (_lr_n, _lr_z))
+            if _sr_n >= SEG_MIN_RUN:
+                _why.append("存在 %d 点连续同侧短段（段中位数偏离 %.1fσ，可能为小幅短偏移）"
+                            % (_sr_n, _sr_z))
             if _r1_ratio > STABLE_RULE1_RATIO:
                 _why.append("超 3σ 点占 %.1f%%" % (_r1_ratio * 100))
             if _r3_ratio > STABLE_TREND_RATIO:
@@ -784,6 +795,10 @@ SEG_MIN_OUTSIDE = 10     # 段外至少 10 点，否则段外估计不可靠
 # 稳定判定阈值
 STABLE_RULE1_RATIO = 0.05    # 超 3σ 点占比超过 5% → 不稳
 STABLE_TREND_RATIO = 0.20    # 趋势规则命中占比超过 20% → 不稳（正常 0%、AR 3%、真漂移 97%）
+# 短段不稳判定（2.19.10 闭合剩余风险 #4）：6~18 点的"小幅短偏移"落在段级识别的
+# min_run 之下、又短于长同侧段阈值（0.12n），旧实现对它完全不查，导致被谎称稳定。
+# 短段方差大，门槛必须比长段（1.5σ）高，否则正常波动会被当偏移。
+SHORT_RUN_Z = 2.2           # 短段（<0.12n）中位数偏离 ≥2.2σ 才敢判不稳
 RULE_PRESETS = {
     "basic": (1, 2, 3, 5),      # Western Electric 基本集（默认）
     "weco": (1, 2, 3, 5),

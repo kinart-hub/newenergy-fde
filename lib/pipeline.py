@@ -175,7 +175,7 @@ if EV is not None and EV.__name__ != "lib.events":
 KB = PP.load_knowledge()
 _fmt = RPT._fmt
 
-ANALYZER_VERSION = "2.19.9"
+ANALYZER_VERSION = "2.19.10"
 
 
 # 空数据排查清单。
@@ -2401,7 +2401,18 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
             elif len(factors) >= 2:
                 opts = DOE.recommend_design(len(factors), levels=2, budget=32)
                 chosen = opts[0]
-                matrix = DOE.build_design(chosen["kind"], len(factors), 2, chosen.get("param"))
+                _bd = DOE.build_design(chosen["kind"], len(factors), 2, chosen.get("param"),
+                                       factor_specs=factors, constraints=_cons)
+                # 2.19.10：build_design 在生成侧也过一遍约束；返回 dict 时提取水平矩阵
+                if isinstance(_bd, dict):
+                    if _bd.get("any_violation"):
+                        result.setdefault("warnings", []).append(
+                            "DOE 生成侧即发现 %d 个运行号越界（%s），已交解码侧复核"
+                            % (len(_bd.get("unsafe_runs") or []),
+                               "、".join(map(str, (_bd.get("unsafe_runs") or [])[:5]))))
+                    matrix = _bd.get("matrix")
+                else:
+                    matrix = _bd
                 plan = DOE.decode_design(matrix, factors, _cons) if matrix else []
                 # P1-7：矩阵只是"做哪些组合"，不是可执行方案。随机化顺序、重复、
                 # 区组、别名结构、样本量功效这五件事不写出来，现场只能靠习惯补。
