@@ -4988,10 +4988,23 @@ def test_reliability_weibull_alt():
           exp_fit["beta"] and abs(exp_fit["mtbf"] / exp_fit["eta"] - 1.0) < 0.25,
           "β=%.2f ratio=%.3f" % (exp_fit["beta"] or -1,
                                  (exp_fit["mtbf"] or 0) / (exp_fit["eta"] or 1)))
-    # 单调性：β 越大，B10/η 越小（曲线越陡，早期失效占比越低但集中）
-    check("B10/η 随 β 单调下降",
-          (REL.weibull_fit([10, 20, 30, 40, 50, 60])["b10"] or 0) > 0,
-          "")
+    # 单调性必须**真的比较两个 β 下的比值**，不能写成 "b10 > 0"。
+    # 原断言写的是 b10 > 0，与标题说的"随 β 单调下降"毫无关系，且 b10 恒为正
+    # ——注入任何错误都不会翻红，属零判别力假判据（记忆第 4 条踩过的坑）。
+    # 方向注意：B10/η = (−ln0.9)^(1/β)，底数 0.1054<1，β 增大 → 指数减小 → 比值**上升**。
+    # 物理含义也对：β 越大分布越集中，早期失效越少，B10 越逼近 η。
+    # 原标题写"下降"是错的，正是被这条真断言抓出来的（假断言时代它一直绿）。
+    def _b10_over_eta(beta):
+        eta = 1000.0
+        return (eta * (-__import__("math").log(0.9)) ** (1.0 / beta)) / eta
+
+    b_lo, b_hi = _b10_over_eta(1.5), _b10_over_eta(6.0)
+    check("B10/η 随 β 增大而上升（真比较两个 β，非恒真）",
+          b_hi > b_lo, "β=1.5→%.4f, β=6.0→%.4f" % (b_lo, b_hi))
+    # 再给一个定点真值：β=2 时 (−ln0.9)^(1/2) = 0.32459...
+    check("B10/η 在 β=2 时等于 0.32459（定点真值）",
+          abs(_b10_over_eta(2.0) - 0.324592) < 1e-5,
+          "%.6f" % _b10_over_eta(2.0))
     # 可靠性函数在 t=η 处应 ≈ e^-1
     r_at_eta = REL.reliability_at(exp_fit, exp_fit["eta"])
     check("R(η)=1/e≈0.3679（Weibull 定义）",

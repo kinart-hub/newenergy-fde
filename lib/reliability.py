@@ -678,8 +678,19 @@ def _selftest():
     ok.append(("MTBF 用 Γ 修正而非直接取 η",
                abs(fit["mtbf"] - fit["eta"]) > 1e-6,
                "MTBF=%.1f vs η=%.1f" % (fit["mtbf"], fit["eta"])))
-    ok.append(("B10 小于 η", fit["b10"] < fit["eta"],
-               "B10=%.1f" % fit["b10"]))
+    # 注意：这里**不能**写 "B10 < η" 这种断言——(−ln0.9)^(1/β) 对任意 β>0 恒 <1，
+    # 所以 B10<η 数学上永远成立，注入任何错误都翻不了红，是零判别力的假判据
+    # （记忆第 4 条：用例看着绿 ≠ 锁住了东西）。改成对**闭式解真值**的定点比对：
+    #   B10 = η·(−ln0.9)^(1/β)，用拟合出的 β/η 算期望值，要求与实现一致。
+    b10_expected = fit["eta"] * (-math.log(0.9)) ** (1.0 / fit["beta"])
+    ok.append(("B10 与闭式解一致（非恒真断言）",
+               abs(fit["b10"] - b10_expected) / b10_expected < 1e-9,
+               "B10=%.4f 闭式=%.4f" % (fit["b10"], b10_expected)))
+    # MTBF 同理给闭式解锚点：η·Γ(1+1/β)，而不是"不等于 η"这种弱断言
+    mtbf_expected = fit["eta"] * math.gamma(1.0 + 1.0 / fit["beta"])
+    ok.append(("MTBF 与 Γ 闭式解一致",
+               abs(fit["mtbf"] - mtbf_expected) / mtbf_expected < 1e-9,
+               "MTBF=%.4f 闭式=%.4f" % (fit["mtbf"], mtbf_expected)))
     ok.append(("样本充足时判定可用", fit["b10_usable"] and fit["status"] == ST.SUCCESS,
                "status=%s" % fit["status"]))
     ok.append(("β 区间覆盖真值",
@@ -752,8 +763,15 @@ def _selftest():
     ok.append(("串联可靠度相乘", abs(rbd_reliability("series", [0.9, 0.9])["R"] - 0.81) < 1e-12, ""))
     ok.append(("并联可靠度 1-∏(1-R)",
                abs(rbd_reliability("parallel", [0.9, 0.9])["R"] - 0.99) < 1e-12, ""))
-    ok.append(("R 随 t 单调下降",
-               reliability_at(fit, 100)["R"] > reliability_at(fit, 5000)["R"], ""))
+    # R(t) 必须与闭式解 exp(-(t/η)^β) 一致；只说"下降"太弱——
+    # 把 t/η 写成 η/t 这种错也会"单调下降"，但对不上真值。
+    r100 = reliability_at(fit, 100)["R"]
+    r100_expected = math.exp(-((100.0 / fit["eta"]) ** fit["beta"]))
+    ok.append(("R(100) 与闭式解一致",
+               abs(r100 - r100_expected) < 1e-12,
+               "R=%.8f 闭式=%.8f" % (r100, r100_expected)))
+    ok.append(("R 随 t 单调下降（真比较 t=100 与 t=5000）",
+               r100 > reliability_at(fit, 5000)["R"], ""))
 
     # 区间覆盖：B10 区间应包住点估计
     ok.append(("B10 区间覆盖点估计",

@@ -3168,6 +3168,58 @@ def rule_fmea_severity_before_rpn():
     return _r(True, "", {"ok": True})
 
 
+def rule_stat_assert_has_closed_form():
+    """统计量自检断言必须带**闭式解/定点真值**锚点，不得用数学恒真式。
+
+    实测抓到的真缺陷（本轮自己犯的）：
+        ok.append(("B10 小于 η", fit["b10"] < fit["eta"], ...))
+    这条断言**数学上恒真**——B10 = η·(−ln0.9)^(1/β)，而 (−ln0.9)=0.10536 < 1，
+    对任意 β>0 都有 (0.10536)^(1/β) < 1，所以 B10 < η 永远成立。
+    把 B10 的指数从 (1/β) 写坏成 β、把 η 换成常数，它照样绿。
+    更严重的一条：`check("B10/η 随 β 单调下降", b10 > 0, ...)` ——
+    标题说的是单调性，断言验的是"正数"，两者毫无关系。
+    于是"23 项自检全过"这个汇报本身是不成立的。
+
+    判据（只认形态，不认措辞）：
+      1. 自检文件里不得出现已被证明恒真的写法（B10<η 这类）；
+      2. 涉及 b10 / mtbf / 可靠度 R 的断言，必须伴随闭式解计算
+         （math.gamma / (-math.log(0.9)) / math.exp 出现在断言附近），
+         否则说明它没有真值锚点，注入变异翻不了红。
+    """
+    t = _read(RELIABILITY_FILE) or ""
+    if not t:
+        return _r(False, "读不到 " + RELIABILITY_FILE)
+    # 不用 _block：它有 maxlen 截断，本函数体远超默认上限，会被截在
+    # b10 锚点那一行之后 → 后面三个锚点全部"看不见" → 规则恒失败。
+    # 改用起点定位 + 全文（记忆里已记过这个坑：_block maxlen 截断）。
+    pos = t.find("def _selftest(")
+    if pos < 0:
+        return _r(False, "找不到 _selftest 函数")
+    body = t[pos:]
+    # 1) 已知恒真写法不得复活（字面判定，不用复杂正则——正则会漏）
+    if "B10 小于 η" in body:
+        return _r(False, "又出现了『B10 小于 η』这条恒真断言——"
+                        "B10=η·(−ln0.9)^(1/β) 对任意 β>0 恒小于 η，"
+                        "注入任何错误都不会翻红")
+    if "> 0" in body and "随 β" in body:
+        seg = body[body.find("随 β"):body.find("随 β") + 200]
+        if re.search(r">\s*0\s*[,)]", seg):
+            return _r(False, "单调性断言退化成了『>0』——恒真，锁不住单调性")
+    # 2) b10 / mtbf / R 三个量必须各自有闭式解锚点，不能"整个文件里有一个就算过"
+    #    （原写法只看全文件有没有 math.gamma，把 b10 的闭式换成常数照样过——实测漏抓）
+    if "(-math.log(0.9)) ** (1.0 / fit[\"beta\"])" not in body:
+        return _r(False, "B10 没有闭式解锚点（应出现 "
+                        "(-math.log(0.9)) ** (1.0 / fit[\"beta\"])）；"
+                        "没有真值锚点的断言锁不住实现")
+    if "math.gamma(1.0 + 1.0 / fit[\"beta\"])" not in body:
+        return _r(False, "MTBF 没有 Γ 闭式解锚点（应出现 "
+                        "math.gamma(1.0 + 1.0 / fit[\"beta\"])）")
+    if "math.exp(-((100.0 / fit[\"eta\"]) ** fit[\"beta\"]))" not in body:
+        return _r(False, "可靠度 R 没有闭式解锚点（应出现 "
+                        "math.exp(-((100.0 / fit[\"eta\"]) ** fit[\"beta\"]))）")
+    return _r(True, "", {"ok": True})
+
+
 AUDIT_RULES = [
     Rule("LICENSE 与代码事实对齐：Elastic 2.0 正文齐全且无许可密钥条款", rule_license,
          "（1）首行必须是裸文本 'Elastic License 2.0'（带 # 判不过）；"
@@ -4386,6 +4438,22 @@ AUDIT_RULES = [
           _mutant("缺分返回 0 分（修复退化：没填=风险最低）",
                   _sub('"usable": False, "rpn": None', '"usable": False, "rpn": 0'),
                   FMEA_FILE)]),
+    Rule("统计量自检断言必须带闭式解锚点，不得用数学恒真式",
+         rule_stat_assert_has_closed_form,
+         "自检里不得出现『B10 小于 η』这类对任意 β>0 恒真的断言（注入任何错误都不翻红）；"
+         "涉及 b10/mtbf/R 的断言必须伴随 math.gamma / math.log(0.9) / math.exp 等闭式解计算；"
+         "单调性断言必须真比较两个点，不得退化成 >0。"
+         "本轮实测：我写了恒真断言并据此汇报『23 项全过』，而把 B10 指数写反它照样绿。",
+         RELIABILITY_FILE,
+         [_mutant("把 b10 闭式解锚点换成常数（修复退化：改坏实现也不翻红）",
+                  _sub('(-math.log(0.9)) ** (1.0 / fit["beta"])',
+                       '0.5'),
+                  RELIABILITY_FILE),
+          _mutant("复活『B10 小于 η』恒真断言",
+                  _re_sub(r'ok\.append\(\("B10 与闭式解一致（非恒真断言）",',
+                          'ok.append(("B10 小于 η", fit["b10"] < fit["eta"], ""))\n'
+                          '    ok.append(("B10 与闭式解一致（非恒真断言）",'),
+                  RELIABILITY_FILE)]),
 ]
 
 
