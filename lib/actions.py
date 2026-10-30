@@ -20,6 +20,7 @@ actions.py —— 横向排查、永久措施候选、预防性参数优化
 from . import crossprocess as XP
 from . import kbstore as KBS
 from . import stats as S
+from . import preprocess as PP
 try:
     from . import direction as DIR       # 包模式
 except Exception:                        # 脚本模式无包上下文
@@ -44,6 +45,58 @@ def lateral_plan(table, target_col=None, defect=None, current_process=None,
     if table is None or not target_col:
         out["notes"].append("缺少目标列，无法做横向排查")
         return out
+
+    # ------------------------------------------------------------------
+    # defect / current_process：过去这两个参数**收了但从不读**，
+    # 于是"焊接不良"与"面密度超差"拿到的是**一模一样**的横向排查清单
+    # ——排查动作不带缺陷语义，现场只能照单全做一遍。
+    # 这里用知识库把两条线索接上：
+    #   · carry_over_from  → 该缺陷已知会从哪些上游工序带进来（向上游追溯）
+    #   · clearing_evidence → 判定"确实清除了"需要哪些证据（否则以为改好了）
+    # 取知识库一律走 PP.load_knowledge()：它是分析侧唯一收口，
+    # 已叠加租户覆盖与行业作用域；裸读 process_specs.json 会绕过这两层。
+    _kb_note = ""
+    try:
+        _kb = PP.load_knowledge() or {}
+        _defs = _kb.get("defect_rootcause") or {}
+        _entry = _defs.get(defect) if defect else None
+        if defect and _entry is None:
+            # 缺陷名可能给的是现场叫法，按 aliases 再找一次
+            for _k, _v in _defs.items():
+                if defect in list(_v.get("aliases") or []) or defect == _k:
+                    _entry, defect = _v, _k
+                    break
+        if _entry:
+            _carry = list(_entry.get("carry_over_from") or [])
+            _clear = list(_entry.get("clearing_evidence") or [])
+            _entry_proc = _entry.get("process")
+            if _carry:
+                out["checklist"].append({
+                    "scope": "物料横向·上游追溯",
+                    "action": "缺陷「%s」已知可从 %s 工序带入：先确认本批上游对应批次，"
+                              "再判断问题是否同源（只查本工序会漏掉真正来源）"
+                              % (defect, "、".join(_carry)),
+                    "basis": "知识库 defect_rootcause[%s].carry_over_from" % defect})
+            if _clear:
+                out["checklist"].append({
+                    "scope": "清除证据",
+                    "action": "判定「%s」已清除必须具备：%s"
+                              "（缺这些证据就只是'看起来好了'）"
+                              % (defect, "、".join(_clear)),
+                    "basis": "知识库 defect_rootcause[%s].clearing_evidence" % defect})
+            if current_process and _entry_proc and _entry_proc != current_process:
+                out["notes"].append(
+                    "知识库里「%s」登记的工序是 %s，与当前工序 %s 不一致："
+                    "横向排查按当前工序做，但机理条目可能借自另一工序，结论需复核"
+                    % (defect, _entry_proc, current_process))
+        elif defect:
+            _kb_note = ("知识库里没有「%s」的机理条目：横向排查只能按通用路径做，"
+                        "建议先补条目或确认缺陷叫法" % defect)
+            out["notes"].append(_kb_note)
+    except Exception as _e:
+        # 知识库不可用不能拖垮横向排查，但必须留痕（静默兜底会让清单悄悄变通用）
+        out["notes"].append("知识库读取失败（%s）：本次横向排查未带缺陷语义"
+                            % str(_e)[:60])
 
     group_cols = []
     for c in table.columns:

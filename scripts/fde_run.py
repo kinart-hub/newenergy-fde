@@ -5500,6 +5500,13 @@ def flow_verify(args):
         run_cmd("7. 上架前隐私审计", [PY, "scripts/prepublish_audit.py", "--strict"],
                 timeout=args.timeout),
         run_cmd("8. 打包完整性", [PY, "scripts/package.py"], timeout=args.timeout),
+        # 9. 全局连贯性（棘轮）：查的是**接口之间**的脱节——能力写了没人调、
+        #    参数收了不用、字段产出了没人读、开关形同虚设。
+        #    这些不会让任何单测翻红，前 8 步全绿也照样存在。
+        #    用棘轮而不是硬零：存量技术债不阻断（否则门禁立刻全红、然后被忽略），
+        #    但**任何新增都必须拦住**——这才是"不许再犯同样的错"的机制。
+        run_cmd("9. 全局连贯性（棘轮）",
+                [PY, "scripts/coherence_audit.py", "--gate"], timeout=args.timeout),
     ]
     return finish("质量闸门全套", steps, args.report, started=started)
 

@@ -801,6 +801,11 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
                 "vendor": DEV.get_profile(ing["device"]).get("vendor") if ing["device"] else "unknown",
                 "confidence": ing["device_info"].get("confidence"),
                 "score": ing["device_info"].get("score"),
+                # 手动指定与自动识别必须区分：前者是"人给的假设"，不是证据。
+                # 若不带到报告，下游会把 --device 指定的档案当成识别结果，
+                # 于是建立在它之上的默认规格/列映射被误当成"系统认出来的"。
+                "manually_specified": bool(
+                    ing["device_info"].get("manually_specified")),
                 "evidence": ing["device_info"].get("evidence") or [],
                 "runner_up": ing["device_info"].get("runner_up"),
                 "export_note": ing.get("profile_note", ""),
@@ -985,6 +990,12 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
     result["device"] = _main_dev.get("device")
     result["device_name"] = _main_dev.get("device_name")
     result["device_matched_by"] = _main_dev.get("matched_by")
+    result["device_manually_specified"] = bool(_main_dev.get("manually_specified"))
+    if result["device_manually_specified"]:
+        result.setdefault("warnings", []).append(
+            "设备档案由 **--device 手动指定**（不是自动识别出来的）："
+            "后续依赖该档案的默认规格与列名映射都建立在“人给的假设”上，"
+            "结论证据强度相应降低。若该档案并不匹配，请清空 --device 重跑。")
     result["shape"] = main.shape()
     result["columns"] = main.columns
 
@@ -4415,6 +4426,17 @@ def main():
                          "字体；要字体嵌入保真请用 docx 再转）")
     ap.add_argument("--no-xlsx", action="store_true",
                     help="不导出 Excel 结果表")
+    # --device：手动指定设备档案 key。
+    # 这条能力原本**三段都在、只差两端没接**：
+    #   analyze(device=...) 支持、DEV.ingest(device=...) 支持、
+    #   identify_device(force=...) 支持并会返回 manually_specified，
+    #   但 argparse 从未定义 --device，main 调 analyze 也没传 —— 于是
+    #   fde_run 的 "--device" 帮助文本写着"手动指定设备档案 key"，
+    #   传进去却被静默忽略（coherence_audit 的 DEAD_FLAG 类别抓到的就是它）。
+    # 这类"中间层支持、两端没接"的断链，单测和门禁都不会报，只有查调用关系才看得见。
+    ap.add_argument("--device", default=None,
+                    help="手动指定设备档案 key（设备未登记识别特征、自动识别认不出来时用；"
+                         "已登记的 key 可用 python scripts/kb_manage.py devices 查看）")
     ap.add_argument("--d2-card", default=None,
                     help="已填写的 8D D2 录入卡路径（首次运行会随报告生成空白卡，"
                          "填好后用本参数回传，引擎会把 5W2H 与数据做交叉校验并渲染完整 D1–D8）")
@@ -4448,6 +4470,7 @@ def main():
                   dedup_key=([c.strip() for c in args.dedup_key.split(",") if c.strip()]
                              if args.dedup_key else None),
                   on_conflict=args.dedup_conflict, cursor=args.cursor,
+                  device=getattr(args, "device", None),
                   lot_pattern=getattr(args, "lot_pattern", None),
                   exclude_status_col=getattr(args, "exclude_status_col", None),
                   exclude_status_values=getattr(args, "exclude_status_values", None),

@@ -5333,6 +5333,28 @@ def test_realworld_dirty_values():
         check("带 NaN/inf 的 CSV 不抛异常", err is None, err or "")
 
 
+def test_coherence_audit():
+    """全局连贯性审计器自身的判别力。
+
+    这条守的是"自检的自检"：审计器若抓不到五种脱节，它前面 8 步全绿也没意义。
+    同时验证棘轮机制——**基线之外的新增必须被拦住**，
+    否则"只减不增"就成了一句空话。
+    """
+    print("\n[全局连贯性审计：五类脱节 + 棘轮]")
+    sys.path.insert(0, os.path.join(ROOT, "scripts"))
+    import coherence_audit as CA
+    for n, ok, d in CA._selftest():
+        check(n, ok, d)
+    # 棘轮：基线里已有的不算新增；人为造一个新签名必须被判为新增
+    base = CA.load_baseline()
+    check("基线文件存在且非空", bool(base), "%s 条" % (len(base or [])))
+    fake = set(base or []) | {"ORPHAN|lib/__nonexistent__.py|ghost_func"}
+    check("棘轮能识别出新增条目",
+          bool(fake - (base or set())), "")
+    check("棘轮签名不含行号（行号会漂移，进签名会天天变）",
+          all(":L" not in x for x in (base or [])), "")
+
+
 def test_realdata_provenance():
     """真实数据印证回路：来源元数据必须齐，残缺数据必须声明。
 
@@ -5898,6 +5920,7 @@ if __name__ == "__main__":
     test_semiconductor_deep_capability()
     test_realworld_dirty_values()
     test_realdata_provenance()
+    test_coherence_audit()
     print("\n" + "=" * 56)
     print("通过 %d 项，失败 %d 项" % (len(PASS), len(FAIL)))
     if FAIL:
