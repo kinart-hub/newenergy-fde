@@ -9,7 +9,13 @@
   "industries": {
     "battery": {
       "name": "锂电池",
-      "alias": ["锂电", "电池", "lithium", "battery", "LIB"],
+      "alias": [
+        "锂电",
+        "电池",
+        "lithium",
+        "battery",
+        "LIB"
+      ],
       "domain": "battery",
       "processes": [
         "battery_coating",
@@ -18,20 +24,56 @@
         "battery_filling",
         "battery_formation"
       ],
-      "docs": ["knowledge/锂电池工序知识库.md"],
+      "docs": [
+        "knowledge/锂电池工序知识库.md"
+      ],
       "note": "涂布/辊压/卷绕/注液/化成。开路电压在此行业指电芯 OCV（典型 3.0-4.2 V 单芯）。"
     },
     "pv": {
       "name": "光伏",
-      "alias": ["太阳能", "组件", "photovoltaic", "pv", "solar"],
+      "alias": [
+        "太阳能",
+        "组件",
+        "photovoltaic",
+        "pv",
+        "solar"
+      ],
       "domain": "pv",
       "processes": [
         "pv_wafer",
         "pv_cell_el",
         "pv_module_iv"
       ],
-      "docs": ["knowledge/光伏工序知识库.md"],
+      "docs": [
+        "knowledge/光伏工序知识库.md"
+      ],
       "note": "硅片检测/电池片 EL/组件 IV。开路电压在此行业指组件 Voc（典型 30-50 V 量级），与锂电 OCV 相差一个数量级，不可混用。"
+    },
+    "materials_testing": {
+      "name": "材料测试",
+      "alias": [
+        "材料测试",
+        "材料表征",
+        "高分子测试",
+        "复合材料测试",
+        "材料检测",
+        "materials testing",
+        "material testing",
+        "polymer testing",
+        "composite testing"
+      ],
+      "domain": "materials_testing",
+      "processes": [
+        "material_thermal",
+        "material_spectroscopy",
+        "material_mechanical",
+        "material_electrical",
+        "material_reliability"
+      ],
+      "docs": [
+        "knowledge/材料测试工序知识库.md"
+      ],
+      "note": "高分子/导热界面/电磁屏蔽/吸波/复合材料等的实验室表征测试（热分析 DSC/TGA/TMA/DMA、成分结构 FTIR/GC-MS/NMR/XRD/SEM、力学、电学与电磁屏蔽、老化环境）。域参数与标准口径取自公开检测机构资料与国标/行标/国军标，现场适用性待复核；FDE 提供统计/DOE/根因/报告方法论，不替代设备操作与标准符合性判定。"
     }
   },
   "shared_assets": {
@@ -40,6 +82,10 @@
       "knowledge/interp_rules.json",
       "knowledge/分析方法与判读指南.md"
     ],
-    "sections": ["unit_conversions", "unit_aliases", "_fallback"]
+    "sections": [
+      "unit_conversions",
+      "unit_aliases",
+      "_fallback"
+    ]
   }
 }

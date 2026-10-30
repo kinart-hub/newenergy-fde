@@ -149,7 +149,7 @@ _BAD_HINT = ("不良", "缺陷", "报废", "返工", "次品", "reject", "defect
 _DEFECT_NAMES_CACHE = {}
 
 
-def _defect_alias_names(dk, dv):
+def _defect_alias_names(dk, dv, include_param_aliases=True):
     """返回某缺陷的全部叫法（已归一化）：键名 + 自身 aliases + param_key 的 aliases。
 
     为什么需要这一层：知识库按**机理**命名（「隔膜褶皱」「黑心」），
@@ -162,21 +162,32 @@ def _defect_alias_names(dk, dv):
       2. 条目的 aliases 字段（现场叫法，最直接）
       3. param_key 指向的 params 条目的 aliases（复用，避免两处维护）
 
-    **但第 3 条有个前提**：param_key 必须是一个「缺陷计量列」。
+    **但第 3 条有两个前提**：
+    (a) param_key 必须是一个「缺陷计量列」。
     「功率衰减」「内阻偏高」「容量一致性差」这类缺陷是由**结果指标本身的漂移**
     定义的，它们的 param_key 指向 pmax / acir / capacity —— 那是**被分析的目标量**，
     不是缺陷计数列。把目标量的别名（Pmax / 功率 / 峰值功率）当成缺陷叫法，
     会让 identify_defects 把功率列本身识别成「功率衰减」缺陷列，
     进而让目标列 == 缺陷列、共线排除判据失效（实测踩过：E06 组件IV 用例直接翻红）。
-    所以这类条目的别名只认键名与显式 aliases，不继承结果指标的别名。
+    所以这类条目（response_defect）只认键名与显式 aliases，不继承结果指标的别名。
+    (b) **跨工序借用时不继承 param_key 别名**。param_key 的别名多是参数缩写
+    （TC / ACIR / CTM ……），它们是给 rank_root_causes 做「列→参数」映射用的，
+    不是缺陷叫法。跨工序把"高分子热导率不达标"借用到光伏数据时，
+    若带 param_key 别名 "TC"，会子串命中 "Pmax_STC(W)" 误判成缺陷列
+    （实测踩过：注入材料测试切片后 E06 用例翻红）。跨工序匹配只认键名+显式 aliases。
     """
-    hit = _DEFECT_NAMES_CACHE.get(dk)
+    # 缓存键必须带上 include_param_aliases：同一缺陷在「本工序(带参别名)」与
+    # 「跨工序借用(不带参别名)」两种调用下别名集合不同，混用会串味——
+    # 先被跨工序调用写入的"无参别名"缓存会被本工序复用，导致本工序漏匹配
+    # （实测踩过：e2e 单文件-涂布 在 B/C 用例之后 rootcause 凭空消失）。
+    _ck = (dk, bool(include_param_aliases))
+    hit = _DEFECT_NAMES_CACHE.get(_ck)
     if hit is not None:
         return hit
     kb = _kb()
     names = [dk] + list(dv.get("aliases") or [])
     pk = dv.get("param_key")
-    if pk and not dv.get("response_defect"):
+    if pk and include_param_aliases and not dv.get("response_defect"):
         pv = (kb.get("params") or {}).get(pk) or {}
         names += list(pv.get("aliases") or [])
     out, seen = [], set()
@@ -187,7 +198,7 @@ def _defect_alias_names(dk, dv):
         if nn and nn not in seen:
             seen.add(nn)
             out.append(nn)
-    _DEFECT_NAMES_CACHE[dk] = out
+    _DEFECT_NAMES_CACHE[_ck] = out
     return out
 
 
@@ -232,8 +243,12 @@ def identify_defects(table, hint=None, process=None):
             if not scope:
                 continue
             best_dk, best_len = None, 0
+            # 跨工序借用时不继承 param_key 别名（参数缩写会误命中其它工序
+            # 的目标量列，见 _defect_alias_names 的 (b) 前提与 E06 翻红事故）。
+            _inc_param = scope is not dr_all
             for dk in sorted(scope):
-                for nn in _defect_alias_names(dk, scope[dk]):
+                for nn in _defect_alias_names(dk, scope[dk],
+                                              include_param_aliases=_inc_param):
                     if _name_hits(nn, nc) and len(nn) > best_len:
                         best_dk, best_len = dk, len(nn)
             if best_dk:

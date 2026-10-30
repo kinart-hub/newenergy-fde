@@ -3297,8 +3297,8 @@ AUDIT_RULES = [
          [_mutant("去掉功率衰减的 response_defect 标记",
                   _json_drop_defect_field("功率衰减", "response_defect")),
           _mutant("别名索引不再检查 response_defect",
-                  _sub('if pk and not dv.get("response_defect"):',
-                       'if pk:'), ROOTCAUSE_FILE)]),
+                  _sub('if pk and include_param_aliases and not dv.get("response_defect"):',
+                       'if pk and include_param_aliases:'), ROOTCAUSE_FILE)]),
 
     Rule("未收录缺陷必须给可行动提示", rule_unregistered_hint_actionable,
          "lib/rootcause.py 的 build_5why 未收录分支必须调用 _unregistered_hint，"
