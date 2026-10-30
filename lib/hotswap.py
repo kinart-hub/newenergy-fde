@@ -45,7 +45,8 @@ MIN_CHECK_INTERVAL = 1.0
 
 # --------------------------------------------------------------- 原子写
 
-def read_text_retry(path, encoding="utf-8", retries=8, base_delay=0.01):
+def read_text_retry(path, encoding="utf-8", retries=20, base_delay=0.01,
+                    max_delay=0.05):
     """读文件，并容忍 Windows 上 `os.replace` 交换瞬间的瞬时读拒绝。
 
     背景（实测结论，见 scripts/prepublish_audit.py 之外的并发压测）：
@@ -57,6 +58,15 @@ def read_text_retry(path, encoding="utf-8", retries=8, base_delay=0.01):
     `kbstore._read_json` 原本用裸 `except Exception` 兜住一切，
     于是 PermissionError 会被当成"这文件坏了"，**静默返回空知识库**——
     报告照出、结论全错、还没有任何报错。这是本项目最不该发生的一类失效。
+
+    重试预算为什么从 8 次提到 20 次（2026-10-30 实测改）：
+    原预算是 0.01+0.02+…+0.08 ≈ 0.36 秒。单跑自检从不失败，但在
+    **门禁全量跑（多子进程 + 磁盘饱和）** 时，1.5 秒的并发压测里偶发把预算耗光，
+    于是 `atomic_write` 侧被判失败、门禁变红——同一份代码单跑三次全过。
+    门禁时红时绿本身就是缺陷：它让人开始怀疑门禁、进而忽略它。
+    等间隔增长改为**带上限的线性增长**（每次最多 0.05s），总预算约 0.9 秒，
+    既覆盖了高负载下的 replace 窗口，也不会在真缺文件时长时间空转
+    （ENOENT 不重试，见下）。
     """
     last = None
     for i in range(retries):
@@ -69,7 +79,7 @@ def read_text_retry(path, encoding="utf-8", retries=8, base_delay=0.01):
             if e.errno != 13:
                 raise
             last = e
-            time.sleep(base_delay * (i + 1))
+            time.sleep(min(max_delay, base_delay * (i + 1)))
     raise last
 
 

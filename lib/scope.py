@@ -163,6 +163,17 @@ def add_note(msg):
         _NOTES.append(msg)
 
 
+def root():
+    """当前 effective SKILL_ROOT。
+
+    为什么要这个取值口：测试里改过 set_root 之后必须能拿到**本模块自己的**
+    原值来还原。曾用 `tenancy.root()` 代它还原，两个模块的全局状态被混用——
+    前一个测试把 tenancy 留在临时目录时，scope 就被还原到一个已被删除的路径，
+    表现为"后面所有行业解析都失败"（隐藏很久，直到有新测试真的去 resolve 才暴露）。
+    """
+    return SKILL_ROOT
+
+
 def clear():
     global _INDUSTRIES, _NOTES
     _INDUSTRIES = None

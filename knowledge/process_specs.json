@@ -634,6 +634,228 @@
    "notes": "紫外/氙灯老化 GB-T 16422/ISO 4892/ASTM G154；湿热 GB-T 2423；盐雾 ASTM B117/GB-T 10125；热空气老化 GB-T 3512。",
    "upstream_keys": [],
    "downstream_keys": []
+  },
+  "semi_litho": {
+   "domain": "semiconductor",
+   "name": "光刻",
+   "alias": [
+    "光刻",
+    "曝光",
+    "涂胶显影",
+    "lithography",
+    "photo",
+    "litho"
+   ],
+   "upstream": [
+    "薄膜沉积",
+    "清洗"
+   ],
+   "downstream": [
+    "刻蚀",
+    "量测"
+   ],
+   "key_params": [
+    "cd_critical_dim",
+    "overlay",
+    "exposure_dose",
+    "focus_offset",
+    "resist_thickness"
+   ],
+   "common_defects": [
+    "CD偏移",
+    "Overlay超差",
+    "光刻胶缺陷",
+    "显影不净"
+   ],
+   "doe_factors": [
+    "exposure_dose",
+    "focus_offset",
+    "resist_thickness"
+   ],
+   "notes": "光刻是图形尺寸的第一道关口：CD 决定器件电性，Overlay 决定层间对准。CD 与 Overlay 的漂移往往先于电性失效出现，是最值得做 SPC 的两个量。",
+   "upstream_keys": [],
+   "downstream_keys": [
+    "semi_etch",
+    "semi_metrology"
+   ]
+  },
+  "semi_etch": {
+   "domain": "semiconductor",
+   "name": "刻蚀",
+   "alias": [
+    "刻蚀",
+    "蚀刻",
+    "干法刻蚀",
+    "湿法刻蚀",
+    "etch",
+    "etching"
+   ],
+   "upstream": [
+    "光刻"
+   ],
+   "downstream": [
+    "薄膜沉积",
+    "量测"
+   ],
+   "key_params": [
+    "etch_rate",
+    "etch_uniformity",
+    "etch_selectivity",
+    "sidewall_angle"
+   ],
+   "common_defects": [
+    "刻蚀残留",
+    "过刻蚀",
+    "侧壁角度异常",
+    "刻蚀不均"
+   ],
+   "doe_factors": [
+    "rf_power",
+    "chamber_pressure",
+    "gas_flow"
+   ],
+   "notes": "刻蚀要同时控住三件事：刻多快（rate）、刻多匀（uniformity）、刻得选不选（selectivity）。三者互相牵制，单参数调到极致通常会让另两个变差，所以必须用 DOE 找窗口而不是逐参数试。",
+   "upstream_keys": [
+    "semi_litho"
+   ],
+   "downstream_keys": [
+    "semi_thinfilm"
+   ]
+  },
+  "semi_thinfilm": {
+   "domain": "semiconductor",
+   "name": "薄膜沉积",
+   "alias": [
+    "薄膜",
+    "薄膜沉积",
+    "化学气相沉积",
+    "物理气相沉积",
+    "原子层沉积",
+    "cvd",
+    "pvd",
+    "ald",
+    "thin film"
+   ],
+   "upstream": [
+    "刻蚀",
+    "清洗"
+   ],
+   "downstream": [
+    "CMP",
+    "量测"
+   ],
+   "key_params": [
+    "film_thickness",
+    "film_uniformity",
+    "film_stress",
+    "refractive_index",
+    "sheet_resistance"
+   ],
+   "common_defects": [
+    "膜厚不均",
+    "膜应力过大",
+    "薄膜颗粒",
+    "折射率异常"
+   ],
+   "doe_factors": [
+    "depo_temp",
+    "chamber_pressure",
+    "gas_flow",
+    "rf_power"
+   ],
+   "notes": "薄膜的三个基本量：厚度、均匀性、应力。应力过大直接导致翘曲与后续光刻对准失败，常被漏查——只看厚度合格就放行是典型盲区。",
+   "upstream_keys": [
+    "semi_etch"
+   ],
+   "downstream_keys": [
+    "semi_cmp"
+   ]
+  },
+  "semi_cmp": {
+   "domain": "semiconductor",
+   "name": "化学机械研磨",
+   "alias": [
+    "化学机械研磨",
+    "化学机械抛光",
+    "研磨",
+    "抛光",
+    "cmp"
+   ],
+   "upstream": [
+    "薄膜沉积"
+   ],
+   "downstream": [
+    "量测",
+    "清洗"
+   ],
+   "key_params": [
+    "removal_rate",
+    "dishing",
+    "erosion",
+    "down_force",
+    "polish_uniformity"
+   ],
+   "common_defects": [
+    "碟形凹陷",
+    "侵蚀",
+    "研磨不均",
+    "研磨划伤"
+   ],
+   "doe_factors": [
+    "down_force",
+    "platen_speed",
+    "slurry_flow"
+   ],
+   "notes": "CMP 的两个专有失效：dishing（同材料区凹陷）与 erosion（密集区整体下陷）。它们不是「厚度超差」，而是**图形依赖的局部形貌偏差**，用常规厚度 SPC 抓不到，必须按图形密度分组看。",
+   "upstream_keys": [
+    "semi_thinfilm"
+   ],
+   "downstream_keys": [
+    "semi_metrology"
+   ]
+  },
+  "semi_metrology": {
+   "domain": "semiconductor",
+   "name": "量测与良率",
+   "alias": [
+    "量测",
+    "良率",
+    "缺陷检测",
+    "metrology",
+    "yield",
+    "inspection"
+   ],
+   "upstream": [
+    "光刻",
+    "刻蚀",
+    "薄膜沉积",
+    "化学机械研磨"
+   ],
+   "downstream": [
+    "封装测试"
+   ],
+   "key_params": [
+    "defect_density",
+    "yield_rate",
+    "cd_uniformity",
+    "particle_count",
+    "wafer_cpk"
+   ],
+   "common_defects": [
+    "良率骤降",
+    "缺陷密度超标",
+    "颗粒污染",
+    "晶圆划伤"
+   ],
+   "doe_factors": [],
+   "notes": "良率是结果量（response），不能当因子。良率骤降的第一件事是按层/按机台/按批号拆分，而不是直接在整片上算相关——整片混算会把「某台设备」的信号稀释成噪声。",
+   "upstream_keys": [
+    "semi_litho",
+    "semi_etch",
+    "semi_thinfilm",
+    "semi_cmp"
+   ],
+   "downstream_keys": []
   }
  },
  "params": {
@@ -4253,6 +4475,568 @@
    },
    "note": "老化/环境试验箱温度波动度（量级兜底，以受控规格/方法确认报告为准）",
    "source": "JJF 1101；GB-T 2423"
+  },
+  "cd_critical_dim": {
+   "name": "关键尺寸 CD",
+   "process": "semi_litho",
+   "unit": "nm",
+   "aliases": [
+    "关键尺寸CD",
+    "临界尺寸CD",
+    "线宽CD",
+    "critical dimension",
+    "CD值"
+   ],
+   "typical_range": [
+    10,
+    500
+   ],
+   "control": {
+    "mode": "none"
+   },
+   "note": "图形线宽的实际尺寸，决定器件电性（量级兜底，控制限以受控规格书为准）",
+   "source": "工序/参数/机理取自 SEMI 标准体系的量测与统计术语、IRDS 公开路线图框架，以及名企 JD 原文点名的工序与失效项（长鑫存储薄膜区 CVD/PVD/RTP/铜工艺与 CMP、北方华创 MPCVD、京东方 PVD、中芯良率 Inline/Fail Bin）；典型值为量级兜底，控制限须由企业按自身数据与受控规格书确定"
+  },
+  "overlay": {
+   "name": "套刻精度 Overlay",
+   "process": "semi_litho",
+   "unit": "nm",
+   "aliases": [
+    "overlay",
+    "套刻",
+    "套刻精度",
+    "对准精度",
+    "对位精度"
+   ],
+   "typical_range": [
+    0,
+    50
+   ],
+   "control": {
+    "mode": "none"
+   },
+   "note": "层与层之间的对准偏差，超标直接短路或开路（量级兜底，控制限以受控规格书为准）",
+   "source": "工序/参数/机理取自 SEMI 标准体系的量测与统计术语、IRDS 公开路线图框架，以及名企 JD 原文点名的工序与失效项（长鑫存储薄膜区 CVD/PVD/RTP/铜工艺与 CMP、北方华创 MPCVD、京东方 PVD、中芯良率 Inline/Fail Bin）；典型值为量级兜底，控制限须由企业按自身数据与受控规格书确定"
+  },
+  "exposure_dose": {
+   "name": "曝光剂量",
+   "process": "semi_litho",
+   "unit": "mJ/cm²",
+   "aliases": [
+    "曝光剂量",
+    "剂量",
+    "dose",
+    "exposure dose"
+   ],
+   "typical_range": [
+    5,
+    200
+   ],
+   "control": {
+    "mode": "none"
+   },
+   "note": "决定光刻胶接受的能量，是 CD 的主要调节手段（量级兜底，控制限以受控规格书为准）",
+   "source": "工序/参数/机理取自 SEMI 标准体系的量测与统计术语、IRDS 公开路线图框架，以及名企 JD 原文点名的工序与失效项（长鑫存储薄膜区 CVD/PVD/RTP/铜工艺与 CMP、北方华创 MPCVD、京东方 PVD、中芯良率 Inline/Fail Bin）；典型值为量级兜底，控制限须由企业按自身数据与受控规格书确定"
+  },
+  "focus_offset": {
+   "name": "聚焦偏移",
+   "process": "semi_litho",
+   "unit": "nm",
+   "aliases": [
+    "聚焦偏移",
+    "焦距",
+    "focus",
+    "focus offset"
+   ],
+   "typical_range": [
+    -200,
+    200
+   ],
+   "control": {
+    "mode": "none"
+   },
+   "note": "离焦会同时恶化 CD 与侧壁形貌（量级兜底，控制限以受控规格书为准）",
+   "source": "工序/参数/机理取自 SEMI 标准体系的量测与统计术语、IRDS 公开路线图框架，以及名企 JD 原文点名的工序与失效项（长鑫存储薄膜区 CVD/PVD/RTP/铜工艺与 CMP、北方华创 MPCVD、京东方 PVD、中芯良率 Inline/Fail Bin）；典型值为量级兜底，控制限须由企业按自身数据与受控规格书确定"
+  },
+  "resist_thickness": {
+   "name": "光刻胶厚度",
+   "process": "semi_litho",
+   "unit": "nm",
+   "aliases": [
+    "光刻胶厚度",
+    "胶厚",
+    "resist thickness"
+   ],
+   "typical_range": [
+    50,
+    5000
+   ],
+   "control": {
+    "mode": "none"
+   },
+   "note": "胶厚影响分辨率与抗刻蚀能力（量级兜底，控制限以受控规格书为准）",
+   "source": "工序/参数/机理取自 SEMI 标准体系的量测与统计术语、IRDS 公开路线图框架，以及名企 JD 原文点名的工序与失效项（长鑫存储薄膜区 CVD/PVD/RTP/铜工艺与 CMP、北方华创 MPCVD、京东方 PVD、中芯良率 Inline/Fail Bin）；典型值为量级兜底，控制限须由企业按自身数据与受控规格书确定"
+  },
+  "etch_rate": {
+   "name": "刻蚀速率",
+   "process": "semi_etch",
+   "unit": "nm/min",
+   "aliases": [
+    "刻蚀速率",
+    "蚀刻速率",
+    "etch rate"
+   ],
+   "typical_range": [
+    1,
+    2000
+   ],
+   "control": {
+    "mode": "none"
+   },
+   "note": "单位时间去除量，决定工艺时间与产能（量级兜底，控制限以受控规格书为准）",
+   "source": "工序/参数/机理取自 SEMI 标准体系的量测与统计术语、IRDS 公开路线图框架，以及名企 JD 原文点名的工序与失效项（长鑫存储薄膜区 CVD/PVD/RTP/铜工艺与 CMP、北方华创 MPCVD、京东方 PVD、中芯良率 Inline/Fail Bin）；典型值为量级兜底，控制限须由企业按自身数据与受控规格书确定"
+  },
+  "etch_uniformity": {
+   "name": "刻蚀均匀性",
+   "process": "semi_etch",
+   "unit": "%",
+   "aliases": [
+    "刻蚀均匀性",
+    "蚀刻均匀性",
+    "etch uniformity"
+   ],
+   "typical_range": [
+    0,
+    20
+   ],
+   "control": {
+    "mode": "none"
+   },
+   "note": "片内/片间去除量的一致性（量级兜底，控制限以受控规格书为准）",
+   "source": "工序/参数/机理取自 SEMI 标准体系的量测与统计术语、IRDS 公开路线图框架，以及名企 JD 原文点名的工序与失效项（长鑫存储薄膜区 CVD/PVD/RTP/铜工艺与 CMP、北方华创 MPCVD、京东方 PVD、中芯良率 Inline/Fail Bin）；典型值为量级兜底，控制限须由企业按自身数据与受控规格书确定"
+  },
+  "etch_selectivity": {
+   "name": "刻蚀选择比",
+   "process": "semi_etch",
+   "unit": "比值",
+   "aliases": [
+    "选择比",
+    "刻蚀选择比",
+    "selectivity"
+   ],
+   "typical_range": [
+    0.5,
+    50
+   ],
+   "control": {
+    "mode": "none"
+   },
+   "note": "目标材料与掩膜/底层的去除速率比（量级兜底，控制限以受控规格书为准）",
+   "source": "工序/参数/机理取自 SEMI 标准体系的量测与统计术语、IRDS 公开路线图框架，以及名企 JD 原文点名的工序与失效项（长鑫存储薄膜区 CVD/PVD/RTP/铜工艺与 CMP、北方华创 MPCVD、京东方 PVD、中芯良率 Inline/Fail Bin）；典型值为量级兜底，控制限须由企业按自身数据与受控规格书确定"
+  },
+  "sidewall_angle": {
+   "name": "侧壁角度",
+   "process": "semi_etch",
+   "unit": "°",
+   "aliases": [
+    "侧壁角度",
+    "侧壁角",
+    "sidewall angle"
+   ],
+   "typical_range": [
+    70,
+    90
+   ],
+   "control": {
+    "mode": "none"
+   },
+   "note": "过陡或过缓都会影响后续填充（量级兜底，控制限以受控规格书为准）",
+   "source": "工序/参数/机理取自 SEMI 标准体系的量测与统计术语、IRDS 公开路线图框架，以及名企 JD 原文点名的工序与失效项（长鑫存储薄膜区 CVD/PVD/RTP/铜工艺与 CMP、北方华创 MPCVD、京东方 PVD、中芯良率 Inline/Fail Bin）；典型值为量级兜底，控制限须由企业按自身数据与受控规格书确定"
+  },
+  "rf_power": {
+   "name": "射频功率",
+   "process": "semi_etch",
+   "unit": "W",
+   "aliases": [
+    "射频功率",
+    "RF功率",
+    "rf power"
+   ],
+   "typical_range": [
+    100,
+    5000
+   ],
+   "control": {
+    "mode": "none"
+   },
+   "note": "等离子体强度主控量（量级兜底，控制限以受控规格书为准）",
+   "source": "工序/参数/机理取自 SEMI 标准体系的量测与统计术语、IRDS 公开路线图框架，以及名企 JD 原文点名的工序与失效项（长鑫存储薄膜区 CVD/PVD/RTP/铜工艺与 CMP、北方华创 MPCVD、京东方 PVD、中芯良率 Inline/Fail Bin）；典型值为量级兜底，控制限须由企业按自身数据与受控规格书确定"
+  },
+  "chamber_pressure": {
+   "name": "腔体压力",
+   "process": "semi_etch",
+   "unit": "mTorr",
+   "aliases": [
+    "腔体压力",
+    "反应腔压力",
+    "chamber pressure"
+   ],
+   "typical_range": [
+    1,
+    500
+   ],
+   "control": {
+    "mode": "none"
+   },
+   "note": "影响离子能量分布与均匀性（量级兜底，控制限以受控规格书为准）",
+   "source": "工序/参数/机理取自 SEMI 标准体系的量测与统计术语、IRDS 公开路线图框架，以及名企 JD 原文点名的工序与失效项（长鑫存储薄膜区 CVD/PVD/RTP/铜工艺与 CMP、北方华创 MPCVD、京东方 PVD、中芯良率 Inline/Fail Bin）；典型值为量级兜底，控制限须由企业按自身数据与受控规格书确定"
+  },
+  "gas_flow": {
+   "name": "气体流量",
+   "process": "semi_etch",
+   "unit": "sccm",
+   "aliases": [
+    "气体流量",
+    "气流",
+    "gas flow"
+   ],
+   "typical_range": [
+    10,
+    2000
+   ],
+   "control": {
+    "mode": "none"
+   },
+   "note": "反应物供给量（量级兜底，控制限以受控规格书为准）",
+   "source": "工序/参数/机理取自 SEMI 标准体系的量测与统计术语、IRDS 公开路线图框架，以及名企 JD 原文点名的工序与失效项（长鑫存储薄膜区 CVD/PVD/RTP/铜工艺与 CMP、北方华创 MPCVD、京东方 PVD、中芯良率 Inline/Fail Bin）；典型值为量级兜底，控制限须由企业按自身数据与受控规格书确定"
+  },
+  "film_thickness": {
+   "name": "薄膜厚度",
+   "process": "semi_thinfilm",
+   "unit": "nm",
+   "aliases": [
+    "薄膜厚度",
+    "沉积膜厚",
+    "film thickness",
+    "thin film thickness"
+   ],
+   "typical_range": [
+    1,
+    5000
+   ],
+   "control": {
+    "mode": "none"
+   },
+   "note": "薄膜沉积的核心控制量（量级兜底，控制限以受控规格书为准）",
+   "source": "工序/参数/机理取自 SEMI 标准体系的量测与统计术语、IRDS 公开路线图框架，以及名企 JD 原文点名的工序与失效项（长鑫存储薄膜区 CVD/PVD/RTP/铜工艺与 CMP、北方华创 MPCVD、京东方 PVD、中芯良率 Inline/Fail Bin）；典型值为量级兜底，控制限须由企业按自身数据与受控规格书确定"
+  },
+  "film_uniformity": {
+   "name": "膜厚均匀性",
+   "process": "semi_thinfilm",
+   "unit": "%",
+   "aliases": [
+    "膜厚均匀性",
+    "厚度均匀性",
+    "film uniformity"
+   ],
+   "typical_range": [
+    0,
+    15
+   ],
+   "control": {
+    "mode": "none"
+   },
+   "note": "片内厚度分布一致性（量级兜底，控制限以受控规格书为准）",
+   "source": "工序/参数/机理取自 SEMI 标准体系的量测与统计术语、IRDS 公开路线图框架，以及名企 JD 原文点名的工序与失效项（长鑫存储薄膜区 CVD/PVD/RTP/铜工艺与 CMP、北方华创 MPCVD、京东方 PVD、中芯良率 Inline/Fail Bin）；典型值为量级兜底，控制限须由企业按自身数据与受控规格书确定"
+  },
+  "film_stress": {
+   "name": "薄膜应力",
+   "process": "semi_thinfilm",
+   "unit": "MPa",
+   "aliases": [
+    "薄膜应力",
+    "膜应力",
+    "应力",
+    "film stress"
+   ],
+   "typical_range": [
+    -1000,
+    1000
+   ],
+   "control": {
+    "mode": "none"
+   },
+   "note": "过大会导致翘曲与光刻对准失败（量级兜底，控制限以受控规格书为准）",
+   "source": "工序/参数/机理取自 SEMI 标准体系的量测与统计术语、IRDS 公开路线图框架，以及名企 JD 原文点名的工序与失效项（长鑫存储薄膜区 CVD/PVD/RTP/铜工艺与 CMP、北方华创 MPCVD、京东方 PVD、中芯良率 Inline/Fail Bin）；典型值为量级兜底，控制限须由企业按自身数据与受控规格书确定"
+  },
+  "refractive_index": {
+   "name": "折射率",
+   "process": "semi_thinfilm",
+   "unit": "无量纲",
+   "aliases": [
+    "折射率",
+    "refractive index",
+    "n值"
+   ],
+   "typical_range": [
+    1.3,
+    2.5
+   ],
+   "control": {
+    "mode": "none"
+   },
+   "note": "间接反映膜成分与致密度（量级兜底，控制限以受控规格书为准）",
+   "source": "工序/参数/机理取自 SEMI 标准体系的量测与统计术语、IRDS 公开路线图框架，以及名企 JD 原文点名的工序与失效项（长鑫存储薄膜区 CVD/PVD/RTP/铜工艺与 CMP、北方华创 MPCVD、京东方 PVD、中芯良率 Inline/Fail Bin）；典型值为量级兜底，控制限须由企业按自身数据与受控规格书确定"
+  },
+  "sheet_resistance": {
+   "name": "方块电阻",
+   "process": "semi_thinfilm",
+   "unit": "Ω/□",
+   "aliases": [
+    "方块电阻",
+    "方阻",
+    "sheet resistance",
+    "sheet resistance Rs"
+   ],
+   "typical_range": [
+    0.01,
+    1000
+   ],
+   "control": {
+    "mode": "none"
+   },
+   "note": "金属/掺杂层电性表征（量级兜底，控制限以受控规格书为准）",
+   "source": "工序/参数/机理取自 SEMI 标准体系的量测与统计术语、IRDS 公开路线图框架，以及名企 JD 原文点名的工序与失效项（长鑫存储薄膜区 CVD/PVD/RTP/铜工艺与 CMP、北方华创 MPCVD、京东方 PVD、中芯良率 Inline/Fail Bin）；典型值为量级兜底，控制限须由企业按自身数据与受控规格书确定"
+  },
+  "depo_temp": {
+   "name": "沉积温度",
+   "process": "semi_thinfilm",
+   "unit": "℃",
+   "aliases": [
+    "沉积温度",
+    "淀积温度",
+    "deposition temperature"
+   ],
+   "typical_range": [
+    150,
+    1200
+   ],
+   "control": {
+    "mode": "none"
+   },
+   "note": "决定膜致密度与应力方向（量级兜底，控制限以受控规格书为准）",
+   "source": "工序/参数/机理取自 SEMI 标准体系的量测与统计术语、IRDS 公开路线图框架，以及名企 JD 原文点名的工序与失效项（长鑫存储薄膜区 CVD/PVD/RTP/铜工艺与 CMP、北方华创 MPCVD、京东方 PVD、中芯良率 Inline/Fail Bin）；典型值为量级兜底，控制限须由企业按自身数据与受控规格书确定"
+  },
+  "removal_rate": {
+   "name": "研磨去除速率",
+   "process": "semi_cmp",
+   "unit": "nm/min",
+   "aliases": [
+    "去除速率",
+    "研磨速率",
+    "removal rate",
+    "MRR"
+   ],
+   "typical_range": [
+    10,
+    2000
+   ],
+   "control": {
+    "mode": "none"
+   },
+   "note": "单位时间去除量，决定研磨时间窗口（量级兜底，控制限以受控规格书为准）",
+   "source": "工序/参数/机理取自 SEMI 标准体系的量测与统计术语、IRDS 公开路线图框架，以及名企 JD 原文点名的工序与失效项（长鑫存储薄膜区 CVD/PVD/RTP/铜工艺与 CMP、北方华创 MPCVD、京东方 PVD、中芯良率 Inline/Fail Bin）；典型值为量级兜底，控制限须由企业按自身数据与受控规格书确定"
+  },
+  "dishing": {
+   "name": "碟形凹陷",
+   "process": "semi_cmp",
+   "unit": "nm",
+   "aliases": [
+    "碟形凹陷",
+    "凹陷",
+    "dishing"
+   ],
+   "typical_range": [
+    0,
+    200
+   ],
+   "control": {
+    "mode": "none"
+   },
+   "note": "同材料宽结构区的凹陷量，图形依赖（量级兜底，控制限以受控规格书为准）",
+   "source": "工序/参数/机理取自 SEMI 标准体系的量测与统计术语、IRDS 公开路线图框架，以及名企 JD 原文点名的工序与失效项（长鑫存储薄膜区 CVD/PVD/RTP/铜工艺与 CMP、北方华创 MPCVD、京东方 PVD、中芯良率 Inline/Fail Bin）；典型值为量级兜底，控制限须由企业按自身数据与受控规格书确定"
+  },
+  "erosion": {
+   "name": "侵蚀",
+   "process": "semi_cmp",
+   "unit": "nm",
+   "aliases": [
+    "侵蚀",
+    "erosion",
+    "过磨"
+   ],
+   "typical_range": [
+    0,
+    300
+   ],
+   "control": {
+    "mode": "none"
+   },
+   "note": "密集图形区整体下陷量，用常规厚度 SPC 抓不到（量级兜底，控制限以受控规格书为准）",
+   "source": "工序/参数/机理取自 SEMI 标准体系的量测与统计术语、IRDS 公开路线图框架，以及名企 JD 原文点名的工序与失效项（长鑫存储薄膜区 CVD/PVD/RTP/铜工艺与 CMP、北方华创 MPCVD、京东方 PVD、中芯良率 Inline/Fail Bin）；典型值为量级兜底，控制限须由企业按自身数据与受控规格书确定"
+  },
+  "down_force": {
+   "name": "研磨压力",
+   "process": "semi_cmp",
+   "unit": "psi",
+   "aliases": [
+    "研磨压力",
+    "下压力",
+    "down force"
+   ],
+   "typical_range": [
+    0.5,
+    10
+   ],
+   "control": {
+    "mode": "none"
+   },
+   "note": "主控去除速率，但过大会增大缺陷（量级兜底，控制限以受控规格书为准）",
+   "source": "工序/参数/机理取自 SEMI 标准体系的量测与统计术语、IRDS 公开路线图框架，以及名企 JD 原文点名的工序与失效项（长鑫存储薄膜区 CVD/PVD/RTP/铜工艺与 CMP、北方华创 MPCVD、京东方 PVD、中芯良率 Inline/Fail Bin）；典型值为量级兜底，控制限须由企业按自身数据与受控规格书确定"
+  },
+  "polish_uniformity": {
+   "name": "研磨均匀性",
+   "process": "semi_cmp",
+   "unit": "%",
+   "aliases": [
+    "研磨均匀性",
+    "抛光均匀性",
+    "polish uniformity"
+   ],
+   "typical_range": [
+    0,
+    20
+   ],
+   "control": {
+    "mode": "none"
+   },
+   "note": "片内去除量一致性（量级兜底，控制限以受控规格书为准）",
+   "source": "工序/参数/机理取自 SEMI 标准体系的量测与统计术语、IRDS 公开路线图框架，以及名企 JD 原文点名的工序与失效项（长鑫存储薄膜区 CVD/PVD/RTP/铜工艺与 CMP、北方华创 MPCVD、京东方 PVD、中芯良率 Inline/Fail Bin）；典型值为量级兜底，控制限须由企业按自身数据与受控规格书确定"
+  },
+  "defect_density": {
+   "name": "缺陷密度",
+   "process": "semi_metrology",
+   "unit": "个/cm²",
+   "aliases": [
+    "缺陷密度",
+    "defect density",
+    "DD"
+   ],
+   "typical_range": [
+    0,
+    100
+   ],
+   "control": {
+    "mode": "none"
+   },
+   "note": "单位面积缺陷数，良率的主要先行指标（量级兜底，控制限以受控规格书为准）",
+   "source": "工序/参数/机理取自 SEMI 标准体系的量测与统计术语、IRDS 公开路线图框架，以及名企 JD 原文点名的工序与失效项（长鑫存储薄膜区 CVD/PVD/RTP/铜工艺与 CMP、北方华创 MPCVD、京东方 PVD、中芯良率 Inline/Fail Bin）；典型值为量级兜底，控制限须由企业按自身数据与受控规格书确定"
+  },
+  "cd_uniformity": {
+   "name": "CD 均匀性",
+   "process": "semi_metrology",
+   "unit": "%",
+   "aliases": [
+    "CD均匀性",
+    "线宽均匀性",
+    "cd uniformity"
+   ],
+   "typical_range": [
+    0,
+    15
+   ],
+   "control": {
+    "mode": "none"
+   },
+   "note": "片内关键尺寸一致性（量级兜底，控制限以受控规格书为准）",
+   "source": "工序/参数/机理取自 SEMI 标准体系的量测与统计术语、IRDS 公开路线图框架，以及名企 JD 原文点名的工序与失效项（长鑫存储薄膜区 CVD/PVD/RTP/铜工艺与 CMP、北方华创 MPCVD、京东方 PVD、中芯良率 Inline/Fail Bin）；典型值为量级兜底，控制限须由企业按自身数据与受控规格书确定"
+  },
+  "particle_count": {
+   "name": "颗粒数",
+   "process": "semi_metrology",
+   "unit": "颗",
+   "aliases": [
+    "颗粒数",
+    "颗粒",
+    "particle",
+    "particle count"
+   ],
+   "typical_range": [
+    0,
+    10000
+   ],
+   "control": {
+    "mode": "none"
+   },
+   "note": "颗粒是良率的头号杀手，且跨所有工序（量级兜底，控制限以受控规格书为准）",
+   "source": "工序/参数/机理取自 SEMI 标准体系的量测与统计术语、IRDS 公开路线图框架，以及名企 JD 原文点名的工序与失效项（长鑫存储薄膜区 CVD/PVD/RTP/铜工艺与 CMP、北方华创 MPCVD、京东方 PVD、中芯良率 Inline/Fail Bin）；典型值为量级兜底，控制限须由企业按自身数据与受控规格书确定"
+  },
+  "wafer_cpk": {
+   "name": "晶圆级 Cpk",
+   "process": "semi_metrology",
+   "unit": "无量纲",
+   "aliases": [
+    "晶圆Cpk",
+    "wafer cpk",
+    "Cpk"
+   ],
+   "typical_range": [
+    0,
+    3
+   ],
+   "control": {
+    "mode": "none"
+   },
+   "note": "参数能力指数，需按层/按机台分别算（量级兜底，控制限以受控规格书为准）",
+   "source": "工序/参数/机理取自 SEMI 标准体系的量测与统计术语、IRDS 公开路线图框架，以及名企 JD 原文点名的工序与失效项（长鑫存储薄膜区 CVD/PVD/RTP/铜工艺与 CMP、北方华创 MPCVD、京东方 PVD、中芯良率 Inline/Fail Bin）；典型值为量级兜底，控制限须由企业按自身数据与受控规格书确定"
+  },
+  "platen_speed": {
+   "name": "研磨盘转速",
+   "process": "semi_cmp",
+   "unit": "rpm",
+   "aliases": [
+    "研磨盘转速",
+    "盘转速",
+    "platen speed"
+   ],
+   "typical_range": [
+    10,
+    200
+   ],
+   "control": {
+    "mode": "none"
+   },
+   "note": "影响去除速率与均匀性（量级兜底，控制限以受控规格书为准）",
+   "source": "工序/参数/机理取自 SEMI 标准体系的量测与统计术语、IRDS 公开路线图框架，以及名企 JD 原文点名的工序与失效项（长鑫存储薄膜区 CVD/PVD/RTP/铜工艺与 CMP、北方华创 MPCVD、京东方 PVD、中芯良率 Inline/Fail Bin）；典型值为量级兜底，控制限须由企业按自身数据与受控规格书确定"
+  },
+  "slurry_flow": {
+   "name": "研磨液流量",
+   "process": "semi_cmp",
+   "unit": "mL/min",
+   "aliases": [
+    "研磨液流量",
+    "slurry流量",
+    "slurry flow"
+   ],
+   "typical_range": [
+    50,
+    500
+   ],
+   "control": {
+    "mode": "none"
+   },
+   "note": "化学作用强度，影响选择比与缺陷（量级兜底，控制限以受控规格书为准）",
+   "source": "工序/参数/机理取自 SEMI 标准体系的量测与统计术语、IRDS 公开路线图框架，以及名企 JD 原文点名的工序与失效项（长鑫存储薄膜区 CVD/PVD/RTP/铜工艺与 CMP、北方华创 MPCVD、京东方 PVD、中芯良率 Inline/Fail Bin）；典型值为量级兜底，控制限须由企业按自身数据与受控规格书确定"
   }
  },
  "defect_rootcause": {
@@ -5929,6 +6713,281 @@
    ],
    "source": "失效机理清单取自光伏组件测试/失效分析岗招聘 JD 原文所列项（PID、LID/LeTID、隐裂、黄变、焊带疲劳、接线盒失效）与 IEC 61215 / IEC 61730 的老化试验框架；机理描述为公开通用口径，不含任何企业阈值，判定以受控规格书为准",
    "note": "机理取自公开资料与 JD 所列失效项，现场适用性待复核；判定阈值以受控规格书为准，本条不含企业数值"
+  },
+  "CD偏移": {
+   "process": "semi_litho",
+   "likely_params": [
+    "cd_critical_dim",
+    "exposure_dose",
+    "focus_offset",
+    "resist_thickness"
+   ],
+   "mechanism": "曝光剂量偏离、离焦、胶厚变化或显影异常导致线宽整体偏大/偏小；也可能是掩膜本身尺寸漂移（来料）",
+   "verify_data": [
+    "CD 趋势图与曝光剂量趋势对照",
+    "片内 CD 分布图",
+    "掩膜版来料 CD 数据",
+    "聚焦校准记录"
+   ],
+   "quick_checks": [
+    "是整体偏移还是局部（局部多为离焦或掩膜缺陷）",
+    "同机台不同产品是否都偏",
+    "换批次光刻胶后是否变化"
+   ],
+   "carry_over_from": [],
+   "clearing_evidence": [
+    "掩膜来料 CD 报告",
+    "曝光机校准记录"
+   ],
+   "param_key": "cd_critical_dim",
+   "aliases": [
+    "CD偏移",
+    "线宽超差",
+    "CD超差",
+    "线宽偏移"
+   ],
+   "source": "工序/参数/机理取自 SEMI 标准体系的量测与统计术语、IRDS 公开路线图框架，以及名企 JD 原文点名的工序与失效项（长鑫存储薄膜区 CVD/PVD/RTP/铜工艺与 CMP、北方华创 MPCVD、京东方 PVD、中芯良率 Inline/Fail Bin）；典型值为量级兜底，控制限须由企业按自身数据与受控规格书确定",
+   "note": "机理取自公开资料与 JD 所列失效项，现场适用性待复核；本条不含企业配方与阈值，判定以受控规格书为准"
+  },
+  "Overlay超差": {
+   "process": "semi_litho",
+   "likely_params": [
+    "overlay",
+    "focus_offset"
+   ],
+   "mechanism": "对准系统误差、机台热漂移、前层图形畸变或薄膜应力导致层间错位；应力过大的膜会使晶圆翘曲，进而使对准失效",
+   "verify_data": [
+    "Overlay 矢量图（含 X/Y 分量）",
+    "前层薄膜应力数据",
+    "机台对准校准记录",
+    "晶圆翘曲量"
+   ],
+   "quick_checks": [
+    "误差是平移、旋转还是放大（三者原因不同）",
+    "是否与某台曝光机或某个前层膜相关",
+    "翘曲量是否超限"
+   ],
+   "carry_over_from": [],
+   "clearing_evidence": [
+    "前层膜应力与翘曲记录",
+    "对准校准记录"
+   ],
+   "param_key": "overlay",
+   "aliases": [
+    "Overlay超差",
+    "套刻超差",
+    "对准偏移",
+    "套刻偏移"
+   ],
+   "source": "工序/参数/机理取自 SEMI 标准体系的量测与统计术语、IRDS 公开路线图框架，以及名企 JD 原文点名的工序与失效项（长鑫存储薄膜区 CVD/PVD/RTP/铜工艺与 CMP、北方华创 MPCVD、京东方 PVD、中芯良率 Inline/Fail Bin）；典型值为量级兜底，控制限须由企业按自身数据与受控规格书确定",
+   "note": "机理取自公开资料与 JD 所列失效项，现场适用性待复核；本条不含企业配方与阈值，判定以受控规格书为准"
+  },
+  "膜厚不均": {
+   "process": "semi_thinfilm",
+   "likely_params": [
+    "film_thickness",
+    "film_uniformity",
+    "depo_temp",
+    "chamber_pressure",
+    "gas_flow"
+   ],
+   "mechanism": "气流分布不均、温度场不均、喷淋头堵塞或腔体状态漂移导致片内厚度分布偏差",
+   "verify_data": [
+    "片内多点厚度图（等高线）",
+    "温度场与气流场记录",
+    "喷淋头/腔体清洁周期",
+    "同腔体前后批次对比"
+   ],
+   "quick_checks": [
+    "是中心-边缘型还是单边型（单边多为气流或排气）",
+    "是否集中在某个腔体或某个位置",
+    "清洁后是否恢复"
+   ],
+   "carry_over_from": [],
+   "clearing_evidence": [
+    "腔体 PM 记录",
+    "温度与气流量校验"
+   ],
+   "param_key": "film_thickness",
+   "aliases": [
+    "膜厚不均",
+    "厚度不均",
+    "膜厚均匀性差"
+   ],
+   "source": "工序/参数/机理取自 SEMI 标准体系的量测与统计术语、IRDS 公开路线图框架，以及名企 JD 原文点名的工序与失效项（长鑫存储薄膜区 CVD/PVD/RTP/铜工艺与 CMP、北方华创 MPCVD、京东方 PVD、中芯良率 Inline/Fail Bin）；典型值为量级兜底，控制限须由企业按自身数据与受控规格书确定",
+   "note": "机理取自公开资料与 JD 所列失效项，现场适用性待复核；本条不含企业配方与阈值，判定以受控规格书为准"
+  },
+  "薄膜颗粒": {
+   "process": "semi_thinfilm",
+   "likely_params": [
+    "particle_count",
+    "film_thickness"
+   ],
+   "mechanism": "腔体壁沉积物剥落、前驱体残留、进气污染或晶圆搬运引入颗粒；颗粒会造成局部遮挡形成针孔或短路",
+   "verify_data": [
+    "颗粒地图与 adders（前后差值）",
+    "腔体清洁周期与颗粒趋势",
+    "前驱体批次",
+    "搬运机械手状态"
+   ],
+   "quick_checks": [
+    "颗粒是新增（adders）还是原有",
+    "是否集中在晶圆某区域",
+    "清洁后是否下降"
+   ],
+   "carry_over_from": [],
+   "clearing_evidence": [
+    "腔体清洁记录",
+    "前驱体批次与纯度"
+   ],
+   "param_key": "particle_count",
+   "aliases": [
+    "薄膜颗粒",
+    "颗粒污染",
+    "颗粒超标"
+   ],
+   "source": "工序/参数/机理取自 SEMI 标准体系的量测与统计术语、IRDS 公开路线图框架，以及名企 JD 原文点名的工序与失效项（长鑫存储薄膜区 CVD/PVD/RTP/铜工艺与 CMP、北方华创 MPCVD、京东方 PVD、中芯良率 Inline/Fail Bin）；典型值为量级兜底，控制限须由企业按自身数据与受控规格书确定",
+   "note": "机理取自公开资料与 JD 所列失效项，现场适用性待复核；本条不含企业配方与阈值，判定以受控规格书为准"
+  },
+  "刻蚀残留": {
+   "process": "semi_etch",
+   "likely_params": [
+    "etch_rate",
+    "etch_uniformity",
+    "etch_selectivity",
+    "chamber_pressure"
+   ],
+   "mechanism": "刻蚀不足（速率偏低/时间不足）、选择比不当或局部气流不足导致底层未完全打开；残留会在后续工序变成开路或漏电",
+   "verify_data": [
+    "残留区域分布图",
+    "刻蚀速率与时间记录",
+    "终点检测曲线",
+    "选择比数据"
+   ],
+   "quick_checks": [
+    "残留集中在边缘还是中心",
+    "终点检测是否提前触发",
+    "同腔体是否连续发生"
+   ],
+   "carry_over_from": [],
+   "clearing_evidence": [
+    "刻蚀速率校验记录",
+    "终点检测曲线"
+   ],
+   "param_key": "etch_rate",
+   "aliases": [
+    "刻蚀残留",
+    "蚀刻残留",
+    "刻蚀不净",
+    "残留"
+   ],
+   "source": "工序/参数/机理取自 SEMI 标准体系的量测与统计术语、IRDS 公开路线图框架，以及名企 JD 原文点名的工序与失效项（长鑫存储薄膜区 CVD/PVD/RTP/铜工艺与 CMP、北方华创 MPCVD、京东方 PVD、中芯良率 Inline/Fail Bin）；典型值为量级兜底，控制限须由企业按自身数据与受控规格书确定",
+   "note": "机理取自公开资料与 JD 所列失效项，现场适用性待复核；本条不含企业配方与阈值，判定以受控规格书为准"
+  },
+  "碟形凹陷": {
+   "process": "semi_cmp",
+   "likely_params": [
+    "dishing",
+    "down_force",
+    "slurry_flow",
+    "platen_speed"
+   ],
+   "mechanism": "研磨时同材料宽结构区因图形密度差异被过度去除，形成碟形凹坑；与研磨压力、研磨液选择比和图形密度相关",
+   "verify_data": [
+    "按图形密度分组的凹陷量",
+    "研磨压力与转速记录",
+    "研磨液批次与流量",
+    "AFM/台阶仪形貌数据"
+   ],
+   "quick_checks": [
+    "凹陷是否只出现在宽金属区（图形依赖=典型 dishing）",
+    "同批次不同图形密度是否差异明显",
+    "研磨时间是否偏长"
+   ],
+   "carry_over_from": [],
+   "clearing_evidence": [
+    "研磨参数受控记录",
+    "研磨液批次"
+   ],
+   "param_key": "dishing",
+   "aliases": [
+    "碟形凹陷",
+    "碟形",
+    "dishing",
+    "凹陷超差"
+   ],
+   "source": "工序/参数/机理取自 SEMI 标准体系的量测与统计术语、IRDS 公开路线图框架，以及名企 JD 原文点名的工序与失效项（长鑫存储薄膜区 CVD/PVD/RTP/铜工艺与 CMP、北方华创 MPCVD、京东方 PVD、中芯良率 Inline/Fail Bin）；典型值为量级兜底，控制限须由企业按自身数据与受控规格书确定",
+   "note": "机理取自公开资料与 JD 所列失效项，现场适用性待复核；本条不含企业配方与阈值，判定以受控规格书为准"
+  },
+  "研磨划伤": {
+   "process": "semi_cmp",
+   "likely_params": [
+    "particle_count",
+    "down_force",
+    "slurry_flow"
+   ],
+   "mechanism": "研磨液中大颗粒、压力过大或研磨垫状态不良导致表面划伤；划伤多为方向性条纹",
+   "verify_data": [
+    "划伤方向与分布图",
+    "研磨液过滤状态与颗粒计数",
+    "研磨垫使用时长",
+    "压力设定与实际值"
+   ],
+   "quick_checks": [
+    "划伤是否呈同一方向（方向性=研磨垫/颗粒）",
+    "换研磨液批次后是否消失",
+    "研磨垫是否超期"
+   ],
+   "carry_over_from": [],
+   "clearing_evidence": [
+    "研磨液过滤与颗粒数据",
+    "研磨垫更换记录"
+   ],
+   "param_key": "particle_count",
+   "aliases": [
+    "研磨划伤",
+    "划伤",
+    "CMP划伤",
+    "刮伤"
+   ],
+   "source": "工序/参数/机理取自 SEMI 标准体系的量测与统计术语、IRDS 公开路线图框架，以及名企 JD 原文点名的工序与失效项（长鑫存储薄膜区 CVD/PVD/RTP/铜工艺与 CMP、北方华创 MPCVD、京东方 PVD、中芯良率 Inline/Fail Bin）；典型值为量级兜底，控制限须由企业按自身数据与受控规格书确定",
+   "note": "机理取自公开资料与 JD 所列失效项，现场适用性待复核；本条不含企业配方与阈值，判定以受控规格书为准"
+  },
+  "良率骤降": {
+   "process": "semi_metrology",
+   "likely_params": [
+    "yield_rate",
+    "defect_density",
+    "wafer_cpk",
+    "particle_count"
+   ],
+   "mechanism": "良率是多因结果：常见为某台设备漂移、某层参数越界、颗粒突增或来料批次异常。必须先按层/机台/批号拆分定位，不可直接在整片上算相关",
+   "verify_data": [
+    "按层/机台/批号拆分的良率对比",
+    "Fail Bin 分布",
+    "Inline 参数与电性参数关联",
+    "缺陷地图与颗粒 adders"
+   ],
+   "quick_checks": [
+    "骤降是阶跃还是渐变（阶跃多为设备/批次事件）",
+    "是否集中在某一台设备或某一层",
+    "同期是否有 PM、换料、换程序"
+   ],
+   "carry_over_from": [],
+   "clearing_evidence": [
+    "设备 PM 与换料记录",
+    "按机台拆分的 Inline 数据"
+   ],
+   "param_key": "yield_rate",
+   "aliases": [
+    "良率骤降",
+    "良率下降",
+    "良率异常",
+    "yield loss"
+   ],
+   "source": "工序/参数/机理取自 SEMI 标准体系的量测与统计术语、IRDS 公开路线图框架，以及名企 JD 原文点名的工序与失效项（长鑫存储薄膜区 CVD/PVD/RTP/铜工艺与 CMP、北方华创 MPCVD、京东方 PVD、中芯良率 Inline/Fail Bin）；典型值为量级兜底，控制限须由企业按自身数据与受控规格书确定",
+   "note": "机理取自公开资料与 JD 所列失效项，现场适用性待复核；本条不含企业配方与阈值，判定以受控规格书为准",
+   "response_defect": true
   }
  },
  "data_gaps": {

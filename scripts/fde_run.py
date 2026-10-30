@@ -3220,6 +3220,50 @@ def rule_stat_assert_has_closed_form():
     return _r(True, "", {"ok": True})
 
 
+def rule_test_restores_own_global_root():
+    """测试切了某模块的全局 root，必须在 finally 还原**该模块自己的** root。
+
+    实测抓到的真缺陷（不是假想）：
+        test_device_memory 里 `SC.set_root(tmp)` 把 scope 根的目录切到临时目录，
+        finally 里却只还原了 `TN.set_root(orig_root)`——`orig_root` 来自
+        `TN.root()`，与 scope 是**两个模块的两份全局状态**。
+        结果 scope 的根目录一直指向已被 rmtree 掉的临时路径，
+        之后所有行业解析（resolve）静默返回空，全库没有任何报错。
+        这个洞存在很久，直到新加的行为测试真的去 resolve 才暴露。
+
+    判据（形态级，不认措辞）：
+      1. 必须存在 `orig_sc_root`（scope 自己的 root 快照）——不能拿别的模块的 root 顶替；
+      2. 必须存在 `set_root(orig_sc_root)` 的还原调用；
+      3. 不得出现 `SC.set_root(orig_root)` 这种跨模块混用的还原。
+    """
+    t = _read(os.path.join("scripts", "selftest.py")) or ""
+    if not t:
+        return _r(False, "读不到 scripts/selftest.py")
+    # 1) 快照必须**真的取自 scope 自己的 root()**，不是赋个 None 占位。
+    #    只查标识符 "orig_sc_root" 会漏抓 `orig_sc_root = None`（实测漏抓过一次）；
+    #    也不能只查"至少有一处对"——快照散在多个测试里，改成全量校验：
+    #    每一处 orig_sc_root 赋值都必须是 xxx.root() 形式。
+    assigns = re.findall(r"orig_sc_root\s*=\s*([^\n#]+)", t)
+    if not assigns:
+        return _r(False, "没有 scope 自己的 root 快照（orig_sc_root）")
+    bad = [a.strip() for a in assigns if not re.search(r"\.root\(\)\s*$", a.strip())]
+    if bad:
+        return _r(False, "有 orig_sc_root 快照不是取自 root()（如 %r）——"
+                        "赋 None 占位的还原等于没还原" % (bad[0],))
+    # 2) 还原调用必须在
+    if not re.search(r"\.set_root\(orig_sc_root\)", t):
+        return _r(False, "没有 set_root(orig_sc_root) 的还原调用——"
+                        "scope 根目录会停在临时路径，之后行业解析静默失效")
+    # 3) 禁止**scope** 用 tenancy 的 root 还原。只针对 scope 的别名（SC / SC2 / SC3…）：
+    #    写成 `\.set_root\(orig_root\)` 会误伤合法的 TN.set_root(orig_root)（那是还原
+    #    tenancy 自己的 root，本来就该这样）；写成 `SC\.` 又会漏掉 SC2/SC3 这类带序号别名
+    #    ——两个方向都实测踩过。正确形态是 `SC\d*\.`。
+    if re.search(r"\bSC\d*\.set_root\(orig_root\)", t):
+        return _r(False, "出现 SCx.set_root(orig_root)：把 tenancy 的 root 当成 scope 的 root 还原，"
+                        "两个模块的全局状态被混用")
+    return _r(True, "", {"ok": True})
+
+
 AUDIT_RULES = [
     Rule("LICENSE 与代码事实对齐：Elastic 2.0 正文齐全且无许可密钥条款", rule_license,
          "（1）首行必须是裸文本 'Elastic License 2.0'（带 # 判不过）；"
@@ -4454,6 +4498,22 @@ AUDIT_RULES = [
                           'ok.append(("B10 小于 η", fit["b10"] < fit["eta"], ""))\n'
                           '    ok.append(("B10 与闭式解一致（非恒真断言）",'),
                   RELIABILITY_FILE)]),
+    Rule("测试改了模块全局 root 必须还原该模块自己的 root",
+         rule_test_restores_own_global_root,
+         "selftest 里必须存在 scope 自己的 root 快照 orig_sc_root，且 finally 里有 "
+         "set_root(orig_sc_root) 还原；不得出现 SC.set_root(orig_root)（跨模块混用）。"
+         "实测：test_device_memory 把 scope 切到临时目录后只还原 tenancy，"
+         "scope 根目录停在已删除路径，之后所有行业解析静默返回空、全库无报错。",
+         os.path.join("scripts", "selftest.py"),
+         [_mutant("改用 tenancy 的 root 还原 scope（跨模块混用）",
+                  _sub("SC2.set_root(orig_sc_root)", "SC2.set_root(orig_root)"),
+                  os.path.join("scripts", "selftest.py")),
+          _mutant("去掉 scope 的 root 快照（还原无从谈起）",
+                  # 必须用 _re_sub 全量替换：快照在多个测试里各有一处，
+                  # _sub 只换第一处，别处的快照仍能通过判据 → 变异抓不到（实测漏抓）。
+                  _re_sub(r"orig_sc_root\s*=\s*_SC\d*\.root\(\)",
+                          "orig_sc_root = None"),
+                  os.path.join("scripts", "selftest.py"))]),
 ]
 
 

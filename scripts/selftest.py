@@ -1291,6 +1291,10 @@ def test_industry():
         try:
             shutil.copytree(os.path.join(ROOT, "knowledge"), os.path.join(tmp2, "knowledge"))
             orig_root = TN.root()
+            # scope 的 root 必须**单独**取、单独还原。曾用 TN.root() 代它还原，
+            # 若前面有测试把 tenancy 留在临时目录，scope 就被还原到已删除路径，
+            # 之后所有行业解析静默失败（直到新增测试真的调用 resolve 才暴露）。
+            orig_sc_root = SC.root()
             TN.set_root(tmp2)
             SC.set_root(tmp2)
             f_bat = os.path.join(ROOT, "examples", "01_涂布工艺数据.csv")
@@ -1311,7 +1315,7 @@ def test_industry():
         finally:
             try:
                 TN.set_root(orig_root)
-                SC.set_root(orig_root)
+                SC.set_root(orig_sc_root)
                 TN.set_tenant(None)
                 SC.clear()
                 PP._KNOWLEDGE = None
@@ -1349,6 +1353,8 @@ def test_device_memory():
     from lib import deviceid as DID, devices as DEV, table as TB
     from lib import tenancy as TN, pipeline as PL, crossprocess as XP
     orig_root = TN.root()
+    from lib import scope as _SC0
+    orig_sc_root = _SC0.root()
     tmp = None
     try:
         tmp = tempfile.mkdtemp(prefix="devmem-")
@@ -1493,6 +1499,15 @@ def test_device_memory():
             TN.set_root(orig_root)
         except Exception as _rst_e:
             reset_fail("TN.set_root(orig_root)", _rst_e)
+        # scope 的根目录必须**单独**还原：本测试前面把它切到 tmp，若只还原 tenancy，
+        # scope 会一直指向已被 rmtree 掉的临时目录，之后所有行业解析静默失败
+        # （表现为 resolve 返回空、无效行业名——隐藏很久，直到有测试真的去 resolve 才暴露）。
+        try:
+            from lib import scope as SC2
+            SC2.set_root(orig_sc_root)
+            SC2.clear()
+        except Exception as _rst_e:
+            reset_fail("scope 根目录还原", _rst_e)
         try:
             from lib import devices as DEV2
             DEV2.invalidate_cache()
@@ -1520,6 +1535,8 @@ def test_hotswap():
     import tempfile, shutil, json as _json, time
     from lib import tenancy as TN, kbstore as KBS, preprocess as PP, hotswap as HS
     orig_root = TN.root()
+    from lib import scope as _SC3
+    orig_sc_root = _SC3.root()
     tmp = None
     try:
         tmp = tempfile.mkdtemp(prefix="hot-")
@@ -1657,7 +1674,7 @@ def test_hotswap():
             TN.set_tenant(None)
             TN.set_root(orig_root)
             from lib import scope as SC
-            SC.set_root(orig_root)
+            SC.set_root(orig_sc_root)
             SC.clear()
             PP._KNOWLEDGE = None
             PP._KNOWLEDGE_TENANT = "__unset__"
@@ -5049,6 +5066,102 @@ def test_fmea_rpn_and_gate():
           str(miss["errors"]))
 
 
+def test_semiconductor_slice():
+    """半导体行业切片（光刻/刻蚀/薄膜/CMP/量测良率）挂载与安全校验。
+
+    三件事必须验，缺一件这个切片就是"看着有、实际用不上"：
+      1. 行业能让 scope 解析出来（否则 --industry 半导体 直接被忽略）
+      2. 工序与参数的悬空引用为零（悬空会让 rootcause 静默少算候选）
+      3. **别名不得是通用词**——本轮建切片时实测：'CD' 命中 'CCD对位偏差'、
+         '厚度' 命中 '涂布厚度'、'Rs' 命中 'Rsh'、'良率' 命中 '不良率(%)'。
+         最后一条最危险：会把「不良率」列当成「良率」的目标量，
+         重演 E06 翻红那类事故。所以这里把已证明危险的泛词列为禁止别名。
+    """
+    print("\n[半导体行业切片：挂载与别名安全]")
+    from lib import scope as SC
+    from lib import pipeline as PL
+    import json as _json
+
+    # 先验一条：前面所有测试跑完后，scope 的根目录必须还在仓库本身。
+    # 实测踩过——test_device_memory 把 scope 切到临时目录后只还原了 tenancy，
+    # 根目录留在已被删除的临时路径，之后所有行业解析静默失败（resolve 返回空）。
+    # 这类"全局状态没还原"的污染不会报错，只会让后面的功能悄悄失效。
+    check("前面的测试未污染 scope 根目录",
+          os.path.abspath(SC.root() or "") == os.path.abspath(ROOT),
+          "root=%r ROOT=%r" % (SC.root(), ROOT))
+    got, unknown = SC.resolve("半导体")
+    check("scope 能解析「半导体」", got == ["semiconductor"],
+          "got=%s unknown=%s" % (got, unknown))
+
+    spec = _json.load(open(os.path.join(ROOT, "knowledge", "process_specs.json"),
+                           encoding="utf-8"))
+    procs = spec.get("processes") or {}
+    params = spec.get("params") or {}
+    defs = spec.get("defect_rootcause") or {}
+
+    semi = [k for k, v in procs.items() if v.get("domain") == "semiconductor"]
+    check("半导体注册 5 个工序", len(semi) == 5, str(sorted(semi)))
+
+    # 悬空引用：一个都不许有
+    dangling = []
+    for k in semi:
+        for pk in (procs[k].get("key_params") or []) + \
+                  (procs[k].get("doe_factors") or []):
+            if pk not in params:
+                dangling.append((k, pk))
+        for sk in (procs[k].get("upstream_keys") or []) + \
+                  (procs[k].get("downstream_keys") or []):
+            if sk not in procs:
+                dangling.append((k, sk))
+    check("工序的 key_params/doe_factors/上下游无悬空", not dangling,
+          str(dangling[:4]))
+
+    semi_defs = [k for k, v in defs.items()
+                 if v.get("process", "").startswith("semi_")]
+    check("半导体注册 8 条缺陷机理", len(semi_defs) == 8, str(sorted(semi_defs)))
+    bad_pk = [(k, defs[k].get("param_key")) for k in semi_defs
+              if defs[k].get("param_key") and defs[k]["param_key"] not in params]
+    check("缺陷的 param_key 均已注册", not bad_pk, str(bad_pk[:4]))
+
+    # 泛词黑名单：这些别名已实测会误命中别行业列，禁止出现在任何参数别名里
+    BANNED = {"CD", "厚度", "膜厚", "Rs", "良率", "THK"}
+    offenders = []
+    for k, v in params.items():
+        if v.get("process", "") not in semi:
+            continue
+        for a in (v.get("aliases") or []):
+            if str(a).strip() in BANNED:
+                offenders.append((k, a))
+    check("半导体参数不含已被证明危险的泛词别名", not offenders, str(offenders[:5]))
+
+    # 行为级：合成一份光刻数据，看能不能认出工序 + 缺陷 + 给出候选
+    with tempfile.TemporaryDirectory() as td:
+        p = os.path.join(td, "litho.csv")
+        rnd = random.Random(20261030)
+        lines = ["批次,关键尺寸CD(nm),曝光剂量(mJ/cm2),聚焦偏移(nm),套刻精度(nm),晶圆良率(%)"]
+        for i in range(60):
+            cd = 45 + 1.2 * ((i % 5) - 2) + rnd.gauss(0, 0.8)
+            dose = 30 + 0.5 * ((i % 4) - 1.5) + rnd.gauss(0, 0.3)
+            focus = rnd.gauss(0, 20)
+            ov = 12 + 2.0 * ((i % 3) - 1) + rnd.gauss(0, 1.5)
+            y = max(50.0, min(100.0, 96 - 0.8 * max(0, cd - 46)
+                              - 0.3 * max(0, ov - 13) + rnd.gauss(0, 0.8)))
+            lines.append("L%03d,%.2f,%.2f,%.1f,%.2f,%.1f"
+                         % (i + 1, cd, dose, focus, ov, y))
+        io.open(p, "w", encoding="utf-8-sig", newline="\n").write("\n".join(lines) + "\n")
+        res = PL.analyze([p], outdir=os.path.join(td, "out"),
+                         target="晶圆良率(%)", process="semi_litho",
+                         do_doe=False, max_charts=0)
+        check("工序被正确识别为光刻", res.get("process_name") == "光刻",
+              str(res.get("process_name")))
+        got_defs = [d.get("defect") for d in (res.get("defects") or [])]
+        check("识别出 CD偏移 缺陷", "CD偏移" in got_defs, str(got_defs))
+        cands = (res.get("rootcause") or {}).get("candidates") or []
+        check("根因候选非空且首位是 CD 相关参数",
+              bool(cands) and ("CD" in str(cands[0].get("param_name") or "")),
+              "%s" % ([c.get("param_name") for c in cands[:2]],))
+
+
 def test_quality_manager_guide():
     """面向质量经理的「报告解读入门」（评审 P3-1）。
 
@@ -5512,6 +5625,7 @@ if __name__ == "__main__":
     test_quality_manager_guide()
     test_reliability_weibull_alt()
     test_fmea_rpn_and_gate()
+    test_semiconductor_slice()
     print("\n" + "=" * 56)
     print("通过 %d 项，失败 %d 项" % (len(PASS), len(FAIL)))
     if FAIL:

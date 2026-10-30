@@ -1,91 +1,115 @@
 {
-  "meta": {
-    "name": "行业作用域登记表",
-    "version": "1.0.0",
-    "updated": "2026-10-10",
-    "note": "企业端按购买的行业模块配置作用域。domain 必须与 process_specs.json 中 processes[*].domain 一致；processes 列表用于显式认领（domain 缺失时兜底）。新增行业只需在此追加一条，并在 process_specs.json 中给工序标注对应 domain。",
-    "derivable": "本文件缺失时，scope.py 会从 process_specs.json 的 domain 字段自动推导，不会中断分析。"
+ "meta": {
+  "name": "行业作用域登记表",
+  "version": "1.0.0",
+  "updated": "2026-10-10",
+  "note": "企业端按购买的行业模块配置作用域。domain 必须与 process_specs.json 中 processes[*].domain 一致；processes 列表用于显式认领（domain 缺失时兜底）。新增行业只需在此追加一条，并在 process_specs.json 中给工序标注对应 domain。",
+  "derivable": "本文件缺失时，scope.py 会从 process_specs.json 的 domain 字段自动推导，不会中断分析。"
+ },
+ "industries": {
+  "battery": {
+   "name": "锂电池",
+   "alias": [
+    "锂电",
+    "电池",
+    "lithium",
+    "battery",
+    "LIB"
+   ],
+   "domain": "battery",
+   "processes": [
+    "battery_coating",
+    "battery_calendering",
+    "battery_winding",
+    "battery_filling",
+    "battery_formation"
+   ],
+   "docs": [
+    "knowledge/锂电池工序知识库.md"
+   ],
+   "note": "涂布/辊压/卷绕/注液/化成。开路电压在此行业指电芯 OCV（典型 3.0-4.2 V 单芯）。"
   },
-  "industries": {
-    "battery": {
-      "name": "锂电池",
-      "alias": [
-        "锂电",
-        "电池",
-        "lithium",
-        "battery",
-        "LIB"
-      ],
-      "domain": "battery",
-      "processes": [
-        "battery_coating",
-        "battery_calendering",
-        "battery_winding",
-        "battery_filling",
-        "battery_formation"
-      ],
-      "docs": [
-        "knowledge/锂电池工序知识库.md"
-      ],
-      "note": "涂布/辊压/卷绕/注液/化成。开路电压在此行业指电芯 OCV（典型 3.0-4.2 V 单芯）。"
-    },
-    "pv": {
-      "name": "光伏",
-      "alias": [
-        "太阳能",
-        "组件",
-        "photovoltaic",
-        "pv",
-        "solar"
-      ],
-      "domain": "pv",
-      "processes": [
-        "pv_wafer",
-        "pv_cell_el",
-        "pv_module_iv"
-      ],
-      "docs": [
-        "knowledge/光伏工序知识库.md"
-      ],
-      "note": "硅片检测/电池片 EL/组件 IV。开路电压在此行业指组件 Voc（典型 30-50 V 量级），与锂电 OCV 相差一个数量级，不可混用。"
-    },
-    "materials_testing": {
-      "name": "材料测试",
-      "alias": [
-        "材料测试",
-        "材料表征",
-        "高分子测试",
-        "复合材料测试",
-        "材料检测",
-        "materials testing",
-        "material testing",
-        "polymer testing",
-        "composite testing"
-      ],
-      "domain": "materials_testing",
-      "processes": [
-        "material_thermal",
-        "material_spectroscopy",
-        "material_mechanical",
-        "material_electrical",
-        "material_reliability"
-      ],
-      "docs": [
-        "knowledge/材料测试工序知识库.md"
-      ],
-      "note": "高分子/导热界面/电磁屏蔽/吸波/复合材料等的实验室表征测试（热分析 DSC/TGA/TMA/DMA、成分结构 FTIR/GC-MS/NMR/XRD/SEM、力学、电学与电磁屏蔽、老化环境）。域参数与标准口径取自公开检测机构资料与国标/行标/国军标，现场适用性待复核；FDE 提供统计/DOE/根因/报告方法论，不替代设备操作与标准符合性判定。"
-    }
+  "pv": {
+   "name": "光伏",
+   "alias": [
+    "太阳能",
+    "组件",
+    "photovoltaic",
+    "pv",
+    "solar"
+   ],
+   "domain": "pv",
+   "processes": [
+    "pv_wafer",
+    "pv_cell_el",
+    "pv_module_iv"
+   ],
+   "docs": [
+    "knowledge/光伏工序知识库.md"
+   ],
+   "note": "硅片检测/电池片 EL/组件 IV。开路电压在此行业指组件 Voc（典型 30-50 V 量级），与锂电 OCV 相差一个数量级，不可混用。"
   },
-  "shared_assets": {
-    "note": "以下资产为跨行业通用方法论，任何作用域下都不裁剪。裁掉它们属于负收益。",
-    "files": [
-      "knowledge/interp_rules.json",
-      "knowledge/分析方法与判读指南.md"
-    ],
-    "sections": [
-      "unit_conversions",
-      "unit_aliases",
-      "_fallback"
-    ]
+  "materials_testing": {
+   "name": "材料测试",
+   "alias": [
+    "材料测试",
+    "材料表征",
+    "高分子测试",
+    "复合材料测试",
+    "材料检测",
+    "materials testing",
+    "material testing",
+    "polymer testing",
+    "composite testing"
+   ],
+   "domain": "materials_testing",
+   "processes": [
+    "material_thermal",
+    "material_spectroscopy",
+    "material_mechanical",
+    "material_electrical",
+    "material_reliability"
+   ],
+   "docs": [
+    "knowledge/材料测试工序知识库.md"
+   ],
+   "note": "高分子/导热界面/电磁屏蔽/吸波/复合材料等的实验室表征测试（热分析 DSC/TGA/TMA/DMA、成分结构 FTIR/GC-MS/NMR/XRD/SEM、力学、电学与电磁屏蔽、老化环境）。域参数与标准口径取自公开检测机构资料与国标/行标/国军标，现场适用性待复核；FDE 提供统计/DOE/根因/报告方法论，不替代设备操作与标准符合性判定。"
+  },
+  "semiconductor": {
+   "name": "半导体制造",
+   "alias": [
+    "半导体",
+    "集成电路",
+    "晶圆制造",
+    "芯片制造",
+    "晶圆厂",
+    "semiconductor",
+    "wafer fab",
+    "fab",
+    "IC manufacturing"
+   ],
+   "domain": "semiconductor",
+   "processes": [
+    "semi_litho",
+    "semi_etch",
+    "semi_thinfilm",
+    "semi_cmp",
+    "semi_metrology"
+   ],
+   "docs": [],
+   "note": "晶圆制造的光刻/刻蚀/薄膜/CMP/量测良率五个环节。本切片只提供工序—参数—缺陷机理骨架，供 SPC/DOE/MSA/根因/FMEA 挂载；不含工艺配方、不含控制限。"
   }
+ },
+ "shared_assets": {
+  "note": "以下资产为跨行业通用方法论，任何作用域下都不裁剪。裁掉它们属于负收益。",
+  "files": [
+   "knowledge/interp_rules.json",
+   "knowledge/分析方法与判读指南.md"
+  ],
+  "sections": [
+   "unit_conversions",
+   "unit_aliases",
+   "_fallback"
+  ]
+ }
 }
