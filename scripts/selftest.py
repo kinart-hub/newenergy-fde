@@ -1560,7 +1560,8 @@ def test_hotswap():
         # 实测在整机负载高时偶发（1.5 秒窗口内两侧各 ~0.9 秒预算会耗尽），
         # 于是门禁时红时绿，而真正要守的"零撕裂"其实一直是好的。
         stat = {"ok": 0, "write_fail": 0, "read_fail": 0,
-                "read_ok": 0, "read_torn": 0, "read_locked": 0}
+                "read_ok": 0, "read_torn": 0, "read_locked": 0,
+                "write_errors": []}
 
         def _holder():
             while not stop["v"]:
@@ -1606,8 +1607,11 @@ def test_hotswap():
                     d["meta"]["revision"] = 2000 + n
                     HS.atomic_write_json(spec, d)
                     stat["ok"] += 1
-                except Exception:
+                except Exception as _we:
                     stat["write_fail"] += 1
+                    if len(stat["write_errors"]) < 3:
+                        stat["write_errors"].append(
+                            "%s: %s" % (type(_we).__name__, str(_we)[:90]))
                 n += 1
                 time.sleep(0.001)
 
@@ -1620,8 +1624,9 @@ def test_hotswap():
         t1.join()
         t2.join()
         check("并发读期间原子写不失败", stat["write_fail"] == 0 and stat["ok"] > 0,
-              "写成功%d 写失败%d 写线程读撞窗口%d"
-              % (stat["ok"], stat["write_fail"], stat["read_fail"]))
+              "写成功%d 写失败%d 写线程读撞窗口%d ⚠%s"
+              % (stat["ok"], stat["write_fail"], stat["read_fail"],
+                 "；".join(stat["write_errors"])))
         # 读侧单独成条：写成功 ≠ 读到的东西是完整的，
         # 这两件事此前共用一个断言，等于只验了前者。
         check("并发读全程零撕裂",
@@ -5263,6 +5268,169 @@ def test_semiconductor_deep_capability():
         check("%s 子流程挂在唯一入口（缺参应报错 rc=2）" % flow, rc == 2, "rc=%s" % rc)
 
 
+def test_realworld_dirty_values():
+    """真实数据才有的脏值：NaN / inf / Infinity / 1e400。
+
+    **这个 bug 是真实数据抓出来的，不是想出来的**：
+      用 UCI SECOM（真实晶圆厂数据）跑 analyze，第 3 步就崩：
+        quality_guard.column_role -> round(nan) -> ValueError:
+        cannot convert float NaN to integer
+      原因是 _to_float 只把 "nan"（小写）当空值，"NaN"（大写）走到
+      float("NaN") 变成 nan；inf/Infinity/1e400 更是直接放过。
+      而 SECOM 有 4.9% 的单元格是 "NaN"——仿真数据从不出现这种字符串，
+      所以 1055 项自检全绿也照样没抓到。
+
+    这条测试守两件事：
+      1. 解析层（quality_guard._to_float / table.to_number）对非有限值必须给 None；
+      2. 端到端：带 NaN 的表能让 analyze 跑完而不是抛异常。
+    """
+    print("\n[真实数据脏值：NaN / inf / Infinity / 1e400]")
+    from lib import quality_guard as QG
+    from lib import table as T
+    from lib import pipeline as PL
+
+    # 1) 解析层：非有限值一律 None（大小写、正负、溢出都要覆盖）
+    for v in ("nan", "NaN", "NAN", "Infinity", "inf", "-inf", "-Infinity",
+              "1e400", "-1e400", "null", "N/A"):
+        check("_to_float(%r) 返回 None" % v, QG._to_float(v) is None,
+              repr(QG._to_float(v)))
+    check("_to_float 不吞掉正常数值", QG._to_float("108.2") == 108.2, "")
+    check("_to_float 处理已是非有限 float",
+          QG._to_float(float("nan")) is None and QG._to_float(float("inf")) is None, "")
+
+    # 2) column_role 不得在含 NaN 的列上抛异常
+    tb = T.Table(["面密度", "膜厚"], [["108.2", "NaN"], ["NaN", "12.3"],
+                                    ["109.0", "Infinity"]], "t")
+    crashed = None
+    try:
+        QG.role_of(tb, "面密度")
+        QG.role_of(tb, "膜厚")
+    except Exception as e:
+        crashed = "%s: %s" % (type(e).__name__, str(e)[:60])
+    check("column_role 在含 NaN/inf 的列上不崩", crashed is None, crashed or "")
+
+    # 3) 端到端：带 NaN 的 CSV 必须跑完
+    with tempfile.TemporaryDirectory() as td:
+        p = os.path.join(td, "dirty.csv")
+        L = ["时间,机台,面密度,膜厚,温度"]
+        rnd = random.Random(7)
+        for i in range(40):
+            nan1 = "NaN" if i % 7 == 0 else "%.2f" % (108 + rnd.gauss(0, 0.3))
+            inf1 = "Infinity" if i % 11 == 0 else "%.2f" % (12 + rnd.gauss(0, 0.2))
+            L.append("2026-01-01 %02d:%02d,M%d,%s,%s,%.1f"
+                     % (8 + i // 60, i % 60, i % 2 + 1, nan1, inf1,
+                        25 + rnd.gauss(0, 0.1)))
+        io.open(p, "w", encoding="utf-8", newline="\n").write("\n".join(L) + "\n")
+        err = None
+        try:
+            res = PL.analyze([p], outdir=os.path.join(td, "out"),
+                             target="面密度", do_doe=False, max_charts=0)
+            check("带 NaN/inf 的 CSV 能出报告",
+                  (not res.get("error")) and bool((res.get("outputs") or {}).get("md")),
+                  str(res.get("error"))[:80])
+        except Exception as e:
+            err = "%s: %s" % (type(e).__name__, str(e)[:100])
+        check("带 NaN/inf 的 CSV 不抛异常", err is None, err or "")
+
+
+def test_realdata_provenance():
+    """真实数据印证回路：来源元数据必须齐，残缺数据必须声明。
+
+    这条守的是"数据可信"，不是"算得对"：
+      · 没有 source.json 的用例必须被拒收（说不清来路的数据，结论无法追溯）；
+      · 声明 truncated 却没写 truncation_note 必须拒收；
+      · 未声明截断且行列数与声明差很大时必须阻断（否则会把"下载被截断"
+        读成"这份数据只有这么点"，进而得出"样本太少"的错误结论——实测踩过）。
+    """
+    print("\n[真实数据印证：来源与完整性校验]")
+    sys.path.insert(0, os.path.join(ROOT, "scripts"))
+    import realdata_check as RD
+    import json as _json
+
+    with tempfile.TemporaryDirectory() as root:
+        # 用例 1：完全合规
+        okd = os.path.join(root, "good")
+        os.makedirs(okd)
+        io.open(os.path.join(okd, "data.csv"), "w",
+                encoding="utf-8", newline="\n").write("a,b\n1,2\n3,4\n")
+        _json.dump({"source_url": "https://example.org/x",
+                    "retrieved_at": "2026-10-30", "publisher": "Example",
+                    "caliber_note": "测试用"},
+                   io.open(os.path.join(okd, "source.json"), "w", encoding="utf-8"))
+        r = RD.assess(okd)
+        check("合规用例通过来源校验", r["ok"] and not r["problems"], str(r["problems"]))
+
+        # 用例 2：缺 source.json → 必须拒收
+        bad1 = os.path.join(root, "nosrc")
+        os.makedirs(bad1)
+        io.open(os.path.join(bad1, "data.csv"), "w",
+                encoding="utf-8", newline="\n").write("a,b\n1,2\n")
+        r2 = RD.assess(bad1)
+        check("缺 source.json 被拒收", (not r2["ok"]) and r2["problems"], "")
+
+        # 用例 3：缺必填字段 → 拒收
+        bad2 = os.path.join(root, "nofield")
+        os.makedirs(bad2)
+        io.open(os.path.join(bad2, "data.csv"), "w",
+                encoding="utf-8", newline="\n").write("a,b\n1,2\n")
+        _json.dump({"source_url": "https://example.org/y", "retrieved_at": "2026-10-30"},
+                   io.open(os.path.join(bad2, "source.json"), "w", encoding="utf-8"))
+        r3 = RD.assess(bad2)
+        check("缺必填字段(发布方/口径)被拒收", not r3["ok"], str(r3["problems"])[:80])
+
+        # 用例 4：声明截断但没写说明 → 拒收
+        bad3 = os.path.join(root, "notruncnote")
+        os.makedirs(bad3)
+        io.open(os.path.join(bad3, "data.csv"), "w",
+                encoding="utf-8", newline="\n").write("a,b\n1,2\n")
+        _json.dump({"source_url": "https://example.org/z", "retrieved_at": "2026-10-30",
+                    "publisher": "Example", "caliber_note": "x", "truncated": True},
+                   io.open(os.path.join(bad3, "source.json"), "w", encoding="utf-8"))
+        r4 = RD.assess(bad3)
+        check("声明截断却无说明被拒收", not r4["ok"], str(r4["problems"])[:80])
+
+        # 用例 5：未声明截断且行列数差很多 → 阻断（这正是代理截断那个坑）
+        bad4 = os.path.join(root, "rowsmismatch")
+        os.makedirs(bad4)
+        io.open(os.path.join(bad4, "data.csv"), "w",
+                encoding="utf-8", newline="\n").write("a,b\n1,2\n3,4\n")
+        _json.dump({"source_url": "https://example.org/w", "retrieved_at": "2026-10-30",
+                    "publisher": "Example", "caliber_note": "x",
+                    "declared_rows": 1567},
+                   io.open(os.path.join(bad4, "source.json"), "w", encoding="utf-8"))
+        r5 = RD.assess(bad4)
+        check("未声明截断而行列数差很大 → 阻断",
+              (not r5["ok"]) and any("未声明 truncated" in p for p in r5["problems"]),
+              str(r5["problems"])[:100])
+
+        # 用例 6：sha256 不符 → 阻断
+        bad5 = os.path.join(root, "badsha")
+        os.makedirs(bad5)
+        io.open(os.path.join(bad5, "data.csv"), "w",
+                encoding="utf-8", newline="\n").write("a,b\n1,2\n")
+        _json.dump({"source_url": "https://example.org/v", "retrieved_at": "2026-10-30",
+                    "publisher": "Example", "caliber_note": "x",
+                    "sha256": "0" * 64},
+                   io.open(os.path.join(bad5, "source.json"), "w", encoding="utf-8"))
+        r6 = RD.assess(bad5)
+        check("sha256 不符被阻断",
+              (not r6["ok"]) and any("sha256" in p for p in r6["problems"]),
+              str(r6["problems"])[:100])
+
+    # 仓库里真实的 realdata/ 用例必须全部合规（防止有人塞无来源数据进仓库）
+    rd_root = os.path.join(ROOT, "realdata")
+    if os.path.isdir(rd_root):
+        bad = []
+        for c in sorted(os.listdir(rd_root)):
+            d = os.path.join(rd_root, c)
+            if not os.path.isdir(d):
+                continue
+            rep = RD.assess(d)
+            if not rep["ok"]:
+                bad.append((c, rep["problems"][:1]))
+        check("仓库 realdata/ 下每个用例都有完整来源", not bad, str(bad)[:160])
+
+
 def test_quality_manager_guide():
     """面向质量经理的「报告解读入门」（评审 P3-1）。
 
@@ -5728,6 +5896,8 @@ if __name__ == "__main__":
     test_fmea_rpn_and_gate()
     test_semiconductor_slice()
     test_semiconductor_deep_capability()
+    test_realworld_dirty_values()
+    test_realdata_provenance()
     print("\n" + "=" * 56)
     print("通过 %d 项，失败 %d 项" % (len(PASS), len(FAIL)))
     if FAIL:

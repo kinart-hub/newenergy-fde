@@ -14,6 +14,7 @@
 
 所有函数仅依赖标准库。
 """
+import math
 import re
 import copy
 
@@ -51,17 +52,34 @@ def _norm(name):
 
 
 def _to_float(v):
+    """转 float；**任何非有限值一律返回 None**。
+
+    为什么必须在源头挡住 NaN/±inf（真实数据抓出来的 bug）：
+        UCI SECOM 真实晶圆厂数据里缺失值写成 "NaN"（大写），4.9% 的单元格是它。
+        原实现只把 "nan"（小写）列进空值表，于是 "NaN" 走到 float("NaN") → nan，
+        再进入 `round(x)` 直接抛 ValueError: cannot convert float NaN to integer，
+        整条 analyze 崩掉。仿真数据里从不出现 NaN 字符串，所以自检一直没抓到。
+        同理 "Infinity"/"inf"/"1e400" 会变成 inf，参与比较与取整都会出错。
+
+    在源头（这一个函数）挡，比在每个调用点挡可靠——调用点会新增，函数只有一个。
+    """
     if v is None:
         return None
-    if isinstance(v, (int, float)):
+    if isinstance(v, bool):
         return float(v)
+    if isinstance(v, (int, float)):
+        f = float(v)
+        return f if math.isfinite(f) else None
     s = str(v).strip().replace(",", "").replace("．", ".").replace("，", "")
-    if s in ("", "-", "—", "NA", "N/A", "nan"):
+    if s.lower() in ("", "-", "—", "na", "n/a", "nan", "null", "none", "inf",
+                     "+inf", "-inf", "infinity", "+infinity", "-infinity"):
         return None
     try:
-        return float(s)
+        f = float(s)
     except ValueError:
         return None
+    # "1e400" 这类溢出成 inf 的也要挡掉
+    return f if math.isfinite(f) else None
 
 
 def column_role(name, values=None):

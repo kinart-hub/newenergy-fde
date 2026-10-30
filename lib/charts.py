@@ -28,6 +28,18 @@ def _esc(s):
 
 
 def _nice_ticks(lo, hi, n=5):
+    """把 [lo, hi] 切成"好看"的刻度。
+
+    **必须先挡非有限值**：真实数据导出里会出现 "Infinity"/"1e400"，
+    它们经 to_number 变成 inf，若漏到这里，`math.floor(math.log10(inf))`
+    会抛 OverflowError: cannot convert float infinity to integer，
+    整条 analyze 崩掉（实测被 UCI SECOM 真实数据抓出）。
+    table.numeric_column 已在源头挡了一层，这里是第二道——
+    坐标轴是纯展示逻辑，任何情况下都不该成为崩溃点。
+    """
+    if not (math.isfinite(lo) and math.isfinite(hi)):
+        lo = lo if math.isfinite(lo) else 0.0
+        hi = hi if math.isfinite(hi) else lo + 1.0
     if lo == hi:
         lo, hi = lo - 1, hi + 1
     span = hi - lo

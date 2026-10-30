@@ -672,6 +672,8 @@ AUDIT_FILES = [
     os.path.join("lib", "toolmatch.py"),
     os.path.join("lib", "recipe.py"),
     os.path.join("lib", "defectchar.py"),
+    # 规则 84：真实数据印证的来源校验。缺了它变异注不进 → 基线判不过
+    os.path.join("scripts", "realdata_check.py"),
     os.path.join("knowledge", "process_specs.json"),
 ]
 
@@ -3230,6 +3232,48 @@ def rule_stat_assert_has_closed_form():
     return _r(True, "", {"ok": True})
 
 
+def rule_realdata_requires_provenance():
+    """真实数据印证必须带完整来源，残缺数据必须声明。
+
+    为什么这条必须存在：这一层唯一的产出是"这个技能符不符合行业要求"的**证据**。
+    证据的第一要件不是数字，是**可追溯**——一份说不清从哪来的数据，
+    它的结论和编出来的结论在下游看起来一模一样。
+
+    实测踩过的两件事：
+      1. 代理把 UCI SECOM 的 9MB 文件截断到 446KB。若不校验，
+         "下载被截断"会被读成"这份数据只有 130 行"，进而得出"样本太少"的错误结论。
+      2. analyze 在真实数据上抛异常（NaN 崩溃），若把"崩了"和
+         "跑了但 0 命中"混成一个结果，会把工具崩溃报成"仅统计可用"。
+
+    判据（形态级）：
+      1. 必有 RECIPE 式的必填字段集，且缺任何一个就返回不可用；
+      2. 必须有 truncated → truncation_note 的强制配对检查；
+      3. 必须有 sha256 与行列数双校验；
+      4. analyze 崩溃必须与 0 命中分开判定（analyze_ok / verdict 赋值存在）。
+    """
+    t = _read(os.path.join("scripts", "realdata_check.py")) or ""
+    if not t:
+        return _r(False, "读不到 scripts/realdata_check.py")
+    if "REQUIRED = (" not in t or "source_url" not in t:
+        return _r(False, "没有必填来源字段集 REQUIRED —— 凭什么判定来源完整")
+    # 判据必须落在**守卫条件本身**：只查"没有来源的数据一律拒收"这句说明文字，
+    # 把 `if not os.path.exists(p):` 改成 `if False:` 照样能过（实测漏抓过一次）。
+    if not re.search(r"if not os\.path\.exists\(p\):", t):
+        return _r(False, "缺 source.json 时没有真正拒收的守卫（守卫条件不见了）")
+    if not re.search(r'if meta\.get\("truncated"\) and not str\(meta\.get\("truncation_note"\)',
+                     t):
+        return _r(False, "truncated → truncation_note 的强制配对守卫不见了"
+                        "（只剩常量与文案）")
+    if "sha256" not in t:
+        return _r(False, "没有 sha256 完整性校验")
+    # analyze 崩了必须单独判：这是把"工具被真实数据打崩"如实报出来的唯一途径
+    if '"analyze_ok"' not in t:
+        return _r(False, "没有 analyze_ok 标志——会把崩溃与 0 命中混为一谈")
+    if "不可用（analyze 抛异常" not in t:
+        return _r(False, "analyze 抛异常时没有专门的判定值——会被含糊成『仅统计可用』")
+    return _r(True, "", {"ok": True})
+
+
 def rule_test_restores_own_global_root():
     """测试切了某模块的全局 root，必须在 finally 还原**该模块自己的** root。
 
@@ -4649,6 +4693,20 @@ AUDIT_RULES = [
           _mutant("去掉期望频数体检的判定条件（修复退化：小样本制造假显著）",
                   _sub("ratio > MAX_LOW_EXPECTED_RATIO", "False"),
                   DEFECTCHAR_FILE)]),
+    Rule("真实数据印证必须带完整来源，残缺数据必须声明",
+         rule_realdata_requires_provenance,
+         "必须有必填来源字段集（缺任一即拒收）、truncated→truncation_note 强制配对、"
+         "sha256 与行列数双校验、analyze 崩溃与 0 命中分开判定。"
+         "这一层的产出是证据，证据的第一要件是可追溯；"
+         "实测代理截断把 9MB 截成 446KB，不校验就会被读成『只有 130 行』。",
+         os.path.join("scripts", "realdata_check.py"),
+         [_mutant("删掉无来源即拒收的判定（修复退化：来路不明的数据也进库）",
+                  _sub('    if not os.path.exists(p):', '    if False:'),
+                  os.path.join("scripts", "realdata_check.py")),
+          _mutant("去掉 truncated→truncation_note 的强制配对",
+                  _sub('if meta.get("truncated") and not str(meta.get("truncation_note") or "").strip():',
+                       "if False:"),
+                  os.path.join("scripts", "realdata_check.py"))]),
 ]
 
 

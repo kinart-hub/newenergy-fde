@@ -1,0 +1,13 @@
+{
+  "source_url": "https://archive.ics.uci.edu/dataset/179/secom",
+  "retrieved_at": "2026-10-30",
+  "publisher": "UCI Machine Learning Repository",
+  "license": "CC BY 4.0（UCI 数据集页标注）",
+  "caliber_note": "真实半导体晶圆厂制程数据。原始 1567 样本 × 591 个匿名化制程参数，标签 +1=合格 / -1=不合格。**列名被匿名化为 X1..Xn，无工艺含义**（原表即如此，UCI 为保密未公开参数名）。本次仅取得部分行：下载经代理在 ~1MB 处被截断，用 deflate 部分解压得到前若干完整行。",
+  "declared_rows": 1567,
+  "declared_cols": 591,
+  "sha256": "af983484b1d3d73db6a54b41fd931aa33d4b729a3c479b7e6dae24a06ff7f5cf",
+  "truncated": true,
+  "truncation_note": "代理截断：完整 zip 应有 secom.data 全量 1567 行，实际只解出前 160 行（列数完整）。因此本用例**只作健壮性与列名覆盖度印证，不作统计显著性结论**。",
+  "notes": "标签文件 secom_labels.data（+1/-1）未随本次样本一起落盘，故无 truth.json"
+}

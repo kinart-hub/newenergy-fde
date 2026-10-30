@@ -12,6 +12,7 @@ table.py —— 零依赖表格引擎（CSV / XLSX 读写）
 from . import degrade
 import csv
 import io
+import math
 import os
 import re
 import zipfile
@@ -218,8 +219,23 @@ class Table(object):
                                                  for r in self.rows])
 
     def numeric_column(self, name):
-        return self._cached(("num", name),
-                            lambda: [to_number(v) for v in self.column(name)])
+        """取一列的数值（不可用的位置给 None）。
+
+        这里**必须把非有限值（inf/-inf/NaN/1e400 溢出）也挡成 None**。
+        真实晶圆厂数据（UCI SECOM）里缺失值写作 "NaN"，还有 "Infinity" 这类
+        导出残留；to_number 出于兼容性会放行 inf（见 stats.is_num 的说明），
+        若这一层不挡，inf 会一路流进 SPC -> 控制图坐标轴计算 ->
+        `charts._nice_ticks` 里 `math.floor(log10(inf))` 抛 OverflowError，
+        整条 analyze 崩掉。实测踩过。
+        "数值列"这个 API 的语义就是"可用于统计的数"，inf 不在此列。
+        """
+        def _f():
+            out = []
+            for v in self.column(name):
+                f = to_number(v)
+                out.append(f if (f is not None and math.isfinite(f)) else None)
+            return out
+        return self._cached(("num", name), _f)
 
     def numeric_columns(self):
         return self._cached(

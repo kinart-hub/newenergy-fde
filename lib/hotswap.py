@@ -83,7 +83,7 @@ def read_text_retry(path, encoding="utf-8", retries=20, base_delay=0.01,
     raise last
 
 
-def atomic_write_text(path, text, retries=20, base_delay=0.01, max_delay=0.05):
+def atomic_write_text(path, text, retries=40, base_delay=0.01, max_delay=0.05):
     """
     写入文本：tmp + os.replace，Windows 上 replace 失败则退避重试。
 
@@ -96,6 +96,11 @@ def atomic_write_text(path, text, retries=20, base_delay=0.01, max_delay=0.05):
        单次最多睡 0.05s，20 次总耗时约 0.9s，覆盖更密。
     2. 抖动不可省：两个进程同时写同一文件时，固定步长的退避会让它们
        **同步重试、反复对撞**（惊群），加了抖动才能错开。
+
+    3. 重试次数 20 → 40（2026-10-30）。20 次的预算约 1 秒，单跑自检从不失败，
+       但在门禁全量跑（磁盘已饱和）时偶发耗尽，于是"并发原子写"这条断言
+       时红时绿。写不进去是**容量**问题不是正确性问题，但门禁不确定本身就是缺陷，
+       所以宁可多留一倍预算。单次最长仍 0.05s，总预算约 2 秒。
     """
     import random
     # 写之前先过一遍租户写入闸门：这里是最底层的一次真正的落盘，
@@ -174,9 +179,26 @@ def _cleanup(tmp):
         degrade.note("hotswap._cleanup@L116", _dg_e)
 
 
-def atomic_write_json(path, data, retries=12, base_delay=0.02):
+def atomic_write_json(path, data, retries=None, base_delay=None):
+    """JSON 落盘。重试预算**跟随 atomic_write_text 的默认值**，不另立一套。
+
+    历史坑（2026-10-30 实测抓到）：这里原本硬写 `retries=12, base_delay=0.02`，
+    而 `atomic_write_text` 的默认是 20。于是：
+      · 调 `atomic_write_text` 的地方有 20 次预算，
+      · 调 `atomic_write_json` 的地方只有 12 次（约 0.4 秒）。
+    磁盘饱和时 JSON 那条路先耗尽 → 报"原子写失败（已重试 12 次）"，
+    而并发自检正是走 JSON 这条路过 → 门禁时红时绿，单跑三四次才复现一次。
+    只改 text 的默认值是没用的：JSON 把自己的默认值传下去，把上层预算覆盖掉了。
+
+    所以这里传 None 表示"用下层默认"，两处预算从此只有一个真源。
+    """
+    kw = {}
+    if retries is not None:
+        kw["retries"] = retries
+    if base_delay is not None:
+        kw["base_delay"] = base_delay
     return atomic_write_text(path, json.dumps(data, ensure_ascii=False, indent=2),
-                             retries=retries, base_delay=base_delay)
+                             **kw)
 
 
 def _bump(path):
