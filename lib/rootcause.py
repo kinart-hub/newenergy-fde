@@ -910,12 +910,28 @@ def _data_sufficiency(table, target_col, cands):
                 "reason": "有效样本仅 %d 个（低于 %d），相关系数不稳定，"
                           "本次排序顺序不可靠，只能作线索清单用"
                           % (n_effective, MIN_N_FOR_RANKING)}
+    # 候选为空 与 "候选有但都没数据支持" 是**完全不同的两种处境**，
+    # 处置动作也不同（前者去补列映射/知识条目，后者去补数据/补规格）。
+    # 曾经两者共用一句"真因可能不在知识库收录范围内"，于是列名全认不出来的
+    # 数据（实测 E07：10 列里只映射上 1 列）会被告知"去补知识库"——
+    # 依据指错了方向，比不给理由更糟：用户会照着错的方向白干一轮。
+    if not cands:
+        return {"status": ST.NO_FINDING, "n_rows": rows,
+                "n_effective": n_effective, "target_present": True,
+                "n_data_backed": 0, "n_candidates": 0,
+                "reason": "本次**没有任何候选进入排序**（候选数 0）。"
+                          "常见原因是：该工序在知识库里没有机理条目，"
+                          "或表里的列名与知识库参数名对不上、一个都没映射成功。"
+                          "这不是「查过了、都不是原因」，先看报告里的列映射明细再补数据"}
     if n_data_backed == 0:
         return {"status": ST.NO_FINDING, "n_rows": rows, "n_effective": n_effective,
                 "target_present": True, "n_data_backed": 0,
-                "reason": "数据已够（%d 个有效样本），但没有任何候选拿到数据支持——"
-                          "真因可能不在知识库收录范围内，"
-                          "而不是「检查过、都不是原因」" % n_effective}
+                "n_candidates": len(cands),
+                "reason": "数据已够（%d 个有效样本），进入排序的候选有 %d 条，"
+                          "但**没有一条能拿到本轮数据的支持**——"
+                          "多数情况是候选参数在表里找不到对应列、或该列有效值太少。"
+                          "这是「有候选、但验不了」，不是「检查过、都不是原因」"
+                          % (n_effective, len(cands))}
     return {"status": ST.SUCCESS, "n_rows": rows, "n_effective": n_effective,
             "target_present": True, "n_data_backed": n_data_backed,
             "reason": ""}

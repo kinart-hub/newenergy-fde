@@ -189,7 +189,62 @@ PERMANENT_BY_VERDICT = {
     "上游带入嫌疑高": [
         "先补上游的完整批次数据再定性（当前证据只到'相关'，还没到'越限'）",
     ],
+    # 单文件场景专用。**不能套用"本工序主导"**：那个结论的意思是
+    # "看过上游数据、排除了上游"，而单文件时上游数据根本不存在，
+    # 硬说"本工序主导"是把"没查"说成"查过没问题"——这是本工具最不能犯的错。
+    "仅本工序（未做跨工序追溯）": [
+        "把已识别的本工序关键参数纳入控制计划并按 SPC 纳管，重点是触发判异的那一项",
+        "若人机料法中与该项相关的设定可固化（工艺卡 / 配方版本），则写死并加锁",
+        "**本次只有本工序数据**：上游来料是否同源尚未验证。要区分'本工序造成'与'上游带入'，"
+        "必须补上上游工序的检测数据再跑一次跨工序追溯",
+    ],
 }
+
+
+def self_trace_from_result(result, target_col=None):
+    """把单表分析的结果拼成一份"只有本工序"的追溯输入。
+
+    为什么需要它
+    ------------------------------------------------------------------
+    `permanent_actions` / `preventive` 的入参原本只有 `crossprocess.trace()`
+    的产物，而 trace 要求**至少两张表**。于是只给一份数据时（最常见的用法），
+    整块行动建议被跳过 —— 报告里"永久对策""预防措施""横向展开"三节
+    从来不出现，使用者以为这个工具只会算 Cpk。
+
+    实测数据：单文件场景下这三块**全部为空**，而双文件场景下永久对策出 5 条。
+    同一份数据形态，只因为多给了第二个工序文件，行动建议就从无到有。
+
+    这里用 `strong_pairs`（参数-目标的相关性）构造等价的 contributions，
+    让行动建议在单文件下也能出，并且**在 verdict 里明确写"仅本工序"**，
+    避免把"没查上游"说成"排除上游"。
+    """
+    pairs = (result or {}).get("strong_pairs") or []
+    if not pairs:
+        return None
+    contribs = []
+    for p in pairs:
+        # strong_pairs 是 (a, b) 对；只取"以目标为 b"的那些
+        col, tgt = p.get("a"), p.get("b")
+        r, pv = p.get("r"), p.get("p")
+        if col is None or r is None:
+            continue
+        if target_col and tgt != target_col:
+            continue
+        contribs.append({"column": col, "role": "current",
+                         "param_process": None,
+                         "corr": {"r": r, "p": pv},
+                         # 没有对比探针（那要两份数据才有），如实置空
+                         "probe": None})
+    if not contribs:
+        return None
+    contribs.sort(key=lambda c: -abs((c.get("corr") or {}).get("r") or 0))
+    return {"applicable": False, "self_only": True,
+            "verdict": "仅本工序（未做跨工序追溯）",
+            "verdict_reason": "只有单道工序的数据，无法区分'本工序造成'与'上游带入'",
+            "contributions": contribs,
+            "top_param": contribs[0]["column"] if contribs else None,
+            "notes": ["本次只给了单道工序的数据：行动建议基于本工序归因，"
+                      "上游来源未经验证"]}
 
 
 def permanent_actions(trace_result, defect=None, current_process=None, param_key=None):
@@ -257,26 +312,86 @@ PREVENT_TEMPLATE = [
 
 
 def preventive(trace_result, table=None, target_col=None, kb=None, process=None):
-    """
-    预防性建议：落到具体参数、具体方向、具体监控方式。
+    """预防性建议：落到具体参数、具体方向、具体监控方式。
 
     逻辑：把判定为"有区分力"的参数（含上游），按其均值位势给出收严/放宽方向，
     并区分"要纳管的新参数"与"只需调整现有窗口的参数"。
+
+    `process` / `kb` / `table` / `target_col` 的用途（原先四个参数收了全不用，
+    于是"涂布"和"焊接"拿到的预防建议一模一样）：
+
+      · `process`  —— 定位工序名与工序专属的纳管对象（知识库里该工序的
+        典型参数），让建议落到"这张工艺卡"而不是"某个工艺卡"；
+      · `kb`      —— 允许调用方传入已加载的知识库（租户覆盖后的版本），
+        不传时才自己去读；**必须用调用方给的那份**，否则租户覆盖会被绕过；
+      · `table`/`target_col` —— 用于给出"目标列当前处在窗口什么位置"，
+        没有这层信息就无法说"该收严还是还有余量"。
     """
-    out = {"params": [], "monitoring": [], "templates": PREVENT_TEMPLATE, "notes": []}
+    out = {"params": [], "monitoring": [], "templates": list(PREVENT_TEMPLATE),
+           "notes": []}
+
+    # 工序上下文：名称 + 该工序在知识库里登记的参数（用于把建议落到具体工艺卡）
+    _proc_name, _proc_keys = None, []
+    try:
+        _k = kb if isinstance(kb, dict) else PP.load_knowledge()
+        _pentry = ((_k or {}).get("processes") or {}).get(process) or {}
+        _proc_name = _pentry.get("name")
+        _proc_keys = list((_pentry.get("params") or []))
+    except Exception as _pe:
+        out["notes"].append("工序上下文读取失败（%s）：以下建议未落到具体工序" % str(_pe)[:60])
+    if process and not _proc_name:
+        out["notes"].append(
+            "工序 key「%s」在知识库里没有对应条目：预防建议只能给通用形态，"
+            "请确认工序名或补该工序的知识条目" % process)
+    if _proc_name:
+        out["templates"] = [
+            "**工序：%s**——下面的窗口与门限请写进该工序的工艺卡/控制计划，"
+            "而不是笼统的'加强管理'" % _proc_name] + list(PREVENT_TEMPLATE)
+
+    # 目标列当前位势：决定"该收严"还是"还有余量"
+    _tgt_pos = None
+    if table is not None and target_col:
+        try:
+            _vals = [v for v in table.numeric_column(target_col) if v is not None]
+            if len(_vals) >= 5:
+                _m = S.mean(_vals)
+                _sp = getattr(table, "spec_for", None)
+                _tgt_pos = {"mean": round(_m, 4), "n": len(_vals)}
+                if callable(_sp):
+                    _sc = _sp(target_col) or {}
+                    if _sc.get("lsl") is not None and _sc.get("usl") is not None:
+                        _lo, _hi = _sc["lsl"], _sc["usl"]
+                        _tgt_pos["position"] = round((_m - _lo) / float(_hi - _lo), 3)
+        except Exception as _te:
+            out["notes"].append("目标列位势计算失败（%s）" % str(_te)[:50])
+    if _tgt_pos:
+        out["target_position"] = _tgt_pos
     contribs = (trace_result or {}).get("contributions") or []
     hit = [c for c in contribs
            if (c.get("corr") or {}).get("r") is not None
            and abs(c["corr"]["r"]) >= 0.4 and S.is_sig((c["corr"] or {}).get("p"))]
     for c in hit[:5]:
         probe = c.get("probe") or {}
-        direction = "偏低" if (probe.get("delta") or 0) < 0 else "偏高"
+        # 方向只能来自对比探针（好件/坏件的均值差）。没有探针时**不许默认一个方向**：
+        # 原实现写 `0 < 0` 恒假 → 一律输出"偏高"，等于替现场编了个方向。
+        # 单文件场景没有探针，这条分支会经常走到，所以必须诚实置空。
+        if probe.get("delta") is None:
+            direction = None
+        else:
+            direction = "偏低" if probe["delta"] < 0 else "偏高"
+        if direction:
+            sug = ("把「%s」纳入该工序的日常监控并设内控线；坏件一侧靠%s，"
+                   "窗口应向不敏感的一侧收" % (c["column"], direction))
+        else:
+            sug = ("把「%s」纳入该工序的日常监控并设内控线；"
+                   "**收严还是放宽需现场确认**——本次没有好件/坏件对比数据，"
+                   "不替你定方向（方向搞反会让问题更严重）" % c["column"])
         out["params"].append({
             "column": c["column"], "role": c["role"],
             "param_process": c.get("param_process"),
             "r": c["corr"]["r"], "p": c["corr"]["p"],
-            "suggestion": "把「%s」纳入该工序的日常监控并设内控线；坏件一侧靠%s，"
-                          "窗口应向不敏感的一侧收" % (c["column"], direction),
+            "direction": direction,
+            "suggestion": sug,
         })
     if not hit:
         out["notes"].append("本次没有找到与目标显著相关的参数，无法给出具体的预防窗口——"

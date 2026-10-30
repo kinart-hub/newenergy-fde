@@ -386,6 +386,49 @@ def test_pipeline():
             check("流水线 %s" % name, ok, "图表%d个" % charts)
         except Exception as e:
             check("流水线 %s" % name, False, "异常: %s" % e)
+
+    # 示例的**外部配套文件**必须也跑一遍。
+    #
+    # 实测事故：上面这个循环只调 `PL.analyze([csv])`，从不带 `--spec`，
+    # 于是 `examples/08_跨规格版本数据.csv` 配 `examples/08_规格版本.json`
+    # 这条**仓库自带的示例路径**从来没被任何测试走过。它实际上是崩的：
+    # `pipeline.pick_target` 把多版本规格（list）当 dict 用 `.get("lsl")`，
+    # `fde_run.py analyze --spec examples/08_规格版本.json` 直接 AttributeError，
+    # 一份报告都出不来——而 1087 项自检全绿。
+    #
+    # 判据不是"记得测 08"，而是"示例自带的输入文件必须能喂进它自己"，
+    # 这样以后任何新示例配了新输入都会自动被覆盖。
+    _ext = {"08": ("08_规格版本.json", "spec_overrides"),
+            "09": (None, None), "10": (None, None)}
+    for pre, (fn, kw) in _ext.items():
+        if not fn:
+            continue
+        fp = os.path.join(ROOT, "examples", fn)
+        csvs = [f for f in files
+                if os.path.basename(f).startswith(pre + "_")]
+        if not csvs or not os.path.exists(fp):
+            check("示例配套文件 %s 存在" % fn, False, "缺失")
+            continue
+        try:
+            sp = json.loads(io.open(fp, encoding="utf-8").read())
+        except Exception as e:
+            check("示例配套文件 %s 可解析" % fn, False, str(e)[:80])
+            continue
+        try:
+            r2 = PL.analyze([csvs[0]],
+                            outdir=os.path.join(ROOT, "output", "_test",
+                                                pre + "_ext"),
+                            **{kw: sp})
+            ver = [(p.get("spec_versioning") or {})
+                   for p in (r2.get("spc") or [])]
+            nver = max([v.get("n_segments") or 0 for v in ver] or [0])
+            check("示例 %s 配上自己的 %s 能跑通且规格版本化生效"
+                  % (os.path.basename(csvs[0]), fn),
+                  (not r2.get("error")) and nver >= 2,
+                  "分段数=%d" % nver)
+        except Exception as e:
+            check("示例 %s 配上自己的 %s 能跑通" % (os.path.basename(csvs[0]), fn),
+                  False, "异常: %s: %s" % (type(e).__name__, str(e)[:80]))
     # 缺陷根因引擎
     kb_path = os.path.join(ROOT, "knowledge", "process_specs.json")
     check("知识库可加载", os.path.exists(kb_path) and len(PP.load_knowledge()["params"]) > 40,
@@ -5182,6 +5225,79 @@ def test_semiconductor_slice():
               "%s" % ([c.get("param_name") for c in cands[:2]],))
 
 
+def test_cross_module_coherence():
+    """跨模块协同：模块写好了，主流程到底有没有用上它的产出。
+
+    这一组的每一条都对应一次真实事故，共同特征是——
+    **单测全绿、模块自身没毛病，坏在"接在前一个模块之后"这一层**。
+    """
+    print("\n[跨模块协同：行动建议 / 清洗叙述 / 规格形态]")
+
+    # 1) 单文件（最常见用法）必须给出永久对策与预防措施。
+    #    事故：这两块原本整段写在 `if len(tables) > 1` 的跨工序分支里，
+    #    只给一份数据时整块跳过 → 报告里「永久措施」「预防建议」两节从不出现。
+    #    实测同一份涂布数据：单文件三块全空；追加一个卷绕文件后永久对策出 5 条。
+    _td = tempfile.mkdtemp(prefix="coh-")
+    try:
+        r1 = PL.analyze([os.path.join(ROOT, "examples", "01_涂布工艺数据.csv")],
+                        outdir=_td, do_doe=False, max_charts=0,
+                        export_xlsx=False, export_docx=False, export_pdf=False)
+        pm = r1.get("permanent") or {}
+        pv = r1.get("preventive") or {}
+        check("单文件也给出永久对策（不再依赖跨工序分支）",
+              len(pm.get("generic") or []) > 0,
+              "%d 条" % len(pm.get("generic") or []))
+        check("单文件也给出预防措施", len(pv.get("params") or []) > 0,
+              "%d 条" % len(pv.get("params") or []))
+        # 2) 但**不许**把"没查上游"说成"排除上游"：verdict 必须是"仅本工序"
+        acts = " ".join(str(g.get("action")) for g in (pm.get("generic") or []))
+        check("单文件的对策明确标注『只有本工序数据』",
+              "只有本工序" in acts or "未验证" in acts or "上游" in acts,
+              acts[:60])
+        # 3) 无对比数据时不许编造方向
+        dirs = [x.get("direction") for x in (pv.get("params") or [])]
+        check("无好件/坏件对比时不给出收严/放宽方向",
+              all(d is None for d in dirs) if dirs else True,
+              str(dirs[:3]))
+        # 4) 报错要说清是"有候选但验不了"还是"没有候选"
+        from lib import status as _ST
+        ds = (r1.get("rootcause") or {}).get("data_sufficiency") or {}
+        check("数据充分性结论带候选数（区分『有候选验不了』与『没候选』）",
+              "n_candidates" in ds or ds.get("status") == _ST.SUCCESS,
+              "n_candidates=%s" % ds.get("n_candidates"))
+    finally:
+        shutil.rmtree(_td, ignore_errors=True)
+
+    # 5) 清洗动作必须被叙述：检出了离群点却不在 actions 里留一句，
+    #    使用者看到"120 行进、120 行出"会以为没做过任何处理。
+    _td2 = tempfile.mkdtemp(prefix="coh2-")
+    try:
+        dirty = os.path.join(ROOT, "examples", "enterprises", "E07_小厂脏数据",
+                             "01_未知名仪器_自定义列名.csv")
+        r2 = PL.analyze([dirty], outdir=_td2, do_doe=False, max_charts=0,
+                        export_xlsx=False, export_docx=False, export_pdf=False)
+        cl = r2.get("clean") or {}
+        n_out = sum(int(v.get("count") or 0) for v in (cl.get("outliers") or {}).values())
+        acts = cl.get("actions") or []
+        check("检出离群点时清洗动作里有对应叙述",
+              (n_out == 0) or any("离群点" in str(a) for a in acts),
+              "检出%d个 | actions=%d条" % (n_out, len(acts)))
+    finally:
+        shutil.rmtree(_td2, ignore_errors=True)
+
+    # 6) 规格条目两种形态都必须吃得下：单版本 dict / 多版本 list。
+    #    事故：`pick_target` 写 `ov.get("lsl")`，多版本条目是 list → 崩，
+    #    而这正是仓库自带示例（08 数据 + 08 规格书）的组合。
+    b1 = PP.spec_entry_bounds({"lsl": 0, "usl": 300})
+    b2 = PP.spec_entry_bounds([{"version": "A", "usl": 300},
+                               {"version": "B", "usl": 250}])
+    check("规格归一：单版本 dict → 1 条边界", len(b1) == 1 and b1[0][1] == 300, str(b1))
+    check("规格归一：多版本 list → 2 条边界（不合并成一个区间）",
+          len(b2) == 2 and [x[1] for x in b2] == [300, 250], str(b2))
+    check("规格归一：查不到时返回空列表而不是抛异常",
+          PP.spec_entry_bounds(None) == [] and PP.spec_entry_bounds("abc") == [], "")
+
+
 def test_semiconductor_deep_capability():
     """半导体深度能力：工艺窗口 / 机台匹配 / 配方 / 缺陷表征接入。
 
@@ -5918,6 +6034,7 @@ if __name__ == "__main__":
     test_fmea_rpn_and_gate()
     test_semiconductor_slice()
     test_semiconductor_deep_capability()
+    test_cross_module_coherence()
     test_realworld_dirty_values()
     test_realdata_provenance()
     test_coherence_audit()

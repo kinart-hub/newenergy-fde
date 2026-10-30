@@ -672,6 +672,10 @@ AUDIT_FILES = [
     os.path.join("lib", "toolmatch.py"),
     os.path.join("lib", "recipe.py"),
     os.path.join("lib", "defectchar.py"),
+    # 规则 85 的变异体打在 actions.py 的 verdict 上；不进这张表，
+    # 变异副本里就没有这个文件 → 注不进 → 规则 85 变成**静默 SKIP**。
+    # SKIP 比 FAIL 危险：FAIL 告诉你有事，SKIP 让你以为门禁是好的。
+    os.path.join("lib", "actions.py"),
     # 规则 84：真实数据印证的来源校验。缺了它变异注不进 → 基线判不过
     os.path.join("scripts", "realdata_check.py"),
     os.path.join("knowledge", "process_specs.json"),
@@ -3232,6 +3236,80 @@ def rule_stat_assert_has_closed_form():
     return _r(True, "", {"ok": True})
 
 
+def rule_actions_not_gated_by_multifile():
+    """行动建议不得只挂在"多表"分支上。
+
+    事故：永久对策与预防措施整段写在 `if len(tables) > 1` 的跨工序块里，
+    于是只给**一份数据**（最常见的用法）时整块跳过，
+    报告里「永久措施」「预防建议」两节从来不出现。
+    实测同一份涂布数据：单文件跑 → 两块全空；再追加一个卷绕文件
+    → 永久对策出 5 条。同一批数据、同一工序，只因为多给了一个上游文件，
+    行动建议就从"没有"变成"有"。
+
+    判据（形态级）：
+      1. 必须存在"没有 permanent 就补"的兜底分支（`if not result.get("permanent")`）；
+      2. 兜底必须走"仅本工序"的输入构造（`self_trace_from_result`），
+         不允许直接用跨工序的 trace 结果冒充；
+      3. 兜底里的 verdict 不许写成「本工序主导」——那是"查过上游并排除"的意思，
+         与"没查"是两件事。
+    """
+    t = _read(PIPELINE_FILE) or ""
+    if not t:
+        return _r(False, "读不到 " + PIPELINE_FILE)
+    if 'if not result.get("permanent")' not in t:
+        return _r(False, "没有『permanent 为空就兜底』的分支——"
+                        "单文件场景下行动建议会整段缺席")
+    if "self_trace_from_result(" not in t:
+        return _r(False, "兜底没有走『仅本工序』的输入构造（self_trace_from_result）")
+    # 「仅本工序」这个 claim 的**产地**在 actions.self_trace_from_result，
+    # 不在 pipeline 的兜底块里。判据必须查产地：
+    # 第一版只查 pipeline 的兜底块，而变异体打在 actions 上 → 变异注进去了却没抓到
+    # （报 FAIL「未抓到的变异」，比 SKIP 好，但同样说明判据打偏了）。
+    act = _read(os.path.join("lib", "actions.py")) or ""
+    if not act:
+        return _r(False, "读不到 lib/actions.py")
+    j = act.find("def self_trace_from_result(")
+    if j < 0:
+        return _r(False, "self_trace_from_result 不在了")
+    abl = act[j:j + 2600]
+    if '"本工序主导"' in abl:
+        return _r(False, "self_trace_from_result 把 verdict 写成了「本工序主导」——"
+                        "那是『查过上游并排除』的意思，与『没查』不是一回事")
+    if "仅本工序" not in abl:
+        return _r(False, "self_trace_from_result 没有标注『仅本工序』的 verdict")
+    return _r(True, "", {"ok": True})
+
+
+def rule_spec_entry_any_shape():
+    """规格条目必须按"可能是单版本 dict、也可能是多版本 list"来消费。
+
+    事故：`pick_target` 写 `ov.get("lsl")`，而多版本规格书的值是 list，
+    于是 `fde_run.py analyze --input examples/08_跨规格版本数据.csv
+    --spec examples/08_规格版本.json` —— **仓库自带的示例配自己的示例数据**
+    —— 直接 AttributeError，一份报告都出不来。自检全绿，因为它从不带 --spec。
+
+    判据（形态级）：
+      1. 必须存在统一的归一化入口 `spec_entry_bounds(`；
+      2. pipeline 里不得再出现对规格条目直接 `.get("lsl")` / `.get("usl")`
+         的写法（那是"假设它一定是 dict"）。
+    """
+    t = _read(PIPELINE_FILE) or ""
+    pre = _read(PREPROCESS_FILE) or ""
+    if not t:
+        return _r(False, "读不到 " + PIPELINE_FILE)
+    if "def spec_entry_bounds(" not in pre:
+        return _r(False, "preprocess 里没有 spec_entry_bounds 归一化入口——"
+                        "每个消费方都会各自假设一种形态，迟早崩一个")
+    if "spec_entry_bounds(" not in t:
+        return _r(False, "pipeline 没有使用 spec_entry_bounds 归一化")
+    # 禁止裸取：ov.get("lsl") / _ov.get("lsl")
+    bad = re.findall(r'\b_?ov\.get\(\s*["\'](?:lsl|usl)["\']', t)
+    if bad:
+        return _r(False, "仍有代码把规格条目当 dict 直接用（%s）——"
+                        "多版本规格书会在这一步崩" % bad[0])
+    return _r(True, "", {"ok": True})
+
+
 def rule_realdata_requires_provenance():
     """真实数据印证必须带完整来源，残缺数据必须声明。
 
@@ -4707,6 +4785,33 @@ AUDIT_RULES = [
                   _sub('if meta.get("truncated") and not str(meta.get("truncation_note") or "").strip():',
                        "if False:"),
                   os.path.join("scripts", "realdata_check.py"))]),
+    Rule("行动建议不得只挂在多表分支上（单文件也必须有永久对策/预防措施）",
+         rule_actions_not_gated_by_multifile,
+         "必须有『permanent 为空就兜底』的分支、兜底走 self_trace_from_result、"
+         "且 verdict 不得写成「本工序主导」。实测同一份数据单文件时两块全空，"
+         "加一个上游文件后出 5 条。",
+         PIPELINE_FILE,
+         [_mutant("去掉单文件兜底（修复退化：最常见用法看不到行动建议）",
+                  _sub('if not result.get("permanent") and chosen_proc:',
+                       'if False and chosen_proc:'),
+                  PIPELINE_FILE),
+          _mutant("兜底改用跨工序 verdict（修复退化：没查上游却说排除上游）",
+                  _sub('"verdict": "仅本工序（未做跨工序追溯）",',
+                       '"verdict": "本工序主导",'),
+                  os.path.join("lib", "actions.py"))]),
+    Rule("规格条目必须按单版本/多版本两种形态统一消费",
+         rule_spec_entry_any_shape,
+         "必须有 spec_entry_bounds 归一化入口并被 pipeline 使用；"
+         "不得再对规格条目裸取 .get(\"lsl\")。实测仓库自带示例"
+         "（08 数据 + 08 规格书）会 AttributeError 崩溃，而自检从不带 --spec。",
+         PIPELINE_FILE,
+         [_mutant("把规格条目当 dict 裸取（修复退化：多版本书崩）",
+                  _sub('_bd = PP.spec_entry_bounds(_ov)',
+                       '_bd = [(_ov.get("lsl"), _ov.get("usl"), None, None)]'),
+                  PIPELINE_FILE),
+          _mutant("归一化入口消失（修复退化：各消费方各自假设形态）",
+                  _sub('def spec_entry_bounds(', 'def _spec_entry_bounds_gone('),
+                  os.path.join("lib", "preprocess.py"))]),
 ]
 
 

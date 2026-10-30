@@ -62,6 +62,10 @@ import sys
 # 在下游看起来一模一样——正是 D 类（静默空返回）要抓的东西。
 _SKIPPED = []
 
+# 被归类为"协议/统计量发布"而不是缺陷的条目。**必须打印条数**——
+# 静默排除会让审计看起来比实际干净，那是最危险的一种"变绿"。
+_CLASSIFIED = []
+
 
 def _skip(path, err):
     _SKIPPED.append({"file": _rel(path), "error": "%s: %s"
@@ -78,6 +82,50 @@ sys.path.insert(0, ROOT)
 #   2) dynamic     —— 通过 getattr/反射/插件机制调用，静态分析看不见
 #   3) platform    —— 平台入口（__main__ 分发、脚本 CLI）
 # **"暂时用不到"不是理由**——那是没接线。
+# ---------------------------------------------------------------- 分类规则
+# B/C 两类里有一批条目**本质上不是脱节**，把它们和真问题混在一起报，
+# 会让人误以为"脱节有 120 条"，进而整套审计被当成噪声忽略。
+# 所以按语义分类，并在报告里**分别计数**——分类不等于放过，条数必须报出来。
+#
+# 允许的三类：
+#   protocol   —— 语言/框架协议要求形参，调用方不可能不用它
+#   stats_api  —— 统计量的标准发布字段，供 JSON 消费方与外部集成读取
+#   _          —— 私有占位形参（以 _ 开头），调用方主动忽略
+# **"暂时用不到"不在这里**——那是没接线，必须留在真问题里。
+
+# __exit__ 的三个形参是 with 协议；sys.setprofile 回调必须收 frame/event/arg。
+_PROTOCOL_PARAMS = frozenset(["exc_type", "exc_val", "exc_tb", "tb",
+                              "frame", "event", "arg", "self", "cls"])
+
+# 统计结果的标准字段名。它们不是"内部接口"，而是**对外发布的量**：
+# 谁做外部集成、谁把 result.json 喂给 BI，读的就是这些名字。
+_STATS_FIELDS = frozenset([
+    "n", "n_valid", "n_effective", "df1", "df2", "resid", "fitted", "mse",
+    "std_err", "tvals", "pvals", "intercept", "slope", "intercept_t",
+    "intercept_p", "cohens_d", "sst", "sse", "ss_error", "ss_total",
+    "grand_mean", "effects", "interactions", "power", "n_replicates",
+    "n_blocks", "randomization", "coding", "runs_base", "names", "curve",
+    "cov", "bands", "overall_mean", "independent_after", "used_units",
+    "excluded_local", "prediction", "identified_score", "fingerprint_match",
+    "sigma_e", "h_units", "k_units", "c_minus", "alarm_high", "alarm_low",
+    "min_detectable_shift", "n_alarms", "alarm_indexes",
+])
+
+
+def _classify_param(name):
+    """形参是否为"协议/占位"类。返回类别名或 None。"""
+    if name in _PROTOCOL_PARAMS:
+        return "protocol"
+    if name.startswith("_"):
+        return "placeholder"
+    return None
+
+
+def _classify_output(name):
+    """产出字段是否为"统计量发布"类。"""
+    return "stats_api" if name in _STATS_FIELDS else None
+
+
 WHITELIST = {
     "lib/stats.py:t_test_1sample":
         ("public_api", "零依赖统计库对外 API；内部两样本走 t_test_2sample。"
@@ -220,6 +268,14 @@ def check_unused_params(files):
             for a in list(args.args) + list(args.kwonlyargs) + list(args.posonlyargs):
                 if a.arg in ("self", "cls") or a.arg.startswith("_"):
                     continue
+                _cls = _classify_param(a.arg)
+                if _cls:
+                    # 协议形参（__exit__ 的 exc_type/tb、setprofile 回调的 arg 等）
+                    # 不是缺陷：调用方（解释器）必须传，函数不用它是对的。
+                    _CLASSIFIED.append({"kind": "UNUSED_PARAM", "file": _rel(f),
+                                        "name": "%s(%s)" % (node.name, a.arg),
+                                        "cls": _cls})
+                    continue
                 names.append(a.arg)
             if not names:
                 continue
@@ -281,6 +337,14 @@ def check_dead_output(files, alltext):
                         continue
                     key = k.value
                     if len(key) < 3:
+                        continue
+                    # 统计量发布字段不算断头路：它们是对外发布的标准量，
+                    # 消费方在仓库外（BI / 外部集成 / 复核脚本）。
+                    # 但**必须计数并报出来**，不能静默排除。
+                    if _classify_output(key):
+                        _CLASSIFIED.append({"kind": "DEAD_OUTPUT", "file": _rel(f),
+                                            "name": "%s → %r" % (node.name, key),
+                                            "cls": "stats_api"})
                         continue
                     # 该 key 是否在别处被读取：形如 ["key"] 或 .get("key")
                     if alltext.count('"%s"' % key) > 1 or \
@@ -358,7 +422,7 @@ def check_silent_empty(files):
 
 # ---------------------------------------------------------------- E. 死 CLI 参数
 
-def check_dead_flags(files):
+def check_dead_flags(_files=None):
     """argparse 注册的参数，flow 函数体从不读。"""
     res = []
     fdr = os.path.join(ROOT, "scripts", "fde_run.py")

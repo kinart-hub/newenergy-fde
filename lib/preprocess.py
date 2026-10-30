@@ -571,6 +571,15 @@ def clean(table, missing="drop_rows", outlier="mad", outlier_k=4.5,
                 rep["outliers"][c] = {"method": outlier, "count": len(bad),
                                       "bound": [round(lo, 4), round(hi, 4)],
                                       "samples": [round(tb.numeric_column(c)[i], 4) for i in bad[:8]]}
+                # 检出了就必须在 actions 里留一句。原来这里只写 outliers 不写 actions，
+                # 于是报告"预处理"一节对这批离群点**一字不提**：使用者看到
+                # "120 行进、120 行出"就以为没做过任何处理，而实际上已经检出了 42 个点
+                # （实测 E07 小厂脏数据）。检出而不叙述，等于清洗环节对使用者不可追溯。
+                # 措辞要区分"标记"与"删除"：这里只标记，不能写成"已剔除"。
+                rep["actions"].append(
+                    "列 '%s' 检出 %d 个离群点（%s 法，界限 [%s, %s]），"
+                    "**仅标记未删除**——后续统计按需剔除，不做静默删除"
+                    % (c, len(bad), outlier, round(lo, 4), round(hi, 4)))
     rep["rows_out"] = len(tb.rows)
     rep["numeric_columns"] = tb.numeric_columns()
     return tb, rep
@@ -863,6 +872,39 @@ def unmatched_spec_keys(overrides, columns, col_map):
             continue
         out.append(k)
     return out
+
+
+def spec_entry_bounds(ov):
+    """把一条规格条目归一成 [(lsl, usl, target, version), ...]。
+
+    规格书有两种合法形态，消费方必须都吃得下：
+      · **单版本**：`{"lsl": 0, "usl": 300}` —— 一个 dict；
+      · **多版本**：`[{"version":"A","effective_from":"2024-01-01","usl":300},
+                     {"version":"B","effective_from":"2024-07-01","usl":250}]`
+        —— 一个 list，正是 `examples/08_规格版本.json` 的形态。
+
+    实测事故：`pipeline.pick_target` 与规格分段前的兜底分支都写成
+    `ov.get("lsl")`，把多版本条目当 dict 用，于是
+    `fde_run.py analyze --input examples/08_跨规格版本数据.csv
+     --spec examples/08_规格版本.json` —— **仓库自带的示例配自己的示例数据**
+     —— 直接 AttributeError 崩掉，一份报告都出不来。
+
+    多版本时**绝不合并成一个区间**（那等于又拿一把不存在的尺子）：
+    这里原样返回每一条，由调用方按语义决定用哪条、或者全部列出。
+    """
+    if ov is None:
+        return []
+    if isinstance(ov, dict):
+        return [(ov.get("lsl"), ov.get("usl"), ov.get("target"),
+                 ov.get("version"))]
+    if isinstance(ov, list):
+        out = []
+        for it in ov:
+            if isinstance(it, dict):
+                out.append((it.get("lsl"), it.get("usl"), it.get("target"),
+                            it.get("version")))
+        return out
+    return []
 
 
 # ─────────────────────────────────────────────────────────────

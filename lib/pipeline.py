@@ -321,14 +321,25 @@ def pick_target(table, user_target=None, spec_overrides=None, col_map=None):
             ov = PP.match_spec_key(c, col_map or {}, spec_overrides)
             if not ov:
                 continue
-            lsl, usl = ov.get("lsl"), ov.get("usl")
-            if lsl is None and usl is None:
+            # 规格条目可能是单版本 dict，也可能是多版本 list（示例里的
+            # 08_规格版本.json 就是 list）。直接把 ov 当 dict 用会崩，
+            # 而且是"仓库自带的示例跑不通"这种最不该有的崩法。
+            bounds = PP.spec_entry_bounds(ov)
+            if not bounds:
                 continue
             vals = [v for v in table.numeric_column(c) if v is not None]
             if len(vals) < 10:
                 continue
-            oos = sum(1 for v in vals
-                      if (lsl is not None and v < lsl) or (usl is not None and v > usl))
+            # 选目标列时按**最可能超规的那一版**算：目的只是把值得看的列挑出来，
+            # 宁可多看一列，也不要因为按最新版判而漏掉历史上真的超规的列。
+            # 真正的逐行判定由 specver 按数据时间点分段做，不在这里。
+            oos = 0
+            for lsl, usl, _tgt, _ver in bounds:
+                if lsl is None and usl is None:
+                    continue
+                oos = max(oos, sum(1 for v in vals
+                                   if (lsl is not None and v < lsl)
+                                   or (usl is not None and v > usl)))
             if oos > best_oos:
                 best_oos, best_col = oos, c
         if best_col:
@@ -1553,7 +1564,8 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
                     break
             result["permanent"] = AC.permanent_actions(
                 xrt, defect=defect, current_process=chosen_proc, param_key=top_param)
-            result["preventive"] = AC.preventive(xrt, process=chosen_proc)
+            result["preventive"] = AC.preventive(
+                xrt, table=work, target_col=y_col, process=chosen_proc)
         except Exception as e:
             result.setdefault("read_errors", []).append(
                 {"file": "crossprocess", "error": "跨工序追溯降级：%s" % e})
@@ -1659,7 +1671,22 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
                     "本次不给 Cpk，不按单一版本代判。"
                     % (c, _seg.get("note") or _seg.get("status")))
             elif _ov:
-                lsl, usl, tgt = _ov.get("lsl"), _ov.get("usl"), _ov.get("target")
+                # 这条分支只在**不走分段**时进来（未登记多版本，或分段失败后回落）。
+                # 规格条目可能是单版本 dict 也可能是多版本 list，统一归一。
+                _bd = PP.spec_entry_bounds(_ov)
+                if _bd:
+                    lsl, usl, tgt = _bd[0][0], _bd[0][1], _bd[0][2]
+                    if len(_bd) > 1:
+                        # 多版本却没走分段：不能挑一版冒充全部，必须说清楚
+                        result.setdefault("warnings", []).append(
+                            "「%s」登记了 %d 个规格版本但未按时间分段判定，"
+                            "本次 Cpk 以上限最宽的一版计算，**只作参考**；"
+                            "补上可解析的时间列可得到逐版本判定"
+                            % (c, len(_bd)))
+                        lsl = min((b[0] for b in _bd if b[0] is not None), default=None)
+                        usl = max((b[1] for b in _bd if b[1] is not None), default=None)
+                else:
+                    lsl, usl, tgt = None, None, None
                 _spec_src = "企业规格书"
             else:
                 # 设备档案里的默认规格次之。没有它，上下限就只能靠 mu±k·sd 推定，
@@ -1763,6 +1790,14 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
                            "alarm_indexes": (d.get("alarm_indexes") or [])[:100]}
                     for k_ in extra:
                         out[k_] = d.get(k_)
+                    # 方法说明必须带出来。EWMA/CUSUM 的 performance_note 讲的是
+                    # "这个 λ 下误报率多少、多大偏移能检出、平均迟报几个点"——
+                    # 它是读者判断**能不能信这张图**的唯一依据。
+                    # 原来这里只挑 method/n_alarms/lambda/L，说明被整个丢掉，
+                    # 于是报告里只有"已改用 EWMAST"，却不告诉人改用后的代价。
+                    for k_ in ("performance_note", "note"):
+                        if d.get(k_):
+                            out[k_] = d[k_]
                     return out
 
                 _ewma_out = _brief(_ew, ("lambda", "L"))
@@ -2016,6 +2051,11 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
                                          recog=result.get("column_recognition_rate"),
                                          corr=corr,
                                          exclude_cols=result.get("stc_replaced_cols"))
+        if root and root.get("insufficient_reason"):
+            # 这条说明的是"为什么根因这节给不出可用结论"（列名识别率过低 / 证据太弱）。
+            # 产出了却不进 warnings，用户在报告里只会看到"数据不足"，不知道该补什么。
+            result.setdefault("warnings", []).append(
+                "根因归因不可用：%s" % root["insufficient_reason"])
         if _no_process_prior and root:
             root["_no_process_prior"] = True
             root.setdefault("notes", []).append(
@@ -2479,6 +2519,51 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
     except Exception as _guard_e:
         result.setdefault("degraded_sections", []).append(
             {"section": "DOE", "error": str(_guard_e)})
+
+    # 12c. 行动建议兜底：**单文件也必须出永久对策与预防措施**。
+    #
+    #      上面第 6b 节的跨工序块只有 `len(tables) > 1` 才进去，于是只给一份
+    #      数据时（最常见的用法）「永久对策」「预防措施」两节在报告里从不出现。
+    #      实测：同一份涂布数据，单文件跑 → 两块全空；再追加一个卷绕文件
+    #      → 永久对策出 5 条、预防措施出 5 条。同一批数据、同一工序，
+    #      只因为多给了一个上游文件，行动建议就从"没有"变成"有"。
+    #
+    #      放在这里而不是第 6b 节旁边，是因为这两块要用的输入**在这个位置才齐**：
+    #      相关性（strong_pairs，1981 行）与根因候选都在其后生成。第一次补丁
+    #      放在 1560 行，`_self_tr` 恒为 None，静默不生效——这正是"模块写好了
+    #      但接在错误的时机"这一类断链，靠读代码看不出来，只有跑一遍才暴露。
+    #
+    #      仍然只补「能补的两块」：横向展开要同一张对齐表比较设备/批次，
+    #      单文件给不出来，不能假装有。
+    if not result.get("permanent") and chosen_proc:
+        try:
+            _self_tr = AC.self_trace_from_result(result, y_col)
+            if _self_tr:
+                result["permanent"] = AC.permanent_actions(
+                    _self_tr, defect=defect, current_process=chosen_proc,
+                    param_key=_self_tr.get("top_param"))
+                result["preventive"] = AC.preventive(
+                    _self_tr, table=work, target_col=y_col, process=chosen_proc)
+                if _self_tr.get("self_only"):
+                    # self_only 这个标记本身也要被消费：它告诉下游"这份 trace
+                    # 是拿本工序数据凑出来的，不是真做过跨工序对齐"。
+                    # 只产出不消费，等于标记了个寂寞。
+                    result["permanent"].setdefault("notes", []).append(
+                        "本文件的行动建议来自「只有本工序」的归因路径，"
+                        "未与上游数据做对齐比较；verdict 因此不写「本工序主导」。")
+                result.setdefault("warnings", []).append(
+                    "本次只有单道工序数据：永久对策与预防措施基于**本工序归因**给出，"
+                    "未验证上游来料是否同源（补上游工序数据可得到跨工序归属判定）。")
+                if not result.get("crossprocess"):
+                    result["crossprocess"] = {
+                        "applicable": False, "verdict": None,
+                        "notes": ["只收到单道工序的数据，未做跨工序追溯；"
+                                  "行动建议基于本工序归因"]}
+        except Exception as _sa_e:
+            result.setdefault("read_errors", []).append(
+                {"file": "self_actions", "error": "本工序行动建议降级：%s" % _sa_e})
+            degrade.note("pipeline.analyze@self_actions", _sa_e)
+
     try:  # 护栏：知识沉淀候选（只产出候选，绝不自动改写知识库） 环节失败只降级本节，不中断整轮
         # 13. 知识沉淀候选（只产出候选，绝不自动改写知识库）
         try:
@@ -3871,6 +3956,22 @@ def build_report(res, work, spc_res, corr, assoc, pare, root, gaps, conf,
                                            conflicts=_conflicts, parent=s12)
             res["eightd"]["intake_card"] = _card_path
             res["eightd"]["d2_filled"] = bool(_d2)
+            # missing_d2 / d4_ok 产出了却没人读 → 报告不会提示"8D 还缺什么"。
+            # 这两条直接决定这份 8D 能不能拿出去：D2 必填项没填、D4 根因没验证，
+            # 报告照出、结论照给，客户一问就露。必须升进 warnings。
+            _miss2 = res["eightd"].get("missing_d2") or []
+            if _miss2:
+                res.setdefault("warnings", []).append(
+                    "8D 的 D2 还有 %d 个必填项未填（%s）：在补齐之前，这份 8D "
+                    "的问题描述是不完整的，D3 以后的临时对策与根因都可能指向错的对象。"
+                    % (len(_miss2), "、".join(
+                        (x.get("label") or x.get("key") or str(x))
+                        if isinstance(x, dict) else str(x)
+                        for x in _miss2[:5])))
+            if not res["eightd"].get("d4_ok"):
+                res.setdefault("warnings", []).append(
+                    "8D 的 D4（根因验证）未通过：根因尚未被数据或小批试验确认，"
+                    "此时的 D5/D6 只是候选措施，不能当成已定方案下发。")
             if not res["eightd"]["signoff"]["all_signed"]:
                 res.setdefault("warnings", []).append(
                     "8D 的 D5–D8 未全部经人工确审（%d/%d），不得对外发出。"
