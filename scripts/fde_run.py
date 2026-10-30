@@ -666,6 +666,12 @@ AUDIT_FILES = [
     # 缺了它们会是静默 SKIP（不是 FAIL）——表现为"规则全绿"但一条都没验过。
     os.path.join("lib", "reliability.py"),
     os.path.join("lib", "fmea.py"),
+    # 规则 81/82/83：工艺窗口、机台匹配、缺陷表征。缺了它们不是 FAIL 而是
+    # "副本里读不到文件"→基线直接判不过，变异也注不进（教训同前几批）。
+    os.path.join("lib", "process_window.py"),
+    os.path.join("lib", "toolmatch.py"),
+    os.path.join("lib", "recipe.py"),
+    os.path.join("lib", "defectchar.py"),
     os.path.join("knowledge", "process_specs.json"),
 ]
 
@@ -1110,6 +1116,10 @@ def rule_defect_refs_not_dangling():
 ROOTCAUSE_FILE = os.path.join("lib", "rootcause.py")
 RELIABILITY_FILE = os.path.join("lib", "reliability.py")
 FMEA_FILE = os.path.join("lib", "fmea.py")
+WINDOW_FILE = os.path.join("lib", "process_window.py")
+TOOLMATCH_FILE = os.path.join("lib", "toolmatch.py")
+RECIPE_FILE = os.path.join("lib", "recipe.py")
+DEFECTCHAR_FILE = os.path.join("lib", "defectchar.py")
 CORRELATION_FILE = os.path.join("lib", "correlation.py")
 DIRECTION_FILE = os.path.join("lib", "direction.py")
 STATUS_FILE = os.path.join("lib", "status.py")
@@ -3264,6 +3274,95 @@ def rule_test_restores_own_global_root():
     return _r(True, "", {"ok": True})
 
 
+def rule_joint_window_not_naive_product():
+    """多参数联合合格率必须真算相关结构，不得退化成"各参数相乘"。
+
+    为什么这条必须存在：逐参数 Cpk 都够 ≠ 这一片真的合格，且**偏差方向**取决规格形态
+    （对称双侧下相乘积会低估、单侧同向强负相关下会高估）。工具若把联合算成乘积，
+    数字看着无害，但会把"窗口够不够"这个判断直接做错，而使用者无从察觉。
+
+    判据（形态级，三条缺一不可）：
+      1. 存在二维数值积分实现（吃真实上下限），不是只有乘积；
+      2. 联合计算必须用参数自身的 std_bounds（非对称规格照实），不得反推对称区间；
+      3. 缺相关矩阵时必须显式告警（默认独立是假设，不是事实）。
+    """
+    t = _read(WINDOW_FILE) or ""
+    if not t:
+        return _r(False, "读不到 " + WINDOW_FILE)
+    if "def joint_two_bounds(" not in t:
+        return _r(False, "没有按真实上下限做联合计算的实现（joint_two_bounds）——"
+                        "只剩乘积就等于没做相关结构")
+    # 光有函数不够，必须**真的被 k=2 分支调用**。只查函数名存在的话，
+    # 把分支关掉（if False）也能过——实测漏抓过一次。
+    if "if len(usable) == 2:" not in t:
+        return _r(False, "没有『两参数走精确积分』的分支——k=2 会退化成别的东西")
+    if "j = joint_two_bounds(" not in t:
+        return _r(False, "k=2 分支没有真的调用 joint_two_bounds——实现成了摆设")
+    if "std_bounds" not in t:
+        return _r(False, "联合计算没有使用参数自身的标准化上下限 std_bounds——"
+                        "非对称规格会被当成对称处理")
+    # 告警必须真的存在。原来写成"两种措辞任一即可"，结果把措辞改掉一半变异照样过。
+    if "未提供相关系数矩阵" not in t:
+        return _r(False, "缺相关矩阵时没有显式告警——默认独立是假设，不能悄悄成立")
+    return _r(True, "", {"ok": True})
+
+
+def rule_toolmatch_requires_shared_lots():
+    """机台匹配必须有共批前提，且 unsure 不得算 pass。
+
+    行业里最危险的误判：A 机只做 1 号批、B 机只做 2 号批，拿"两台均值之差"
+    当偏移——那里面混着批间差异，数学上不可分。所以：
+      1. 无共批时必须拒答（offset 为 None），不能给数字；
+      2. 三态判定里 unsure（CI 跨允差边界 / 共批不足）不得被当成 pass；
+      3. 整组匹配必须"每一台都 pass"才算匹配。
+    """
+    t = _read(TOOLMATCH_FILE) or ""
+    if not t:
+        return _r(False, "读不到 " + TOOLMATCH_FILE)
+    if "没有任何共批" not in t:
+        return _r(False, "没有『无共批则拒答』的分支——会把混杂差异当机台偏移")
+    if 'return "unsure"' not in t:
+        return _r(False, "三态判定缺 unsure 这一态——跨允差边界会被直接判 pass/fail")
+    if not re.search(r'if all\(v == "pass" for v in verdicts\):', t):
+        return _r(False, "整组匹配不是『每台都 pass 才算通过』——"
+                        "把 unsure 混进去会宣称整体匹配")
+    return _r(True, "", {"ok": True})
+
+
+def rule_defectchar_is_evidence_gate_not_image_ai():
+    """缺陷表征只做"结论表接入 + 证据门禁"，不得假装解读 SEM/EDS 图像。
+
+    这条守的是**不做没能力做的事**：零依赖纯统计工具不可能读懂 SEM 形貌或 EDS 谱。
+    一旦代码里出现"根据图像判断缺陷类型"这类说法，就是在编。
+    判据：
+      1. 必须有 MECHANISM_EVIDENCE 证据要求表（声称机理 → 需要哪些证据字段）；
+      2. 证据不足时必须判 insufficient_evidence 并说"不能写进报告"；
+      3. 卡方检验前必须做期望频数体检（期望<5 的格子过多时卡方近似失效）；
+      4. 模块头必须写明不解读图像/谱图这一边界。
+    """
+    t = _read(DEFECTCHAR_FILE) or ""
+    if not t:
+        return _r(False, "读不到 " + DEFECTCHAR_FILE)
+    if "MECHANISM_EVIDENCE" not in t:
+        return _r(False, "没有机理→证据要求表（MECHANISM_EVIDENCE）——"
+                        "证据门禁无从判定")
+    if "insufficient_evidence" not in t:
+        return _r(False, "证据不足时没有专门的判定值——会被含糊成『看起来还行』")
+    # 判定值存在不够，**那个分支必须还开着**（曾把 if missing 改成 if False 仍过）
+    if "    if missing:" not in t:
+        return _r(False, "证据缺失的判定分支不在了——门禁形同虚设")
+    if "MIN_EXPECTED" not in t:
+        return _r(False, "卡方前没有期望频数体检——小样本会制造假显著")
+    # 同上：体检的 guard 必须开着，否则常量还在、检查已被关掉
+    if "ratio > MAX_LOW_EXPECTED_RATIO" not in t:
+        return _r(False, "期望频数体检的判定条件不在了（只剩常量）——"
+                        "小样本会制造假显著")
+    if "不解读" not in t:
+        return _r(False, "模块头没有写明『不解读图像/谱图』的边界——"
+                        "这条边界不写，后面就会有人往里加图像识别")
+    return _r(True, "", {"ok": True})
+
+
 AUDIT_RULES = [
     Rule("LICENSE 与代码事实对齐：Elastic 2.0 正文齐全且无许可密钥条款", rule_license,
          "（1）首行必须是裸文本 'Elastic License 2.0'（带 # 判不过）；"
@@ -4514,6 +4613,42 @@ AUDIT_RULES = [
                   _re_sub(r"orig_sc_root\s*=\s*_SC\d*\.root\(\)",
                           "orig_sc_root = None"),
                   os.path.join("scripts", "selftest.py"))]),
+    Rule("多参数联合合格率必须真算相关结构，不得退化成各参数相乘",
+         rule_joint_window_not_naive_product,
+         "必须有 joint_two_bounds（吃真实上下限的联合计算）、必须使用参数自身的 std_bounds、"
+         "缺相关矩阵必须显式告警。逐参数 Cpk 都够 ≠ 这一片真的合格，且偏差方向随规格形态变化。",
+         WINDOW_FILE,
+         [_mutant("k=2 不走精确积分（修复退化：相关结构白算）",
+                  _sub("if len(usable) == 2:", "if False:"),
+                  WINDOW_FILE),
+          _mutant("删掉缺相关矩阵的告警（默认独立悄悄成立）",
+                  _sub("未提供相关系数矩阵", "已提供相关系数矩阵"),
+                  WINDOW_FILE)]),
+    Rule("机台匹配必须有共批前提，unsure 不得算 pass",
+         rule_toolmatch_requires_shared_lots,
+         "无共批必须拒答（offset 为 None）、must 有三态判定 unsure、整组匹配必须每台都 pass。"
+         "无共批时『两台均值之差』混着批间差异，数学上不可分。",
+         TOOLMATCH_FILE,
+         [_mutant("unsure 退化成 pass（修复退化：跨允差边界被放行）",
+                  _sub('    return "unsure"\n\n\ndef _drift_check',
+                       '    return "pass"\n\n\ndef _drift_check'),
+                  TOOLMATCH_FILE),
+          _mutant("整组匹配把 unsure 也算通过",
+                  _sub('if all(v == "pass" for v in verdicts):',
+                       'if all(v in ("pass", "unsure") for v in verdicts):'),
+                  TOOLMATCH_FILE)]),
+    Rule("缺陷表征只做结论表接入与证据门禁，不得假装解读 SEM/EDS 图像",
+         rule_defectchar_is_evidence_gate_not_image_ai,
+         "必须有 MECHANISM_EVIDENCE 证据要求表、证据不足须判 insufficient_evidence、"
+         "卡方前必须做期望频数体检、模块头必须写明不解读图像/谱图。"
+         "零依赖纯统计工具读不懂 SEM 形貌与 EDS 谱，声称能就是编。",
+         DEFECTCHAR_FILE,
+         [_mutant("证据门禁永远通过（修复退化：没证据也给结论）",
+                  _sub("    if missing:", "    if False:"),
+                  DEFECTCHAR_FILE),
+          _mutant("去掉期望频数体检的判定条件（修复退化：小样本制造假显著）",
+                  _sub("ratio > MAX_LOW_EXPECTED_RATIO", "False"),
+                  DEFECTCHAR_FILE)]),
 ]
 
 
@@ -4844,6 +4979,273 @@ def _fmt_ci(ci):
     if not ci:
         return "—"
     return "[%.2f, %.2f]" % (ci[0], ci[1])
+
+
+def flow_window(args):
+    """工艺窗口：多参数联合合格率 + 响应面可行域。
+
+    JD 对标：半导体/精密制造岗点名的"工艺窗口"。核心是纠正一个误用——
+    逐参数 Cpk 都够 ≠ 这一片真的合格，差多少取决于相关结构。
+    """
+    sys.path.insert(0, ROOT)
+    from lib import table as T
+    from lib import process_window as PW
+
+    path = (getattr(args, "input", None) or [None])[0]
+    if not path:
+        print("window 需要 --input 指定数据文件")
+        return 2
+    tb = T.read_any(path, sheet=getattr(args, "sheet", None))
+    params = _parse_param_specs(getattr(args, "params", None), tb)
+    if not params:
+        print("必须用 --params 指定『参数名[:LSL:USL]』，示例：")
+        print("      --params CD:43:47 膜厚:115:125")
+        print("可选列：%s" % "、".join(tb.columns))
+        print("（不自动猜规格：LSL/USL 必须来自受控规格书）")
+        return 2
+
+    corr = None
+    corr_path = getattr(args, "corr_file", None)
+    if corr_path:
+        try:
+            corr = json.load(open(corr_path, encoding="utf-8"))
+        except Exception as e:
+            print("读相关矩阵失败：%s" % str(e)[:100])
+            return 2
+
+    rep = PW.joint_conformance(params, corr=corr)
+    print("=" * 68)
+    print("工艺窗口：多参数联合合格率")
+    print("=" * 68)
+    print("%-14s %6s %10s %10s %8s %8s"
+          % ("参数", "n", "均值", "σ", "Cp", "Cpk"))
+    for m in rep["per_param"]:
+        print("%-14s %6d %10s %10s %8s %8s"
+              % (str(m.get("name"))[:14], m.get("n") or 0,
+                 _f(m.get("mean")), _f(m.get("sigma")),
+                 _f(m.get("cp")), _f(m.get("cpk"))))
+    print("-" * 68)
+    print("各参数合格率相乘（常见误用）: %s" % _p(rep.get("naive_product")))
+    print("真实联合合格率            : %s" % _p(rep.get("joint")))
+    if rep.get("joint_ci"):
+        print("  蒙特卡洛 95%% 误差带     : [%s, %s]"
+              % (_p(rep["joint_ci"][0]), _p(rep["joint_ci"][1])))
+    if rep.get("gap") is not None:
+        print("差额（联合 − 相乘）      : %+.4f" % rep["gap"])
+    print("方法：%s" % (rep.get("method") or "—"))
+    for a in rep.get("assumptions") or []:
+        print("  假设：%s" % a)
+    for w in rep.get("warnings") or []:
+        print("  ⚠ %s" % w)
+    print("-" * 68)
+    print("说明：%s" % rep["note"])
+    print("=" * 68)
+    return 0
+
+
+def _parse_param_specs(raw, tb):
+    """解析 `--params 列名:LSL:USL ...`。空项用 '-' 表示该侧无规格。"""
+    out = []
+    for item in (raw or []):
+        parts = str(item).split(":")
+        name = parts[0].strip()
+        idx = tb.col_index(name)
+        if idx is None:
+            print("  ⚠ 列 %r 不存在，跳过。可选列：%s" % (name, "、".join(tb.columns)))
+            continue
+        lsl = usl = None
+        if len(parts) > 1 and parts[1].strip() not in ("", "-"):
+            lsl = _num(parts[1])
+        if len(parts) > 2 and parts[2].strip() not in ("", "-"):
+            usl = _num(parts[2])
+        out.append({"name": name, "values": [r[idx] for r in tb.rows],
+                    "lsl": lsl, "usl": usl})
+    return out
+
+
+def _num(v):
+    try:
+        return float(str(v).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _f(v, nd=3):
+    return ("%." + str(nd) + "f") % v if isinstance(v, (int, float)) else "—"
+
+
+def _p(v):
+    return ("%.4f" % v) if isinstance(v, (int, float)) else "—"
+
+
+def flow_toolmatch(args):
+    """机台匹配：共批配对偏移估计 + 三态判定（pass/fail/unsure）。"""
+    sys.path.insert(0, ROOT)
+    from lib import table as T
+    from lib import toolmatch as TM
+
+    path = (getattr(args, "input", None) or [None])[0]
+    if not path:
+        print("toolmatch 需要 --input 指定数据文件（长表：机台/批次/测量值）")
+        return 2
+    tb = T.read_any(path, sheet=getattr(args, "sheet", None))
+    rows = [dict(zip(tb.columns, r)) for r in tb.rows]
+    rep = TM.match_group(rows, reference=getattr(args, "reference", None),
+                         match_tol=getattr(args, "match_tol", None),
+                         tool_key=getattr(args, "tool_col", None) or "tool",
+                         lot_key=getattr(args, "lot_col", None) or "lot",
+                         value_key=getattr(args, "value_col", None) or "value")
+    print("=" * 68)
+    print("机台匹配（共批配对偏移）")
+    print("=" * 68)
+    print("参考机台：%s｜允差：%s｜机台数：%d"
+          % (rep.get("reference"), getattr(args, "match_tol", None) or "未给",
+             len(rep.get("tools") or [])))
+    if not rep.get("comparisons"):
+        for w in rep.get("warnings") or []:
+            print("  ⚠ %s" % w)
+        print("=" * 68)
+        return 0
+    print("-" * 68)
+    print("%-10s %9s %10s %20s %8s" % ("机台", "共批数", "偏移", "95% CI", "判定"))
+    for c in rep["comparisons"]:
+        ci = ("[%.4g, %.4g]" % (c["ci"][0], c["ci"][1])) if c.get("ci") else "—"
+        print("%-10s %9s %10s %20s %8s"
+              % (c["tool_b"], c.get("n_lots"), _f(c.get("offset"), 4), ci,
+                 c.get("verdict") or "—"))
+    print("-" * 68)
+    print("方向：%s" % "；".join("%s→%s %s" % (c["tool_a"], c["tool_b"],
+                                             c.get("direction") or "—")
+                               for c in rep["comparisons"]))
+    for c in rep["comparisons"]:
+        for w in c.get("warnings") or []:
+            print("  ⚠ %s: %s" % (c["tool_b"], w))
+    for w in rep.get("warnings") or []:
+        print("  ⚠ %s" % w)
+    gp = rep.get("group_pass")
+    print("整体匹配：%s" % ("是" if gp is True else
+                          ("否（有超差）" if gp is False else "无法判定（存在 unsure）")))
+    print("-" * 68)
+    print("说明：%s" % rep["note"])
+    print("=" * 68)
+    return 0
+
+
+def flow_recipe(args):
+    """配方对比 / 切换影响 / 配方内漂移（配方本身按标签处理，不存不推荐）。"""
+    sys.path.insert(0, ROOT)
+    from lib import table as T
+    from lib import recipe as RC
+
+    path = (getattr(args, "input", None) or [None])[0]
+    if not path:
+        print("recipe 需要 --input 指定数据文件")
+        return 2
+    tb = T.read_any(path, sheet=getattr(args, "sheet", None))
+    rcol = getattr(args, "recipe_col", None)
+    vcol = getattr(args, "value_col", None)
+    if not rcol or not vcol:
+        print("必须用 --recipe-col 与 --value-col 指定列。可选列：%s"
+              % "、".join(tb.columns))
+        return 2
+    ri, vi = tb.col_index(rcol), tb.col_index(vcol)
+    if ri is None or vi is None:
+        print("列名有误。可选列：%s" % "、".join(tb.columns))
+        return 2
+    groups, seq = {}, []
+    for r in tb.rows:
+        k = str(r[ri]).strip()
+        groups.setdefault(k, []).append(r[vi])
+        seq.append(r[vi])
+    rep = RC.compare_recipes(groups, reference=getattr(args, "reference", None))
+    print("=" * 68)
+    print("配方对比（配方按标签处理，不存储、不推荐取值）")
+    print("=" * 68)
+    print("%-14s %6s %10s %10s" % ("配方", "n", "均值", "σ"))
+    for g in rep.get("groups") or []:
+        print("%-14s %6d %10s %10s"
+              % (str(g["name"])[:14], g["n"], _f(g["mean"]), _f(g["sd"])))
+    an = rep.get("anova")
+    if an:
+        print("-" * 68)
+        print("总体 ANOVA：F=%.3f, p=%.4g, η²=%s"
+              % (an.get("F") or 0, an.get("p") or 1,
+                 _f(an.get("eta2"), 4)))
+    es = rep.get("effect_size")
+    if es:
+        print("效应量：组间极差 %.4g / 合池 σ %.4g = %.2f"
+              % (es["spread"], es["pooled_sd"], es["ratio"]))
+    for row in rep.get("pairwise") or []:
+        print("  %-12s 差值 %+.4g  原始 p=%s  校正 p=%s  %s"
+              % (row["recipe"], row.get("diff") or 0,
+                 ("%.3g" % row["p_raw"]) if row.get("p_raw") is not None else "—",
+                 ("%.3g" % row["p_adj"]) if row.get("p_adj") is not None else "—",
+                 "显著" if row.get("significant") else "不显著"))
+    ch = getattr(args, "change_index", None)
+    if ch is not None:
+        imp = RC.change_impact(seq, int(ch))
+        print("-" * 68)
+        print("配方切换（位置 %s）：跳变 %s，p=%s，为基线噪声的 %s 倍"
+              % (ch, _f(imp.get("shift"), 4),
+                 ("%.3g" % imp["p"]) if imp.get("p") is not None else "—",
+                 _f(imp.get("vs_baseline_noise"), 2)))
+        for w in imp.get("warnings") or []:
+            print("  ⚠ %s" % w)
+    for w in rep.get("warnings") or []:
+        print("  ⚠ %s" % w)
+    print("-" * 68)
+    print("说明：%s" % rep["note"])
+    print("=" * 68)
+    return 0
+
+
+def flow_defectchar(args):
+    """缺陷表征结果接入：Pareto / 工序关联 / 证据门禁（不解读图像与谱图）。"""
+    sys.path.insert(0, ROOT)
+    from lib import table as T
+    from lib import defectchar as DC
+
+    path = (getattr(args, "input", None) or [None])[0]
+    if not path:
+        print("defectchar 需要 --input 指定表征结果表")
+        return 2
+    tb = T.read_any(path, sheet=getattr(args, "sheet", None))
+    rows = [dict(zip(tb.columns, r)) for r in tb.rows]
+    rep = DC.summarize(rows, columns=tb.columns)
+    print("=" * 68)
+    print("缺陷物理表征结果接入（SEM/EDS/CT 的结论表，不是原始图像）")
+    print("=" * 68)
+    if rep["status"] == "INSUFFICIENT_DATA" and not rep.get("pareto"):
+        for w in rep.get("warnings") or []:
+            print("  ⚠ %s" % w)
+        print("=" * 68)
+        return 0
+    print("记录 %d 条｜类别 %d 个" % (rep["n"], rep["quality"].get("n_classes") or 0))
+    print("-" * 68)
+    print("%-16s %6s %8s" % ("缺陷类别", "数量", "占比"))
+    for p in rep["pareto"][:15]:
+        print("%-16s %6d %8s" % (str(p["defect_class"])[:16], p["n"], _p(p["share"])))
+    assoc = DC.step_association(rows)
+    print("-" * 68)
+    print("工序关联（缺陷构成是否随工序变化）：")
+    if assoc.get("p") is not None:
+        print("  卡方 p = %.4g（%s）" % (assoc["p"],
+                                       "显著" if assoc["p"] < 0.05 else "不显著"))
+    for w in assoc.get("warnings") or []:
+        print("  ⚠ %s" % w)
+    mech = getattr(args, "mechanism", None)
+    if mech:
+        gate = DC.evidence_gate(rows, mech)
+        print("-" * 68)
+        print("证据门禁（声称机理：%s）：%s" % (mech, gate.get("verdict") or "—"))
+        for w in gate.get("warnings") or []:
+            print("  ⚠ %s" % w)
+    for w in rep.get("warnings") or []:
+        print("  ⚠ %s" % w)
+    print("-" * 68)
+    print("说明：%s" % rep["note"])
+    print("=" * 68)
+    return 0
 
 
 def flow_fmea(args):
@@ -5605,14 +6007,19 @@ def main(argv=None):
         description="newenergy-fde 唯一入口编排器（流程代码化 + 证据落盘）")
     ap.add_argument("flow",
                     choices=["audit", "verify", "analyze", "release", "config",
-                             "kb", "ops", "reliability", "fmea"],
+                             "kb", "ops", "reliability", "fmea",
+                             "window", "toolmatch", "recipe", "defectchar"],
                     help="audit=约定落地核查  verify=质量闸门  "
                          "analyze=交付主流程  release=发布  "
                          "config=可调参数清单与企业规格模板  "
                          "kb=知识生命周期与出处覆盖率审计  "
                          "ops=可观测性运维视图（结构化日志回读）  "
                          "reliability=寿命分析（Weibull/MTBF/B10/加速寿命）  "
-                         "fmea=FMEA 风险排序与填报审计")
+                         "fmea=FMEA 风险排序与填报审计  "
+                         "window=工艺窗口（多参数联合合格率/可行域）  "
+                         "toolmatch=机台匹配（共批配对偏移）  "
+                         "recipe=配方对比与切换影响  "
+                         "defectchar=缺陷表征结果接入（不解读图像）")
     ap.add_argument("--input", "-i", nargs="+", help="analyze：数据文件")
     ap.add_argument("--outdir", "-o", default="output", help="analyze：输出目录")
     ap.add_argument("--target", help="analyze：目标指标列")
@@ -5669,6 +6076,24 @@ def main(argv=None):
                     help="fmea：按 RPN 阈值分组（实践惯例，非标准强制；不给则只排序）")
     ap.add_argument("--from-defects",
                     help="fmea：从 analyze 结果 JSON 生成 FMEA 骨架（S/O/D 留空待人工评分）")
+    # ---- window / toolmatch / recipe / defectchar 专用 ----
+    ap.add_argument("--params", nargs="+",
+                    help="window：参数规格，格式 列名:LSL:USL（无侧用 -），"
+                         "如 CD:43:47 膜厚:-:125")
+    ap.add_argument("--corr-file",
+                    help="window：相关矩阵 JSON（二维数组）；不给则按独立处理并告警")
+    ap.add_argument("--reference",
+                    help="toolmatch/recipe：参考机台或参考配方（不给则自动选并告警）")
+    ap.add_argument("--match-tol", type=float,
+                    help="toolmatch：匹配允差（产品参数，必须由企业给）")
+    ap.add_argument("--tool-col", help="toolmatch：机台列名（默认 tool）")
+    ap.add_argument("--lot-col", help="toolmatch：批次列名（默认 lot）")
+    ap.add_argument("--value-col", help="toolmatch/recipe：测量值列名")
+    ap.add_argument("--recipe-col", help="recipe：配方列名")
+    ap.add_argument("--change-index", type=int,
+                    help="recipe：配方切换位置（由人给，工具不猜事件时刻）")
+    ap.add_argument("--mechanism",
+                    help="defectchar：声称的失效机理，用于证据门禁")
 
     # 把 lib/pipeline.py 的全部参数动态补进来（取长选项，不抢短选项）。
     # 目的是让「唯一入口」名副其实：pipeline 新增参数时编排器自动跟上，
@@ -5712,6 +6137,14 @@ def main(argv=None):
         return flow_reliability(args)
     if args.flow == "fmea":
         return flow_fmea(args)
+    if args.flow == "window":
+        return flow_window(args)
+    if args.flow == "toolmatch":
+        return flow_toolmatch(args)
+    if args.flow == "recipe":
+        return flow_recipe(args)
+    if args.flow == "defectchar":
+        return flow_defectchar(args)
     if args.flow == "audit":
         return flow_audit(args)
     if args.flow == "verify":

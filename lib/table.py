@@ -356,6 +356,21 @@ def detect_delimiter(path, encoding="utf-8"):
     return best
 
 
+def _split_cells(line, delimiter):
+    """按分隔符切一行，**尊重引号**（"Si,O" 是一个格子，不是两个）。
+
+    为什么必须这样切：`line.split(",")` 会把带逗号的引号值拆开，
+    于是数据行的列数比表头多 1，列数一致性判据立刻失效，
+    表头被认到第二行（实测：缺陷表征表的『元素组成』写成 "Si,O" 时，
+    表头被跳成 D001 那一行，后面整表列名全错）。
+    带引号且内含分隔符的值在检测/表征数据里是常态，不是边角情况。
+    """
+    try:
+        return next(csv.reader([line], delimiter=delimiter))
+    except (csv.Error, StopIteration):
+        return line.split(delimiter)
+
+
 def _find_header_line(lines, delimiter):
     """定位真正的表头行。
 
@@ -366,6 +381,8 @@ def _find_header_line(lines, delimiter):
 
     正确判据是**列数稳定性**：真正的表头会让后续大多数行保持相同的列数，
     而元信息行之后列数会突变（通常是变多）。
+
+    切分必须走 csv.reader（尊重引号），见 _split_cells 的说明。
     """
     max_i = min(len(lines), 30)
     best_i, best_score = 0, -1e9
@@ -375,7 +392,7 @@ def _find_header_line(lines, delimiter):
             continue
         if re.match(r"^\s*[;＃#]", line):
             continue
-        cells = [c.strip() for c in line.split(delimiter)]
+        cells = [c.strip() for c in _split_cells(line, delimiter)]
         ncol = len(cells)
         if ncol < 2:
             continue
@@ -388,7 +405,7 @@ def _find_header_line(lines, delimiter):
         if not follow:
             continue
         consist = sum(1 for l in follow
-                      if len(l.split(delimiter)) == ncol) / float(len(follow))
+                      if len(_split_cells(l, delimiter)) == ncol) / float(len(follow))
 
         score = consist * 10.0 + ncol * 0.5 + nonnum / float(ncol)
         if score > best_score:

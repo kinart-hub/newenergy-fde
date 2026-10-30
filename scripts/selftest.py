@@ -1552,8 +1552,15 @@ def test_hotswap():
         # 读侧与写侧分开统计。此前读侧的异常被 pass 吞掉、一个数都没进 stat，
         # 于是「并发读不撕裂」这条断言实际只覆盖了写侧——读侧撕裂根本发现不了。
         # 现在读侧拆成三种结果，只有「解析失败」才是这条测试要抓的目标。
-        stat = {"ok": 0, "fail": 0, "read_ok": 0, "read_torn": 0,
-                "read_locked": 0}
+        # 写侧也要把两类失败分开：
+        #   write_fail = atomic_write_json 抛错（真的写不成，是缺陷）
+        #   read_fail  = 写线程自己那次 read_text_retry 抛错（撞上 replace 排斥窗口，
+        #                与读侧同类，属可接受）
+        # 混成一个 fail 计数会让"读侧撞窗口"被误报成"写入失败"——
+        # 实测在整机负载高时偶发（1.5 秒窗口内两侧各 ~0.9 秒预算会耗尽），
+        # 于是门禁时红时绿，而真正要守的"零撕裂"其实一直是好的。
+        stat = {"ok": 0, "write_fail": 0, "read_fail": 0,
+                "read_ok": 0, "read_torn": 0, "read_locked": 0}
 
         def _holder():
             while not stop["v"]:
@@ -1589,11 +1596,18 @@ def test_hotswap():
             while not stop["v"]:
                 try:
                     d = _json.loads(HS.read_text_retry(spec))
+                except Exception:
+                    # 写线程读不到当前版本：这是读侧的排斥窗口，不是写入失败
+                    stat["read_fail"] += 1
+                    n += 1
+                    time.sleep(0.001)
+                    continue
+                try:
                     d["meta"]["revision"] = 2000 + n
                     HS.atomic_write_json(spec, d)
                     stat["ok"] += 1
                 except Exception:
-                    stat["fail"] += 1
+                    stat["write_fail"] += 1
                 n += 1
                 time.sleep(0.001)
 
@@ -1605,8 +1619,9 @@ def test_hotswap():
         stop["v"] = True
         t1.join()
         t2.join()
-        check("并发读期间原子写不失败", stat["fail"] == 0 and stat["ok"] > 0,
-              "成功%d 失败%d" % (stat["ok"], stat["fail"]))
+        check("并发读期间原子写不失败", stat["write_fail"] == 0 and stat["ok"] > 0,
+              "写成功%d 写失败%d 写线程读撞窗口%d"
+              % (stat["ok"], stat["write_fail"], stat["read_fail"]))
         # 读侧单独成条：写成功 ≠ 读到的东西是完整的，
         # 这两件事此前共用一个断言，等于只验了前者。
         check("并发读全程零撕裂",
@@ -5162,6 +5177,92 @@ def test_semiconductor_slice():
               "%s" % ([c.get("param_name") for c in cands[:2]],))
 
 
+def test_semiconductor_deep_capability():
+    """半导体深度能力：工艺窗口 / 机台匹配 / 配方 / 缺陷表征接入。
+
+    这一组特别要防一类错误：**单测用 Python float 造数据全绿，一接真 CSV 就整列算不出来**
+    （表格单元格是字符串 '44.12'，而 stats.is_num 只认真数值类型）。
+    所以除了模块自带自检，这里必须有"用字符串单元格走一遍完整链路"的集成断言。
+    """
+    print("\n[半导体深度能力：工艺窗口 / 机台匹配 / 配方 / 缺陷表征]")
+    from lib import process_window as PW
+    from lib import toolmatch as TM
+    from lib import recipe as RC
+    from lib import defectchar as DC
+    from lib import table as T
+
+    for name, mod in (("工艺窗口", PW), ("机台匹配", TM),
+                      ("配方", RC), ("缺陷表征", DC)):
+        for n, ok, d in mod._selftest():
+            check("[%s] %s" % (name, n), ok, d)
+
+    # ---- 集成：字符串单元格必须能被吃进去（今天的真缺陷） ----
+    with tempfile.TemporaryDirectory() as td:
+        p = os.path.join(td, "win.csv")
+        rnd = random.Random(20261030)
+        lines = ["CD,Overlay,膜厚"]
+        for _ in range(120):
+            base = rnd.gauss(0, 1)
+            lines.append("%.2f,%.2f,%.1f" % (45 + base + rnd.gauss(0, 0.5),
+                                             10 + 1.6 * base + rnd.gauss(0, 0.6),
+                                             120 + 3 * rnd.gauss(0, 1)))
+        io.open(p, "w", encoding="utf-8-sig", newline="\n").write("\n".join(lines) + "\n")
+        tb = T.read_any(p)
+        cols = {c: [r[i] for r in tb.rows] for i, c in enumerate(tb.columns)}
+        rep = PW.joint_conformance([{"name": "CD", "values": cols["CD"],
+                                     "lsl": 43.5, "usl": 46.5},
+                                    {"name": "Overlay", "values": cols["Overlay"],
+                                     "lsl": 8.0, "usl": 12.0}])
+        check("工艺窗口吃得下字符串单元格（不是 n=0）",
+              all(m["n"] == 120 for m in rep["per_param"]),
+              str([m["n"] for m in rep["per_param"]]))
+        check("工艺窗口在字符串数据上给出联合值",
+              rep["joint"] is not None and 0 < rep["joint"] <= 1,
+              "joint=%s" % rep["joint"])
+
+        # 机台匹配：字符串数值
+        p2 = os.path.join(td, "tool.csv")
+        L = ["tool,lot,value"]
+        for lot in ("L1", "L2", "L3", "L4"):
+            be = rnd.uniform(-3, 3)
+            for _ in range(3):
+                L.append("A,%s,%.3f" % (lot, 100 + be + rnd.gauss(0, 0.03)))
+                L.append("B,%s,%.3f" % (lot, 100 + be + 1.5 + rnd.gauss(0, 0.03)))
+        io.open(p2, "w", encoding="utf-8-sig", newline="\n").write("\n".join(L) + "\n")
+        tb2 = T.read_any(p2)
+        rows2 = [dict(zip(tb2.columns, r)) for r in tb2.rows]
+        m2 = TM.offset_between(TM._pairs_by_lot(rows2), "A", "B", match_tol=2.0)
+        check("机台匹配吃得下字符串数值并回收 1.5",
+              m2["offset"] is not None and abs(m2["offset"] - 1.5) < 0.1,
+              "offset=%s" % m2["offset"])
+
+        # 带引号的逗号值（元素组成 "Si,O"）不得把表头挤到第二行
+        p3 = os.path.join(td, "dc.csv")
+        io.open(p3, "w", encoding="utf-8-sig", newline="\n").write(
+            "缺陷编号,缺陷类别,尺寸,元素组成,工序\n"
+            'D001,颗粒,5,"Si,O",刻蚀\n'
+            'D002,颗粒,6,"Al,O",刻蚀\n'
+            'D003,划伤,20,"Si,N",CMP\n')
+        tb3 = T.read_any(p3)
+        check("带引号的逗号值不会把表头挤到第二行",
+              tb3.columns[0] == "缺陷编号" and "缺陷类别" in tb3.columns,
+              str(tb3.columns))
+        s3 = DC.summarize([dict(zip(tb3.columns, r)) for r in tb3.rows],
+                          columns=tb3.columns)
+        check("缺陷表征能识别类别并给出 Pareto",
+              any(x["defect_class"] == "颗粒" for x in s3["pareto"]),
+              str([x["defect_class"] for x in s3["pareto"]]))
+
+    # ---- 行为级：四个子流程都挂在唯一入口上 ----
+    if os.path.join(ROOT, "scripts") not in sys.path:
+        sys.path.insert(0, os.path.join(ROOT, "scripts"))
+    import fde_run as ORCH2
+    for flow in ("window", "toolmatch", "recipe", "defectchar"):
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc = ORCH2.main([flow])
+        check("%s 子流程挂在唯一入口（缺参应报错 rc=2）" % flow, rc == 2, "rc=%s" % rc)
+
+
 def test_quality_manager_guide():
     """面向质量经理的「报告解读入门」（评审 P3-1）。
 
@@ -5626,6 +5727,7 @@ if __name__ == "__main__":
     test_reliability_weibull_alt()
     test_fmea_rpn_and_gate()
     test_semiconductor_slice()
+    test_semiconductor_deep_capability()
     print("\n" + "=" * 56)
     print("通过 %d 项，失败 %d 项" % (len(PASS), len(FAIL)))
     if FAIL:
