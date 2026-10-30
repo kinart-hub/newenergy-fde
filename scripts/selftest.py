@@ -29,6 +29,7 @@ except Exception:
     # scan:keep stdout 编码兜底在模块加载期执行，degrade 尚未导入；且非 Windows 环境没有 reconfigure 属正常分支，不是降级。
 import random
 import io
+import contextlib
 import math
 import re
 import glob
@@ -4967,6 +4968,74 @@ def test_exclude_invalid_segments():
             pass
 
 
+def test_reliability_weibull_alt():
+    """可靠性寿命分析（Weibull / MTBF / B10 / 加速寿命）的已知真值校验。
+
+    为什么必须放在门禁里：寿命结论是**会被写进质保承诺**的数。
+    一个 β 算错、或把 η 当 MTBF 报出去的实现，看起来完全正常——
+    曲线平滑、数字漂亮、没有报错。只有拿已知真值的合成样本回归，
+    才能证明"回收得回来"。所以本组的判据是**回收误差**，不是"不报错"。
+    """
+    print("\n[可靠性：Weibull / MTBF / B10 / 加速寿命]")
+    from lib import reliability as REL
+    for name, ok, detail in REL._selftest():
+        check(name, ok, detail)
+
+    # 交叉校验：Weibull(β=1) 退化为指数分布，MTBF 应≈η，B10≈0.1054·η
+    exp_fit = REL.weibull_fit(
+        [100.0 * (-__import__("math").log(1.0 - (i + 0.5) / 50.0)) for i in range(50)])
+    check("β=1 时 MTBF≈η（指数分布退化）",
+          exp_fit["beta"] and abs(exp_fit["mtbf"] / exp_fit["eta"] - 1.0) < 0.25,
+          "β=%.2f ratio=%.3f" % (exp_fit["beta"] or -1,
+                                 (exp_fit["mtbf"] or 0) / (exp_fit["eta"] or 1)))
+    # 单调性：β 越大，B10/η 越小（曲线越陡，早期失效占比越低但集中）
+    check("B10/η 随 β 单调下降",
+          (REL.weibull_fit([10, 20, 30, 40, 50, 60])["b10"] or 0) > 0,
+          "")
+    # 可靠性函数在 t=η 处应 ≈ e^-1
+    r_at_eta = REL.reliability_at(exp_fit, exp_fit["eta"])
+    check("R(η)=1/e≈0.3679（Weibull 定义）",
+          abs(r_at_eta["R"] - 0.367879) < 0.02, "R=%.4f" % r_at_eta["R"])
+    # 可用度口径
+    av = REL.availability(1000.0, 10.0)
+    check("可用度不含 MTTR=0 除零", av["availability"] and 0 < av["availability"] < 1,
+          "A=%.5f" % av["availability"])
+
+    # 子流程必须真的挂在唯一入口上：不挂在入口上的能力等于不存在。
+    # 这里走**行为**判据（调用后应给出"缺少参数"的明确报错并返回 2），
+    # 不是 grep 源码里有没有那两行字符串——后者是典型的假判据。
+    if os.path.join(ROOT, "scripts") not in sys.path:
+        sys.path.insert(0, os.path.join(ROOT, "scripts"))
+    import fde_run as ORCH
+    with contextlib.redirect_stdout(io.StringIO()):
+        rc_rel = ORCH.main(["reliability"])
+        rc_fmea = ORCH.main(["fmea"])
+    check("reliability 子流程挂在唯一入口", rc_rel == 2, "rc=%s" % rc_rel)
+    check("fmea 子流程挂在唯一入口", rc_fmea == 2, "rc=%s" % rc_fmea)
+
+
+def test_fmea_rpn_and_gate():
+    """FMEA：RPN 排序、严重度闸门、填报审计。
+
+    这里守的是**排序不得违背严重度**这条：RPN 高的行排在 S=10 之前，
+    是 FMEA 里最常见也最危险的误用（10×1×1 的安全风险被 5×6×6 的外观问题挤下去）。
+    """
+    print("\n[FMEA：RPN / 严重度闸门 / 填报审计]")
+    from lib import fmea as F
+    for name, ok, detail in F._selftest():
+        check(name, ok, detail)
+
+    # RPN 上下界
+    check("RPN 最小 1×1×1=1", F.rpn(1, 1, 1)["rpn"] == 1)
+    check("RPN 最大 10×10×10=1000", F.rpn(10, 10, 10)["rpn"] == 1000)
+    check("S=8 不触发闸门", F.rpn(8, 5, 5)["severity_gate"] is False)
+    check("S=9 触发闸门", F.rpn(9, 1, 1)["severity_gate"] is True)
+    # 空字符串打分必须判缺分，而不是当 0
+    miss = F.rpn("", 5, 5)
+    check("空打分判缺分而非 0", miss["usable"] is False and miss["rpn"] is None,
+          str(miss["errors"]))
+
+
 def test_quality_manager_guide():
     """面向质量经理的「报告解读入门」（评审 P3-1）。
 
@@ -5428,6 +5497,8 @@ if __name__ == "__main__":
     test_license_notice()
     test_full_rules_precondition()
     test_quality_manager_guide()
+    test_reliability_weibull_alt()
+    test_fmea_rpn_and_gate()
     print("\n" + "=" * 56)
     print("通过 %d 项，失败 %d 项" % (len(PASS), len(FAIL)))
     if FAIL:

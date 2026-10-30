@@ -27,6 +27,9 @@ IND = os.path.join(ROOT, "knowledge", "industries.json")
 DOMAIN = "materials_testing"
 SRC_GENERIC = ("机理与标准取自公开检测机构资料（北检/中科院上海硅酸盐所 CNAS 认可项目/"
                "赛宝实验室）与国家标准/行业标准/国军标；现场适用性待复核，正式判定以受控规格书为准")
+SRC_CAL = ("计量溯源与标曲口径取自 CNAS-CL01(等同 ISO/IEC 17025)/GB-T 27417 定量方法确认/"
+           "GB-T 27404 实验室质量控制/JJF 1033·1059·1101 等公开计量规范；"
+           "现场适用性待复核，正式判定以受控方法确认报告与检定/校准证书为准")
 
 # ---------------------------------------------------------------------------
 # 行业登记表条目
@@ -46,7 +49,9 @@ INDUSTRY_ENTRY = {
              "（热分析 DSC/TGA/TMA/DMA、成分结构 FTIR/GC-MS/NMR/XRD/SEM、"
              "力学、电学与电磁屏蔽、老化环境）。域参数与标准口径取自公开检测机构资料与"
              "国标/行标/国军标，现场适用性待复核；FDE 提供统计/DOE/根因/报告方法论，"
-             "不替代设备操作与标准符合性判定。"),
+             "不替代设备操作与标准符合性判定。另含设备与标曲计量口径"
+             "（标曲 R²、质控回收率、检出限/定量限、期间核查、计量溯源、测量不确定度、"
+             "老化箱温场），源自 CNAS-CL01(ISO/IEC 17025)/GB-T 27417/27404/JJF 1033·1059·1101 等公开计量规范。"),
 }
 
 # ---------------------------------------------------------------------------
@@ -73,7 +78,10 @@ PROCESSES = {
         "domain": DOMAIN, "name": "成分与结构表征",
         "alias": ["成分分析", "结构表征", "spectroscopy", "FTIR", "GC-MS", "NMR", "XRD", "SEM"],
         "upstream": ["材料合成/配料"], "downstream": ["材料性能评价"],
-        "key_params": ["filler_content", "molecular_weight_Mw", "residual_monomer", "ftir_anomaly"],
+        "key_params": ["filler_content", "molecular_weight_Mw", "residual_monomer", "ftir_anomaly",
+                       "cal_curve_r2", "cal_linear_range", "qc_recovery", "instrument_lod",
+                       "instrument_loq", "interval_check_dev", "cal_due_days",
+                       "measurement_uncertainty"],
         "common_defects": ["FTIR谱峰异常", "残留单体超标", "填料含量偏差", "分子量分布异常"],
         "doe_factors": ["制样方法", "分辨率", "扫描范围"],
         "notes": ("FTIR 定性鉴别官能团与添加剂；GC-MS 定量残留单体/小分子挥发物；"
@@ -114,7 +122,8 @@ PROCESSES = {
         "alias": ["老化", "可靠性", "reliability", "UV", "盐雾", "湿热"],
         "upstream": ["材料制备"], "downstream": ["寿命评估"],
         "key_params": ["uv_aging_retention", "thermal_aging_retention",
-                       "salt_spray_resistance", "hydrolysis_resistance"],
+                       "salt_spray_resistance", "hydrolysis_resistance",
+                       "chamber_temp_uniformity", "chamber_temp_fluctuation"],
         "common_defects": ["紫外老化变色/衰减", "湿热老化分层", "盐雾腐蚀", "热氧老化降解"],
         "doe_factors": ["温度", "湿度", "辐照强度", "时长"],
         "notes": ("紫外/氙灯老化 GB-T 16422/ISO 4892/ASTM G154；湿热 GB-T 2423；"
@@ -128,13 +137,22 @@ PROCESSES = {
 # ---------------------------------------------------------------------------
 CTRL = {"mode": "deviation_pct", "limit_pct": 5.0, "cv_limit_pct": 5.0}
 
+# 标曲 / 计量溯源类参数的控制口径（方法属性，非每批产品测量值）
+R2_CTRL = {"mode": "lsl", "lsl": 0.99, "cv_limit_pct": 5.0}          # 标曲相关系数下限
+QC_CTRL = {"mode": "range", "lo": 80, "hi": 120, "cv_limit_pct": 5.0} # 质控样回收率 80–120%
+DUE_CTRL = {"mode": "lsl", "lsl": 0, "cv_limit_pct": 5.0}            # 计量有效期余量(天)，≤0 即超期
+UD_CTRL = {"mode": "usl", "usl": 30, "cv_limit_pct": 5.0}            # 测量不确定度上限(%)
+METHOD_ATTR_CTRL = {"mode": "range", "lo": 0, "hi": 100, "cv_limit_pct": 5.0}  # 方法属性占位，不参与 SPC 判异
+CHAMBER_CTRL = {"mode": "deviation_pct", "limit_pct": 10, "cv_limit_pct": 5.0}  # 老化箱温场偏差
+CHK_CTRL = {"mode": "deviation_pct", "limit_pct": 20, "cv_limit_pct": 5.0}      # 期间核查偏差
 
-def P(name, process, unit, aliases, trange, note, source):
+
+def P(name, process, unit, aliases, trange, note, source, control=None):
     return {
         "name": name, "process": process, "unit": unit,
         "aliases": aliases, "typical_range": trange,
-        "control": dict(CTRL),
-        "note": note + "（量级兜底，以受控规格为准）",
+        "control": control or dict(CTRL),
+        "note": note + "（量级兜底，以受控规格/方法确认报告为准）",
         "source": source,
     }
 
@@ -281,12 +299,63 @@ PARAMS = {
         ["耐水解", "吸水率"],
         [0, 5], "吸水率或水解后性能保持",
         "ISO 4611(耐水解)/GB-T 1034(吸水)"),
+    # --- 标曲 / 计量溯源（材料测试实验室能力口径）---
+    "cal_curve_r2": P("标曲相关系数(R²)", "material_spectroscopy", "(无量纲)",
+        ["标曲相关系数", "标曲R²", "校准曲线R²", "calibration R²"],
+        [0.99, 1.0], "定量方法标曲线性（化学/电学定量均适用）",
+        "CNAS-CL01:2018(等同 ISO/IEC 17025) 7.2/7.7；GB-T 27417-2017 定量方法确认；JJF 1033",
+        control=R2_CTRL),
+    "cal_linear_range": P("标曲线性范围", "material_spectroscopy", "(相对量级)",
+        ["标曲线性范围", "线性范围", "校准范围", "linear range"],
+        [1, 1000], "标液浓度上下限跨度（如 0.1–100 mg/L）",
+        "GB-T 27417-2017；IUPAC 分析化学术语",
+        control=METHOD_ATTR_CTRL),
+    "qc_recovery": P("质控样回收率", "material_spectroscopy", "%",
+        ["质控回收率", "回收率", "质控样回收率", "QC回收率", "QC recovery"],
+        [80, 120], "加标回收率，监控前处理与仪器系统稳定性",
+        "GB-T 27404-2008 实验室质量控制（回收率 80–120%）；CNAS-GL 037",
+        control=QC_CTRL),
+    "instrument_lod": P("仪器检出限(LOD)", "material_spectroscopy", "(方法属性)",
+        ["仪器检出限", "检出限", "LOD", "detection limit"],
+        [0, 1], "可可靠检出的最低量（方法确认输出）",
+        "GB-T 27417-2017；IUPAC；JJF 1001 通用计量术语",
+        control=METHOD_ATTR_CTRL),
+    "instrument_loq": P("仪器定量限(LOQ)", "material_spectroscopy", "(方法属性)",
+        ["仪器定量限", "定量限", "LOQ", "quantitation limit"],
+        [0, 10], "可定量的最低量（通常 3–10×LOD）",
+        "GB-T 27417-2017；IUPAC；JJF 1001",
+        control=METHOD_ATTR_CTRL),
+    "interval_check_dev": P("期间核查偏差", "material_spectroscopy", "%",
+        ["期间核查偏差", "期间核查超差", "核查偏差", "interval check"],
+        [0, 20], "两次检定/校准之间的核查偏差",
+        "JJF 1068/相关检定规程；CNAS-CL01 7.8 期间核查",
+        control=CHK_CTRL),
+    "cal_due_days": P("计量有效期余量", "material_spectroscopy", "天",
+        ["计量有效期余量", "校准有效期", "计量到期天数", "cal due", "校准剩余天数"],
+        [0, 365], "距下次强制检定的剩余天数（≤0 即超期）",
+        "JJF 1033 计量标准考核规范；CNAS-CL01 6.4 设备计量溯源",
+        control=DUE_CTRL),
+    "measurement_uncertainty": P("测量不确定度", "material_spectroscopy", "%",
+        ["测量不确定度", "不确定度", "uncertainty", "扩展不确定度"],
+        [0, 30], "扩展不确定度（k=2）相对量，表征结果可信区间",
+        "JJF 1059.1 测量不确定度评定与表示；CNAS-CL01 7.6",
+        control=UD_CTRL),
+    "chamber_temp_uniformity": P("老化箱温度均匀度", "material_reliability", "°C",
+        ["老化箱温度均匀度", "温度均匀度", "箱温均匀性", "temp uniformity"],
+        [0, 5], "老化/环境试验箱工作空间温度均匀度",
+        "JJF 1101 环境试验设备温度/湿度校准；GB-T 2423",
+        control=CHAMBER_CTRL),
+    "chamber_temp_fluctuation": P("老化箱温度波动度", "material_reliability", "°C",
+        ["老化箱温度波动度", "温度波动度", "temp fluctuation"],
+        [0, 2], "老化/环境试验箱温度波动度",
+        "JJF 1101；GB-T 2423",
+        control=CHAMBER_CTRL),
 }
 
 # ---------------------------------------------------------------------------
 # 缺陷机理（defect_rootcause）—— 全部带 source + note
 # ---------------------------------------------------------------------------
-def D(process, likely, mechanism, verify, quick, clear, param_key, aliases):
+def D(process, likely, mechanism, verify, quick, clear, param_key, aliases, source=SRC_GENERIC):
     return {
         "process": process,
         "likely_params": likely,
@@ -297,8 +366,8 @@ def D(process, likely, mechanism, verify, quick, clear, param_key, aliases):
         "clearing_evidence": clear,
         "param_key": param_key,
         "aliases": aliases,
-        "source": SRC_GENERIC,
-        "note": "机理取自公开检测机构资料，现场适用性待复核；最终判定须以实测数据为准。",
+        "source": source,
+        "note": "机理取自公开检测机构资料与计量规范，现场适用性待复核；最终判定须以实测数据与受控方法确认报告为准。",
     }
 
 
@@ -359,6 +428,63 @@ DEFECTS = {
         ["观察断面脆性形貌", "检查增韧相分布", "核对分子量"],
         ["追溯指向配方增韧体系"],
         "impact_strength", ["抗冲击差", "韧不足"]),
+    # --- 标曲 / 计量溯源类缺陷（材料测试实验室能力）---
+    "标曲线性不合格": D("material_spectroscopy",
+        ["cal_curve_r2", "cal_linear_range", "qc_recovery"],
+        "标液配制误差、仪器非线性响应、拟合阶数或点数不当、基质效应未校正",
+        ["标曲 R² 与残差", "标液配制记录", "线性范围覆盖度", "加标回收率"],
+        ["核对标曲 R² 是否≥0.99", "检查线性范围是否覆盖被测浓度", "重做高/低点回收率"],
+        ["追溯指向方法确认与仪器状态，属实验室能力层面"],
+        "cal_curve_r2", ["标曲不直", "相关系数不足", "校准曲线非线性", "标曲不合格"],
+        source=SRC_CAL),
+    "质控样失控": D("material_spectroscopy",
+        ["qc_recovery", "cal_curve_r2"],
+        "试剂/标准物质失效、仪器漂移、前处理波动、人员操作偏差",
+        ["质控样回收率趋势", "批内/批间 RSD", "试剂批号", "仪器状态日志"],
+        ["核对质控回收率是否落在 80–120%", "检查试剂与标准物质有效期", "重测平行样"],
+        ["追溯指向质控体系与仪器日常维护"],
+        "qc_recovery", ["质控失控", "回收率超差", "质控偏离", "QC失控"],
+        source=SRC_CAL),
+    "量值溯源断链": D("material_spectroscopy",
+        ["cal_due_days", "measurement_uncertainty"],
+        "设备超期未检定/校准、标准物质过期、无计量溯源链、证书失效",
+        ["设备检定/校准证书有效期", "标准物质有效期", "计量日程", "期间核查记录"],
+        ["核对设备是否在有效检定期内", "检查标准物质是否在有效期内", "确认溯源链证书"],
+        ["追溯指向计量管理与设备台账"],
+        "cal_due_days", ["溯源断链", "未计量", "超期未校", "计量失效", "无计量溯源"],
+        source=SRC_CAL),
+    "检出限不满足": D("material_spectroscopy",
+        ["instrument_lod", "instrument_loq", "qc_recovery"],
+        "仪器灵敏度不足、前处理损失、本底干扰高、信噪比低",
+        ["方法 LOD/LOQ 确认数据", "空白与加标响应", "信噪比", "前处理回收率"],
+        ["核对方法 LOD/LOQ 是否满足限值要求", "检查空白与加标响应", "优化前处理富集"],
+        ["追溯指向方法确认与仪器性能"],
+        "instrument_lod", ["LOD不足", "检出限不够", "灵敏度不够", "检出限不达标"],
+        source=SRC_CAL),
+    "期间核查超差": D("material_spectroscopy",
+        ["interval_check_dev", "cal_due_days"],
+        "环境因素波动、关键部件老化、未按计划核查、核查点选择不当",
+        ["期间核查偏差记录", "环境温湿度日志", "部件更换记录"],
+        ["核对期间核查偏差是否在允差内", "检查核查点与方法", "缩短核查周期复测"],
+        ["追溯指向设备维护计划"],
+        "interval_check_dev", ["核查超差", "期间核查不合格", "核查偏差超差"],
+        source=SRC_CAL),
+    "测量不确定度超阈值": D("material_spectroscopy",
+        ["measurement_uncertainty", "qc_recovery"],
+        "重复性不足、模型分量遗漏、样品不均匀、温湿度未受控",
+        ["不确定度评定报告", "重复性数据", "分量贡献", "环境记录"],
+        ["核对扩展不确定度是否超阈值", "检查重复性分量", "补全不确定度分量"],
+        ["追溯指向不确定度评定与过程控制"],
+        "measurement_uncertainty", ["不确定度过大", "uncertainty超", "不确定度超阈值"],
+        source=SRC_CAL),
+    "老化箱温场失准": D("material_reliability",
+        ["chamber_temp_uniformity", "chamber_temp_fluctuation"],
+        "加热器老化、循环风机故障、温度传感器漂移、箱内风道阻塞",
+        ["温场均匀度/波动度校准报告", "老化前后性能对比", "箱内多点温度记录"],
+        ["核对温度均匀度/波动度是否在允差内", "检查传感器与风机状态", "重新校准温场"],
+        ["追溯指向环境试验设备计量状态"],
+        "chamber_temp_uniformity", ["温场失准", "老化箱不准", "温度均匀度超差", "箱温失准"],
+        source=SRC_CAL),
 }
 
 

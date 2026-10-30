@@ -662,6 +662,10 @@ AUDIT_FILES = [
     # 规则 56：原生 Word/PDF 导出。判据同时读 export_doc.py 与 pipeline.py，
     # 变异要注入这两个文件——缺了 export_doc.py 会静默 SKIP（不是 FAIL）
     os.path.join("lib", "export_doc.py"),
+    # 规则 66/67：寿命充分性闸门与 FMEA 严重度优先。变异要注入这两个文件，
+    # 缺了它们会是静默 SKIP（不是 FAIL）——表现为"规则全绿"但一条都没验过。
+    os.path.join("lib", "reliability.py"),
+    os.path.join("lib", "fmea.py"),
     os.path.join("knowledge", "process_specs.json"),
 ]
 
@@ -1104,6 +1108,8 @@ def rule_defect_refs_not_dangling():
 
 
 ROOTCAUSE_FILE = os.path.join("lib", "rootcause.py")
+RELIABILITY_FILE = os.path.join("lib", "reliability.py")
+FMEA_FILE = os.path.join("lib", "fmea.py")
 CORRELATION_FILE = os.path.join("lib", "correlation.py")
 DIRECTION_FILE = os.path.join("lib", "direction.py")
 STATUS_FILE = os.path.join("lib", "status.py")
@@ -3093,6 +3099,75 @@ def rule_intro_doc_number_traps():
     return _r(True, "", {"number_traps": len(need)})
 
 
+def rule_reliability_sufficiency_gate():
+    """寿命结论必须有数据充分性闸门：失效数不足不得宣称 B10。
+
+    为什么这条必须存在：B10 是**会被写进质保承诺与客户协议**的数。
+    2 个失效点也能拟合出一条很漂亮的 Weibull 曲线——不报错、不出异常、
+    图也画得出来，但那个 B10 的置信区间宽到没有意义。
+    工具若不加闸门，错的不是"算得不准"，而是"给了不该给的结论"。
+
+    判据落在三处形态上（缺一处就算断）：
+      1. 拟合入口收得到 min_failures（下限可被企业口径覆盖，但不能没有）
+      2. b10_usable 初值必须是 False（默认"不可用"，不是默认"可用"）
+      3. 存在 n_fail < min_failures 的分支，且该分支里写了"不能用于承诺"的理由；
+         唯一的 True 赋值必须在这条分支之后（即只有过关才置真）
+    """
+    t = _read(RELIABILITY_FILE) or ""
+    if not t:
+        return _r(False, "读不到 " + RELIABILITY_FILE)
+    if not re.search(r"min_failures\s*=\s*DEFAULT_MIN_FAILURES", t):
+        return _r(False, "weibull_fit 没有 min_failures 下限参数——"
+                        "样本再少也会给出 B10，等于允许无据外推")
+    init = re.search(r'"b10_usable"\s*:\s*(\w+)', t)
+    if not init or init.group(1) != "False":
+        return _r(False, "b10_usable 初值不是 False——默认可用等于默认放行，"
+                        "闸门形同虚设")
+    gate = re.search(r"if n_fail < min_failures:", t)
+    if not gate:
+        return _r(False, "没有『失效数 < 下限则拒答』的分支")
+    tail = t[gate.end():gate.end() + 400]
+    if "不得用于质保承诺" not in tail and "只作趋势参考" not in tail:
+        return _r(False, "拒答分支里没写清『为什么不能用』——"
+                        "只报 insufficient 而不说原因，使用者会当成工具坏了")
+    pos_gate = t.find('if n_fail < min_failures:')
+    pos_true = t.find('out["b10_usable"] = True')
+    if pos_true < 0:
+        return _r(False, "没有任何地方把 b10_usable 置真——闸门永远不放行，"
+                        "等于把有用结论也一起封死")
+    if pos_true < pos_gate:
+        return _r(False, "b10_usable 在闸门之前就被置真，闸门被绕过")
+    return _r(True, "", {"gate_at": pos_gate, "true_at": pos_true})
+
+
+def rule_fmea_severity_before_rpn():
+    """FMEA 排序必须严重度优先，且缺分不得当成 0 分。
+
+    两个都是行业里反复出事的错法：
+      1. 只按 RPN 排：10×1×1 的安全隐患（RPN=10）被 5×6×6 的外观问题（RPN=180）
+         挤到后面去。严重度不可被频度/探测度抵消，这是 AIAG/VDA 的公开立场。
+      2. 缺分当 0：S/O/D 有空值时算出 RPN=0，直接沉到列表底部——
+         "没填"被读成"风险最低"，这是静默失效里最坏的一种。
+
+    判据：
+      1. 缺分分支返回 rpn=None（不是 0）
+      2. 只有 usable 的行参与排序
+      3. 排序键里 severity_gate 必须排在 RPN 之前
+    """
+    t = _read(FMEA_FILE) or ""
+    if not t:
+        return _r(False, "读不到 " + FMEA_FILE)
+    if not re.search(r'"usable"\s*:\s*False,\s*"rpn"\s*:\s*None', t):
+        return _r(False, "缺分时没有返回 rpn=None——"
+                        "返回 0 会让人以为『风险最低』，实际是『没填』")
+    if not re.search(r'usable\s*=\s*\[x for x in evaluated if x\["usable"\]\]', t):
+        return _r(False, "排序前没有筛掉缺分行，缺分会参与风险排名")
+    if not re.search(r'0 if x\["severity_gate"\] else 1', t):
+        return _r(False, "排序键里没有严重度闸门优先——"
+                        "高危低 RPN 项会被高 RPN 的外观问题压下去")
+    return _r(True, "", {"ok": True})
+
+
 AUDIT_RULES = [
     Rule("LICENSE 与代码事实对齐：Elastic 2.0 正文齐全且无许可密钥条款", rule_license,
          "（1）首行必须是裸文本 'Elastic License 2.0'（带 # 判不过）；"
@@ -4287,6 +4362,30 @@ AUDIT_RULES = [
           _mutant("删掉『样本量<30』陷阱一节（修复退化：小样本结论照样被拿去决策）",
                   _re_sub(r"### ⑧[^\n]*\n[\s\S]*?\n---\n", "\n---\n"),
                   INTRO_DOC)]),
+    Rule("寿命结论必须带数据充分性闸门（失效数不足不得宣称 B10）",
+         rule_reliability_sufficiency_gate,
+         "weibull_fit 必须收到 min_failures 下限参数；b10_usable 初值必须为 False；"
+         "必须存在『失效数 < 下限则拒答并说明原因』的分支，且唯一的 True 赋值在其之后。"
+         "B10 会被写进质保承诺，2 个失效点也能拟出漂亮曲线——不设闸门就是允许无据外推。",
+         RELIABILITY_FILE,
+         [_mutant("拆掉失效数下限（修复退化：少样本也照出 B10）",
+                  _sub("if n_fail < min_failures:", "if False:"),
+                  RELIABILITY_FILE),
+          _mutant("b10_usable 默认改为可用（修复退化：默认放行）",
+                  _sub('"b10_usable": False,', '"b10_usable": True,'),
+                  RELIABILITY_FILE)]),
+    Rule("FMEA 必须严重度优先排序，缺分不得当 0 分",
+         rule_fmea_severity_before_rpn,
+         "缺分分支必须返回 rpn=None；排序前必须用 usable 筛掉缺分行；"
+         "排序键必须是 severity_gate 优先于 RPN。"
+         "缺分当 0 会把『没填』读成『风险最低』，只按 RPN 排会让安全隐患被外观问题压下去。",
+         FMEA_FILE,
+         [_mutant("排序只按 RPN（修复退化：高危低 RPN 项被压到后面）",
+                  _re_sub(r'0 if x\["severity_gate"\] else 1', '0'),
+                  FMEA_FILE),
+          _mutant("缺分返回 0 分（修复退化：没填=风险最低）",
+                  _sub('"usable": False, "rpn": None', '"usable": False, "rpn": 0'),
+                  FMEA_FILE)]),
 ]
 
 
@@ -4494,6 +4593,210 @@ def flow_ops(args):
     print("=" * 68)
     if getattr(args, "json", False):
         print(json.dumps(rep, ensure_ascii=False, indent=2))
+    return 0
+
+
+def flow_reliability(args):
+    """寿命数据分析（Weibull / MTBF / B10 / 加速寿命）。
+
+    JD 对标：储能与电芯可靠性岗普遍要求 Weibull / MTBF / 加速寿命（ALT）。
+    这一流程不接受"帮我猜哪一列是寿命"——列名必须显式给。猜错的后果是
+    拿一列序号算出漂亮的 β 和 B10，然后被写进质保承诺。
+    """
+    sys.path.insert(0, ROOT)
+    from lib import table as T
+    from lib import reliability as REL
+
+    path = (getattr(args, "input", None) or [None])[0]
+    if not path:
+        print("reliability 需要 --input 指定数据文件")
+        return 2
+    tb = T.read_any(path, sheet=getattr(args, "sheet", None))
+    print("=" * 68)
+    print("寿命数据分析（Weibull / MTBF / B10 / 加速寿命）")
+    print("=" * 68)
+    print("数据：%s｜%d 行 × %d 列" % (path, len(tb.rows), len(tb.columns)))
+
+    tcol = getattr(args, "time_col", None)
+    if not tcol:
+        print("必须用 --time-col 指定寿命/失效时间列。可选列：")
+        for c in tb.columns:
+            print("      · %s" % c)
+        print("（不自动猜：猜错会拿无关列算出 B10，而 B10 会被写进质保承诺）")
+        return 2
+    ti = tb.col_index(tcol)
+    if ti is None:
+        print("列 %r 不存在。可选列：%s" % (tcol, "、".join(tb.columns)))
+        return 2
+    times = [r[ti] for r in tb.rows]
+
+    cens = None
+    ccol = getattr(args, "censor_col", None)
+    if ccol:
+        ci = tb.col_index(ccol)
+        if ci is None:
+            print("删失列 %r 不存在。可选列：%s" % (ccol, "、".join(tb.columns)))
+            return 2
+        truthy = {"1", "true", "是", "y", "yes", "未失效", "删失", "censor",
+                  "censored", "right"}
+        cens = [str(r[ci]).strip().lower() in truthy for r in tb.rows]
+        print("删失列：%s（%d 条标记为未失效）" % (ccol, sum(1 for x in cens if x)))
+
+    sc = getattr(args, "stress_col", None)
+    if sc:
+        si = tb.col_index(sc)
+        if si is None:
+            print("应力列 %r 不存在。可选列：%s" % (sc, "、".join(tb.columns)))
+            return 2
+        groups = {}
+        for k, r in enumerate(tb.rows):
+            key = str(r[si]).strip()
+            groups.setdefault(key, ([], []))
+            groups[key][0].append(times[k])
+            groups[key][1].append(cens[k] if cens else False)
+        tbl = REL.group_life_table(groups)
+        print("-" * 68)
+        print("按应力分组拟合（应力列：%s）" % sc)
+        print("%-12s %8s %8s %9s %12s %10s" % ("应力", "n", "失效数", "β", "η", "B10"))
+        for row in tbl["rows"]:
+            print("%-12s %8d %8d %9s %12s %10s"
+                  % (row["group"], row["n"], row["n_fail"],
+                     ("%.3f" % row["beta"]) if row["beta"] else "—",
+                     ("%.1f" % row["eta"]) if row["eta"] else "—",
+                     ("%.1f" % row["b10"]) if row["b10"] else "—"))
+        model = getattr(args, "model", None) or "arrhenius"
+        for w in tbl.get("warnings") or []:
+            print("  ⚠ %s" % w)
+        alt = REL.alt_fit(tbl["alt_points"], model,
+                          use_stress=getattr(args, "use_stress", None))
+        print("-" * 68)
+        print("加速模型：%s" % (alt.get("model_desc") or alt.get("model")))
+        print("拟合水平数：%d｜R²：%s"
+              % (alt.get("levels") or 0,
+                 ("%.4f" % alt["r2"]) if alt.get("r2") is not None else "—"))
+        if alt.get("params"):
+            print("模型参数：%s" % alt["params"].get("interpret"))
+        if alt.get("life_at_use"):
+            print("使用应力 %s 下外推特征寿命：%.1f"
+                  % (alt.get("use_stress"), alt["life_at_use"]))
+        if alt.get("acceleration_factor"):
+            print("加速因子 AF（试验/使用）：%.2f×" % alt["acceleration_factor"])
+        for w in alt.get("warnings") or []:
+            print("  ⚠ %s" % w)
+        print("  说明：%s" % alt.get("note"))
+    else:
+        fit = REL.weibull_fit(times, cens)
+        print("-" * 68)
+        print("样本 %d 条｜失效 %d｜删失 %d（%s）"
+              % (fit["n"], fit["n_fail"], fit["n_censored"],
+                 ("%.0f%%" % fit["censoring_pct"])
+                 if fit["censoring_pct"] is not None else "—"))
+        if fit["beta"]:
+            print("形状 β = %.4f  %s" % (fit["beta"],
+                                       ("CI %s" % _fmt_ci(fit["beta_ci"])) if fit["beta_ci"] else ""))
+            print("尺度 η = %.2f  %s" % (fit["eta"],
+                                       ("CI %s" % _fmt_ci(fit["eta_ci"])) if fit["eta_ci"] else ""))
+            print("MTBF  = %.2f  %s" % (fit["mtbf"], ("CI %s" % _fmt_ci(fit["mtbf_ci"]))
+                                        if fit["mtbf_ci"] else ""))
+            print("B10   = %.2f  %s%s" % (fit["b10"], ("CI %s" % _fmt_ci(fit["b10_ci"]))
+                                          if fit["b10_ci"] else "",
+                                          "" if fit["b10_usable"] else "  ⚠ 不可用于质保承诺"))
+            print("概率图 R² = %s（仅作体测，小样本会虚高）"
+                  % (("%.4f" % fit["goodness_r2"]) if fit["goodness_r2"] is not None else "—"))
+            print("-" * 68)
+            print("解读：%s" % fit["beta_interpret"])
+        for w in fit["warnings"]:
+            print("  ⚠ %s" % w)
+        print("  说明：%s" % fit["note"])
+    print("=" * 68)
+    return 0
+
+
+def _fmt_ci(ci):
+    if not ci:
+        return "—"
+    return "[%.2f, %.2f]" % (ci[0], ci[1])
+
+
+def flow_fmea(args):
+    """FMEA 风险排序与填报审计（RPN + 严重度闸门 + 一致性检查）。"""
+    sys.path.insert(0, ROOT)
+    from lib import fmea as F
+    from lib import table as T
+
+    rows = None
+    src = getattr(args, "from_defects", None)
+    if src:
+        if not os.path.exists(src):
+            print("--from-defects 指向的 analyze 结果不存在：%s" % src)
+            return 2
+        with open(src, encoding="utf-8") as f:
+            rep = json.load(f)
+        defects = rep.get("defects") or (rep.get("rootcause") or {}).get("defects") or []
+        rows = F.seed_from_defects(defects)
+        print("=" * 68)
+        print("FMEA 骨架（来源：%s 识别到的 %d 条缺陷）" % (src, len(rows)))
+        print("=" * 68)
+        print("S/O/D 与后果、控制手段一律留空——这些必须由现场依据评分，"
+              "工具不代填。")
+        out = getattr(args, "out", None) or os.path.join(
+            getattr(args, "outdir", "output"), "_fmea_seed.csv")
+        d = os.path.dirname(out)
+        if d and not os.path.isdir(d):
+            os.makedirs(d, exist_ok=True)
+        cols = ["工序", "失效模式", "参数", "后果", "严重度", "频度", "探测度",
+                "预防控制", "探测控制"]
+        tb = T.Table(cols, [[r.get(c, "") for c in cols] for r in rows], "fmea_seed")
+        T.write_csv(tb, out)
+        print("骨架已写入：%s（填完 S/O/D 后用 --input 指回来评估）" % out)
+        print("=" * 68)
+        return 0
+
+    path = (getattr(args, "input", None) or [None])[0]
+    if not path:
+        print("fmea 需要 --input 指定 FMEA 表（CSV/XLSX），"
+              "或用 --from-defects 从 analyze 结果生成骨架")
+        return 2
+    tb = T.read_any(path, sheet=getattr(args, "sheet", None))
+    dicts = [dict(zip(tb.columns, r)) for r in tb.rows]
+    rep = F.evaluate(dicts, top_n=int(getattr(args, "top", None) or 10),
+                     rpn_threshold=getattr(args, "rpn_threshold", None))
+
+    print("=" * 68)
+    print("FMEA 风险排序与填报审计")
+    print("=" * 68)
+    print("数据：%s｜%d 行｜可算 RPN %d 行｜状态 %s"
+          % (path, rep["n_rows"], len(rep["top"]) if rep["top"] else 0, rep["status"]))
+    if rep["top"]:
+        print("-" * 68)
+        print("%-4s %-10s %-18s %3s %3s %3s %5s %s"
+              % ("行", "工序", "失效模式", "S", "O", "D", "RPN", "闸门"))
+        for x in rep["top"]:
+            print("%-4d %-10s %-18s %3s %3s %3s %5d %s"
+                  % (x["row"], x["step"][:10], x["mode"][:18], x["S"], x["O"],
+                     x["D"], x["rpn"], "★必改" if x["severity_gate"] else ""))
+    ag = rep.get("aggregates") or {}
+    if ag.get("by_step"):
+        print("-" * 68)
+        print("按工序：")
+        for st, s in sorted(ag["by_step"].items(), key=lambda kv: -kv[1]["max_rpn"]):
+            print("      · %-12s %2d 条｜最高 RPN %3d｜必改 %d 条"
+                  % (st[:12], s["n"], s["max_rpn"], s["gate"]))
+    for key, label in (("missing_score", "缺分/非法打分"),
+                       ("logic_flags", "填报逻辑矛盾")):
+        items = rep["audit"].get(key) or []
+        if items:
+            print("-" * 68)
+            print("%s（%d 处）：" % (label, len(items)))
+            for it in items[:10]:
+                body = it.get("errors") or it.get("flags")
+                print("      · 第 %d 行 %s：%s"
+                      % (it["row"], it.get("mode") or "", body))
+    for w in rep["warnings"]:
+        print("  ⚠ %s" % w)
+    print("-" * 68)
+    print("说明：%s" % rep["note"])
+    print("=" * 68)
     return 0
 
 
@@ -5174,12 +5477,14 @@ def main(argv=None):
         description="newenergy-fde 唯一入口编排器（流程代码化 + 证据落盘）")
     ap.add_argument("flow",
                     choices=["audit", "verify", "analyze", "release", "config",
-                             "kb", "ops"],
+                             "kb", "ops", "reliability", "fmea"],
                     help="audit=约定落地核查  verify=质量闸门  "
                          "analyze=交付主流程  release=发布  "
                          "config=可调参数清单与企业规格模板  "
                          "kb=知识生命周期与出处覆盖率审计  "
-                         "ops=可观测性运维视图（结构化日志回读）")
+                         "ops=可观测性运维视图（结构化日志回读）  "
+                         "reliability=寿命分析（Weibull/MTBF/B10/加速寿命）  "
+                         "fmea=FMEA 风险排序与填报审计")
     ap.add_argument("--input", "-i", nargs="+", help="analyze：数据文件")
     ap.add_argument("--outdir", "-o", default="output", help="analyze：输出目录")
     ap.add_argument("--target", help="analyze：目标指标列")
@@ -5220,6 +5525,23 @@ def main(argv=None):
                     help="config：配合 --products 出交叉搭配映射表"
                          "（所有产品组合 → 配置，含需人决断项）")
 
+    # ---- reliability / fmea 专用参数（列名一律显式给，不自动猜）----
+    ap.add_argument("--time-col", help="reliability：寿命/失效时间列名")
+    ap.add_argument("--censor-col",
+                    help="reliability：删失标记列（是/未失效/1 视为右删失）")
+    ap.add_argument("--stress-col",
+                    help="reliability：应力列（按应力分组拟合后做加速模型）")
+    ap.add_argument("--model", choices=["arrhenius", "inverse_power",
+                                       "coffin_manson"],
+                    help="reliability：加速模型（必须由人指定机理，工具不猜）")
+    ap.add_argument("--use-stress", type=float,
+                    help="reliability：使用应力（Arrhenius 填绝对温度 K）")
+    ap.add_argument("--top", type=int, help="fmea：输出前 N 条风险（默认 10）")
+    ap.add_argument("--rpn-threshold", type=float,
+                    help="fmea：按 RPN 阈值分组（实践惯例，非标准强制；不给则只排序）")
+    ap.add_argument("--from-defects",
+                    help="fmea：从 analyze 结果 JSON 生成 FMEA 骨架（S/O/D 留空待人工评分）")
+
     # 把 lib/pipeline.py 的全部参数动态补进来（取长选项，不抢短选项）。
     # 目的是让「唯一入口」名副其实：pipeline 新增参数时编排器自动跟上，
     # 不会出现「换了统一入口反而少一个开关」这种静默降级。
@@ -5258,6 +5580,10 @@ def main(argv=None):
         return flow_kb(args)
     if args.flow == "ops":
         return flow_ops(args)
+    if args.flow == "reliability":
+        return flow_reliability(args)
+    if args.flow == "fmea":
+        return flow_fmea(args)
     if args.flow == "audit":
         return flow_audit(args)
     if args.flow == "verify":
