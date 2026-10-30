@@ -195,18 +195,26 @@ _SELF_ARTIFACTS = ("scripts/coherence_audit.py",
 
 
 def _all_text(files):
-    """全库文本（含文档/配置），用于判断"这个名字是否真的没人用"。"""
+    """**只扫代码**，用于判断"这个名字是否真的没人用"。
+
+    为什么不能算文档与配置（这是第二次踩同一个坑）：
+    第一版把 `*.md` / `docs/*.md` / `*.json` 也算进来，于是审计脚本与基线文件里
+    列出函数名，让"零调用"变成"出现过两次"——**刚报出的问题下一轮自动消失**。
+    后来排除了这两个自身产物，但坑还在：**任何人写一份文档提到某个函数名
+    （比如"auto_chart 仍未被调用"），这个函数就会被判成"有人用"**。
+    实测就是这么发生的：我在 docs 里写了 `spc.auto_chart` 未被调用，
+    下一次审计它就不报了——报告自己把问题治好了。
+
+    判据必须是：**代码里有调用**才算有人用。
+    文档写"这个函数没人调用"属于描述，不是调用。
+    """
     txt = []
     for f in files:
         if _rel(f) in _SELF_ARTIFACTS:
             continue
+        if not f.endswith(".py"):
+            continue
         txt.append(_read(f))
-    import glob as _g
-    for pat in ("*.md", "docs/*.md", "knowledge/*.json", "*.json"):
-        for p in _g.glob(os.path.join(ROOT, pat)):
-            if _rel(p) in _SELF_ARTIFACTS:
-                continue
-            txt.append(_read(p))
     return "\n".join(txt)
 
 
@@ -234,6 +242,20 @@ def check_orphans(files, alltext):
                 continue
             key = "%s:%s" % (_rel(f), name)
             wl = WHITELIST.get(key)
+            # 项目已有 `# scan:keep <理由与启用条件>` 的死代码约定（static_scan 认它）。
+            # 审计器不认就等于两套规矩：同一个函数 S 系列放过、A 系列报出来，
+            # 而人只会看到其中一个。这里对齐，且**仍要计数报出来**。
+            _src = _read(f).split("\n")
+            _declared = ""
+            for _k in range(max(0, node.lineno - 4), node.lineno):
+                _ln = _src[_k] if _k < len(_src) else ""
+                if "scan:keep" in _ln:
+                    _declared = _ln.strip()
+                    break
+            if _declared and not wl:
+                _CLASSIFIED.append({"kind": "ORPHAN", "file": _rel(f),
+                                    "name": name, "cls": "scan_keep"})
+                continue
             res.append({"kind": "ORPHAN", "file": _rel(f), "line": node.lineno,
                         "name": name,
                         "whitelisted": bool(wl),
@@ -498,6 +520,12 @@ def check_dead_flags(_files=None):
 # ---------------------------------------------------------------- 主流程
 
 def audit(include_whitelisted=False):
+    # 台账必须每次清零。不清的后果是**数字失真**：同一个进程里跑两遍，
+    # 分类条数会翻倍（实测 73 → 146），而报告照常打印——
+    # 一个"越跑越脏"的计数器比没有计数器更糟，因为它看起来是权威的。
+    # 规则自检会反复调 audit()，所以这条不只是洁癖。
+    del _CLASSIFIED[:]
+    del _SKIPPED[:]
     files = collect_sources()
     alltext = _all_text(files)
     items = []
