@@ -81,6 +81,8 @@ sys.path.insert(0, ROOT)
 #   1) public_api  —— 对外提供的 API，仓库内本就不用（需说明给谁用）
 #   2) dynamic     —— 通过 getattr/反射/插件机制调用，静态分析看不见
 #   3) platform    —— 平台入口（__main__ 分发、脚本 CLI）
+#   4) generic_render —— 由 `dict.items()` 泛型渲染的产出（报告头元信息等），
+#                        键名不出现在读取代码里，是检测器盲区而非真断头路
 # **"暂时用不到"不是理由**——那是没接线。
 # ---------------------------------------------------------------- 分类规则
 # B/C 两类里有一批条目**本质上不是脱节**，把它们和真问题混在一起报，
@@ -154,13 +156,14 @@ WHITELIST = {
         ("public_api", "派生列注入，供测试与外部构造场景；主流程走内部的列推导。"),
     "lib/table.py:read_multi":
         ("public_api", "多表读入，供外部脚本；主流程走 ingest.merge。"),
-    "lib/spc.py:detect_shift_segments":
-        ("public_api", "返回 [] 表示『没有检出偏移段』，这是**正确语义**而非静默失败："
-                       "调用方据此判断过程无结构性偏移。已加这条说明后"
-                       "不再重复报警，但若将来它改成返回 None 或吞异常，仍会被 D 类抓到。"),
     "lib/process_window.py:joint_two":
         ("public_api", "对称双侧联合合格率的简化入口，供快速估算与自检对比；"
                        "主路径走 joint_two_bounds（吃真实非对称上下限）。"),
+    "lib/views.py:_meta":
+        ("generic_render", "报告头元信息 dict，由 Report 用 `meta.items()` 泛型展开"
+                           "（markdown 与 HTML 两条渲染路径都是），键名不会出现在"
+                           "任何读取代码里——判据看不见泛型消费，属检测器盲区。"
+                           "字段名对用户可见，删掉会真正丢信息。"),
 }
 
 
@@ -372,10 +375,18 @@ def check_dead_output(files, alltext):
                     if alltext.count('"%s"' % key) > 1 or \
                             alltext.count("'%s'" % key) > 1:
                         continue
+                    # 白名单：有一类"没人按名字读"是**假阳性**——
+                    # 报告头元信息这类 dict 是被 `meta.items()` 泛型渲染的，
+                    # 键名根本不会出现在读取代码里。判据看不见泛型消费，
+                    # 若不提供登记入口，正确做法就会变成"把字段删掉"，
+                    # 那是为了迁就检测器而减信息。理由是显式写的，可复核。
+                    key2 = "%s:%s" % (_rel(f), node.name)
+                    wl = WHITELIST.get(key2)
                     res.append({"kind": "DEAD_OUTPUT", "file": _rel(f),
                                 "line": sub.lineno,
                                 "name": "%s → %r" % (node.name, key),
-                                "whitelisted": False, "reason": "",
+                                "whitelisted": bool(wl),
+                                "reason": wl[1] if wl else "",
                                 "detail": "返回值里的 %r 全库无人读取" % key})
     return res
 

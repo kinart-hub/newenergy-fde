@@ -122,8 +122,15 @@ def tenant_kb(tid=None):
 
 
 def promotion_dir(tid=None):
-    """租户想把成果提给基线时的投递区（不写基线，只投候选）"""
-    return os.path.join(SKILL_ROOT, "promotion")
+    """租户想把成果提给基线时的投递区（不写基线，只投候选）。
+
+    tid 必须生效：曾经收了 tid 却一律返回共享的 `<root>/promotion`，
+    于是**所有租户的提级候选都投进同一个队列**——A 厂提的知识会进 B 厂的
+    待审列表，tenant 隔离在这一层形同虚设（而隔离正是租户机制的立身之本）。
+    现在：有租户就落该租户自己的投递区，没有租户（基线模式）才用共享区。
+    """
+    r = tenant_root(tid)
+    return os.path.join(r, "promotion") if r else os.path.join(SKILL_ROOT, "promotion")
 
 
 def set_tenant(tid):
@@ -139,9 +146,14 @@ def set_tenant(tid):
     safe = _safe_id(tid)
     tr = os.path.join(SKILL_ROOT, "tenants", safe)
     kb = os.path.join(tr, "knowledge")
-    for d in (tr, kb, os.path.join(kb, "backups"), promotion_dir()):
+    # 建的是**新租户**的投递区，必须显式拼路径。
+    # 原先这里调 promotion_dir()，而它取的是 `_TENANT`——此时 _TENANT 还是
+    # 上一个租户（或 None），于是切租户时创建的是**旧租户**的目录，
+    # 新租户的投递区根本不存在，第一次投递就会写失败或落到共享区。
+    promo = os.path.join(tr, "promotion")
+    for d in (tr, kb, os.path.join(kb, "backups"), promo):
         os.makedirs(d, exist_ok=True)
-    _TENANT_DIRS[safe] = {"root": tr, "kb": kb,
+    _TENANT_DIRS[safe] = {"root": tr, "kb": kb, "promotion": promo,
                           "lock": os.path.join(tr, ".lock")}
     _TENANT = safe
     return _TENANT_DIRS[safe]

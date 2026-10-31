@@ -73,9 +73,14 @@ def D4_factor(n):
 
 # ------------------------------------------------------------------ 规格解析
 
-def resolve_spec(control, measured_mean=None, measured_sigma=None, target=None):
+def resolve_spec(control, measured_mean=None, target=None):
     """把知识库的 control 描述解析为 (lsl, usl, target)。
-    control: {"mode":..., ...}"""
+    control: {"mode":..., ...}
+
+    **刻意不收 measured_sigma**：控制限必须来自登记的规格口径，
+    不能用实测 σ 反推——拿这批数据的 σ 去定合格线，等于宣布"现状即合格"：
+    过程越乱，合格线越宽，判异永远不会响。这是自我循环，不是规格。
+    （原先签名里有 measured_sigma，调用方真的在传，函数却一次都没读过它。）"""
     if not control:
         return None, None, None
     mode = control.get("mode")
@@ -249,7 +254,7 @@ def _split_same_side_runs(vals, med, rs):
 
 
 def detect_shift_segments(values, min_run=None, min_zdiff=None,
-                          min_sig=None, min_outside=None):
+                          min_sig=None, min_outside=None, report=None):
     """识别"整体抬升/下沉的连续段"（段级偏移），返回段列表。
 
     解决什么问题（这是本函数存在的唯一理由）：
@@ -275,7 +280,22 @@ def detect_shift_segments(values, min_run=None, min_zdiff=None,
       真偏移时段外干净（实测 φ≈0）→ 阈值不放大 → 命中。
 
     返回 [{start, end, side, z, phi_out, n}]，start/end 是在传入序列里的位置。
+
+    report：可选 dict，in-place 填入本次检测的**结论状态**：
+      status = SUCCESS / NO_FINDING / INSUFFICIENT_DATA
+      reason / n / min_run / closest（最接近阈值的候选差多少）
+    为什么必须给：返回 [] 有两个完全不同的含义——「序列里确实没有整体偏移」
+    与「样本太少/尺度不可估，这活儿根本没干」。旧实现两者都返回 []，
+    调用方（和报告读者）会把后者读成前者，于是一条 15 点的序列被报成
+    「过程无结构性偏移」。这是"没算"冒充"没有"，比算错更危险。
     """
+    def _rep(status, reason, **kw):
+        if isinstance(report, dict):
+            report.clear()
+            report.update({"status": status, "reason": reason})
+            report.update(kw)
+        return []
+
     _min_run = SEG_MIN_RUN if min_run is None else min_run
     _min_zdiff = SEG_MIN_ZDIFF if min_zdiff is None else min_zdiff
     _min_sig = SEG_MIN_SIG if min_sig is None else min_sig
@@ -283,17 +303,25 @@ def detect_shift_segments(values, min_run=None, min_zdiff=None,
 
     n = len(values)
     if n < 12:
-        return []
+        return _rep("INSUFFICIENT_DATA",
+                    "样本 n=%d < 12，段级偏移检测不适用（不能用『未检出偏移段』解读）" % n,
+                    n=n, min_run=_min_run)
     med = S.median(values)
     rs = S.robust_sigma(values)
     if not rs or rs <= 0:
-        return []
+        return _rep("INSUFFICIENT_DATA",
+                    "序列无变异（稳健尺度为零），偏移段无从判别——不是『没有偏移』",
+                    n=n, min_run=_min_run)
 
     out = []
     all_idx = set(range(n))
+    # 记录每个候选段卡在哪一关，用于区分「确实没有」与「有但没过阈值」
+    _closest = None      # (z_out, m_in, m_out, n_seg, 关卡名)
+    _n_runs = 0
     for side, idxs in _split_same_side_runs(values, med, rs):
         if len(idxs) < _min_run:
             continue
+        _n_runs += 1
         outside = [values[i] for i in sorted(all_idx - set(idxs))]
         if len(outside) < _min_out:
             continue
@@ -304,12 +332,20 @@ def detect_shift_segments(values, min_run=None, min_zdiff=None,
             continue
         z_out = (m_in - m_out) / rs_out * side
         if z_out < _min_zdiff:
+            if _closest is None or z_out > _closest[0]:
+                _closest = (round(z_out, 3), round(m_in, 6), round(m_out, 6),
+                            len(idxs), "偏移幅度不足 %.2fσ（阈值 %.2fσ）"
+                            % (z_out, _min_zdiff))
             continue
         phi_out = max(-0.9, min(0.9, _ar1_phi(outside)))
         # AR(1) 有效样本量 n_eff = n(1-φ)/(1+φ) → 标准误放大 sqrt((1+φ)/(1-φ))
         infl = math.sqrt((1 + phi_out) / (1 - phi_out))
         se = 1.2533 * rs_out / math.sqrt(len(idxs)) * infl
         if se <= 0 or (m_in - m_out) / se * side < _min_sig:
+            if _closest is None or z_out > _closest[0]:
+                _closest = (round(z_out, 3), round(m_in, 6), round(m_out, 6),
+                            len(idxs), "偏移幅度 %.2fσ 够、但未达统计显著（阈值 %.2f）"
+                            % (z_out, _min_sig))
             continue
         # 段边界收紧：同侧 run 的边界会把"刚过中心线一点点"的正常点也圈进来
         # （实测 40 点稳定段 + 5 个尖峰时，第 39 点值 10.61、中心 9.98，
@@ -320,12 +356,31 @@ def detect_shift_segments(values, min_run=None, min_zdiff=None,
         kept = [i for i in idxs
                 if (values[i] > _mid if side > 0 else values[i] < _mid)]
         if len(kept) < _min_run:
+            if _closest is None or z_out > _closest[0]:
+                _closest = (round(z_out, 3), round(m_in, 6), round(m_out, 6),
+                            len(kept), "边界收紧后只剩 %d 点，不足最短段长 %d"
+                            % (len(kept), _min_run))
             continue
         idxs = kept
         out.append({"start": idxs[0], "end": idxs[-1], "side": side,
                     "z": round(z_out, 3), "phi_out": round(phi_out, 3),
                     "n": len(idxs),
                     "median_in": round(m_in, 6), "median_out": round(m_out, 6)})
+    if out:
+        _rep("SUCCESS", "检出 %d 个整体偏移段" % len(out), n=n,
+             min_run=_min_run, n_segments=len(out), n_runs=_n_runs)
+        # _rep 会清空 report，但这里不能影响返回值 out
+    elif _closest:
+        _rep("NO_FINDING",
+             "有 %d 个同侧候选段，但都没过门槛；最接近的一个：段中位数 %.6g vs 其余 %.6g，%s"
+             % (_n_runs, _closest[1], _closest[2], _closest[4]),
+             n=n, min_run=_min_run, n_segments=0, n_runs=_n_runs,
+             closest={"z": _closest[0], "median_in": _closest[1],
+                      "median_out": _closest[2], "n": _closest[3]})
+    else:
+        _rep("NO_FINDING",
+             "全段未出现连续 ≥%d 点的同侧 run，不存在可判的整体偏移段" % _min_run,
+             n=n, min_run=_min_run, n_segments=0, n_runs=0)
     return out
 
 
@@ -388,11 +443,14 @@ def phase1_limits(values, max_iter=4, rules=None, max_drop_ratio=0.5,
     #      而且它剔出的空洞会打断"连续 N 点"的判定，使剩下的半截再也够不到阈值。
     # 先整段剔掉，后面逐点迭代只需处理单点尖峰，收敛更快也更干净。
     segments = []
+    seg_scan = {}
     try:
-        segments = detect_shift_segments(vals)
+        segments = detect_shift_segments(vals, report=seg_scan)
     except Exception as exc:
         _note("spc.phase1@segments", exc)
         segments = []
+        # 抛异常与「确实没检出」必须分开留痕，否则崩溃会被读成"过程无偏移"
+        seg_scan = {"status": "FAILED", "reason": "段级偏移检测抛异常：%s" % str(exc)[:120]}
     seg_hit = set()
     for sg in segments:
         seg_hit |= set(range(sg["start"], sg["end"] + 1))
@@ -691,6 +749,9 @@ def phase1_limits(values, max_iter=4, rules=None, max_drop_ratio=0.5,
              "side": s["side"], "z": s["z"], "n": s["n"],
              "phi_out": s["phi_out"]}
             for s in (segments or [])],
+        # 段级检测的结论状态：区分「确实无整体偏移」与「样本不够、这活儿没干」。
+        # 不接这一层，15 点的序列会被报告读成"过程无结构性偏移"。
+        "shift_scan": seg_scan,
         "iterations": iters, "stable": stable, "note": note,
         "mode": mode, "rules_used": tuple(parse_rules(rules)),
     }
@@ -870,7 +931,7 @@ def autocorrelation(values, max_lag=None):
     return {"status": "OK", "n": n, "limit": lim, "acf": acf}
 
 
-def autocorrelation_diagnosis(values, alpha=None):
+def autocorrelation_diagnosis(values):
     """自相关诊断 → 该用哪种图。返回 dict（含 autocorrelation 各阶与结论）。
 
     结论取严：只要 lag-1 或前 3 阶里有任一阶显著，就认为该过程自相关，
@@ -909,7 +970,7 @@ def autocorrelation_diagnosis(values, alpha=None):
     return out
 
 
-def _acf_factor(acf_rows, lam=None, n=None):
+def _acf_factor(acf_rows, lam=None):
     """自相关对 EWMA/均值统计量的方差放大因子。
 
     EWMA 统计量的稳态方差

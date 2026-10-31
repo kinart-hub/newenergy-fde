@@ -437,8 +437,25 @@ def explainability(table, col, col_map=None, include_test_condition=False):
     """
     roles = {}
     numeric, textual = [], []
+    # col_map 是「响应/控制」先验的入口，必须参与筛选。
+    # docstring 里那句"必须和响应/控制先验联合使用"原先只是写在文档里——
+    # col_map 收了却从不读，于是"结果被另一个结果解释"这种同义反复
+    # （Voc 被 Isc 解释得很好 → 判成"Voc 是被影响的结果"）
+    # 照常拿到高分，把真正的质量特性挤下去。
+    _resp_keys = set()
+    if col_map:
+        try:
+            _params = (KB or {}).get("params") or {}
+        except Exception:
+            _params = {}
+        for _k in set(col_map.values()):
+            if _k and (_params.get(_k) or {}).get("role") == "response":
+                _resp_keys.add(_k)
     for c in table.columns:
         if c == col:
+            continue
+        # 已知是"响应/结果型"参数的列，不得充当别的列的解释者
+        if col_map and col_map.get(c) in _resp_keys:
             continue
         r = role_of(table, c)
         roles[c] = r

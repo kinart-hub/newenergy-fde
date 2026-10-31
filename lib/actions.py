@@ -262,9 +262,28 @@ def permanent_actions(trace_result, defect=None, current_process=None, param_key
         cases = KBS.find_cases(defect=defect, param_key=param_key) or []
     except Exception:
         cases = []
+    # current_process 必须参与匹配：改善措施库里每条案例都带 process，
+    # 不按工序筛就会出现"涂布的问题套用焊接的对策"——机理不同、参数不同，
+    # 对策照抄过去不但无效还可能引入新问题（与 identify_defects 跨工序串机理
+    # 是同一类错误）。同工序优先；库里只有别工序的，明确标 cross_process 并
+    # 要求先验证，绝不静默当成同工序已验证的对策推给现场。
+    _same, _cross = [], []
     for c in (cases or []):
+        (_same if (not current_process or c.get("process") == current_process)
+         else _cross).append(c)
+    if current_process and _cross and not _same:
+        out["notes"].append(
+            "改善措施库里没有「%s」工序的历史验证对策；以下 %d 条来自**其它工序**，"
+            "机理与参数未必适用，**必须先做小批验证**再考虑固化。"
+            % (current_process, len(_cross)))
+    elif current_process and _cross:
+        out["notes"].append(
+            "另有 %d 条其它工序的历史对策未列出（机理不同，不作为本工序措施）。"
+            % len(_cross))
+    for c in (_same or _cross):
         cm = c.get("countermeasure") or {}
         res = ((c.get("verification") or {}).get("result") or {})
+        _is_cross = c in _cross
         out["from_library"].append({
             "action": cm.get("action"),
             "type": cm.get("type"),
@@ -275,9 +294,16 @@ def permanent_actions(trace_result, defect=None, current_process=None, param_key
                 res.get("unit", ""), res.get("sample_size"), res.get("period", ""))
             if res else "未提供量化结果",
             "standardization": c.get("standardization"),
-            "recommend": bool(c.get("can_recommend")),
+            "recommend": bool(c.get("can_recommend")) and not _is_cross,
+            "process": c.get("process"),
+            "cross_process": _is_cross,
+            # 跨工序借用的对策不进"已验证"口径：recommend 关掉还不够，
+            # 必须在同一条记录上写明为什么不能当作已验证。
+            "caveat": ("该对策来自其它工序（%s），机理与参数未必适用于本工序，"
+                       "须先做单因子小批验证" % (c.get("process") or "未标注工序"))
+            if _is_cross else None,
         })
-    if not cases:
+    if not (cases or []):
         out["notes"].append("改善措施库中没有「%s」的历史验证对策，本次只能给出方向性候选，"
                             "**必须自行设计验证方案**" % (defect or "该缺陷"))
 

@@ -177,7 +177,7 @@ def _gap_indexes(times, gap_mult=GAP_MULT):
     return idx
 
 
-def _freeze_runs(values, min_run=FREEZE_RUN, min_uniq_ratio=MIN_UNIQ_RATIO):
+def _freeze_runs(values, min_run=FREEZE_RUN):
     """连续冻结段：从第 min_run 个重复值开始的那些行。
 
     设备停着不乱动时传感器读数会定住；正常生产即便控制得再好也会有末位抖动。

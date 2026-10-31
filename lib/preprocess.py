@@ -408,7 +408,7 @@ def map_columns(table, prefer_process=None):
 # ------------------------------------------------------------------ 清洗
 
 def clean(table, missing="drop_rows", outlier="mad", outlier_k=4.5,
-          use_physical=True, drop_dup=True, spec_override=None, log=None,
+          use_physical=True, drop_dup=True, log=None,
           prefer_process=None):
     """
     返回 (clean_table, report_dict)
@@ -641,12 +641,54 @@ def parse_time_column(table, col=None):
     return best, [T.parse_datetime(r[table.col_index(best)]) for r in table.rows]
 
 
-def time_align(tables, keys, freq_seconds=None, how="nearest", tolerance_seconds=None,
+def _agg_values(vals, agg):
+    """把一个时间栅格内的多个采样合并成一个值。
+
+    空列表返回 None（不是 0）——"这个栅格没有数据"与"这个栅格的值是 0"
+    是两件事，填 0 会让下游把它当成真实读数参与统计。
+    """
+    vs = [v for v in vals if v is not None]
+    if not vs:
+        return None
+    if agg == "median":
+        vs = sorted(vs)
+        n = len(vs)
+        return vs[n // 2] if n % 2 else (vs[n // 2 - 1] + vs[n // 2]) / 2.0
+    if agg == "first":
+        return vs[0]
+    if agg == "last":
+        return vs[-1]
+    if agg == "min":
+        return min(vs)
+    if agg == "max":
+        return max(vs)
+    if agg == "sum":
+        return sum(vs)
+    # 默认 mean
+    return sum(vs) / float(len(vs))
+
+
+def time_align(tables, freq_seconds=None, how="nearest", tolerance_seconds=None,
                agg="mean"):
     """
-    多表按时间对齐。tables: [(Table, timecol)]；freq: 重采样间隔（秒）
+    多表按时间对齐。tables: [(Table, timecol)]——时间列由每张表自己带，
+    不需要额外的 keys 形参（历史上收了 keys 却从不使用，调用方只能传 None）。
+
+    freq_seconds —— 重采样间隔（秒）。**给了就进入栅格模式**：
+        时间轴被离散成固定间隔的栅格，每个栅格内的多个采样按 agg 合并成一个值。
+        多表采样频率不一致（一张 1 分钟、一张 5 分钟）时必须用它，
+        否则"逐点配对"会拿一个点去代表 5 分钟，等于凭空造精度。
+    how  —— 非栅格模式下选哪个采样点："nearest"（默认）| "prev" | "next"。
+    agg  —— 栅格模式下一个栅格内多个采样的合并方式：
+            "mean"（默认）| "median" | "first" | "last" | "min" | "max" | "sum"。
+    tolerance_seconds —— how="nearest" 时允许的最大时间差（秒），超了丢掉该点。
+            不给就是"无论多远都配最近的一个"，那样会把隔了三天的读数
+            当成同一时刻，报里必须写明（见 report["tolerance_seconds"]）。
+
     返回 (aligned_table, report)
     """
+    import datetime as _dt
+
     series = []
     for tb, tcol in tables:
         tc, times = parse_time_column(tb, tcol)
@@ -657,43 +699,110 @@ def time_align(tables, keys, freq_seconds=None, how="nearest", tolerance_seconds
     if not series:
         return None, {"error": "未找到可解析的时间列，无法做时间对齐"}
 
-    # 收集所有时间点作为候选（以第一张表为主表，其余向主表对齐）
     base_name, base_times, base_cols, base_tb = series[0]
-    idx_ok = [i for i, t in enumerate(base_times) if t is not None]
-    aligned_rows = []
     used_cols = [(base_name, c) for c in base_cols]
     for s in series[1:]:
         used_cols += [(s[0], c) for c in s[2]]
 
-    report = {"base": base_name, "aligned": [], "dropped_unmatched": 0}
-    for i in idx_ok:
-        bt = base_times[i]
-        row = []
-        ok = True
-        for si, (name, times, numcols, tb) in enumerate(series):
-            if si == 0:
-                for c in numcols:
-                    row.append(T.to_number(tb.rows[i][tb.col_index(c)]))
-                continue
-            # 找最近时间点
-            best_j, best_d = None, None
-            for j, t in enumerate(times):
-                if t is None:
+    freq = None
+    try:
+        if freq_seconds:
+            freq = float(freq_seconds)
+            if freq <= 0:
+                freq = None
+    except Exception:
+        freq = None
+
+    report = {"base": base_name, "aligned": 0, "dropped_unmatched": 0,
+              "mode": ("resample" if freq else "pair"),
+              "freq_seconds": freq, "how": how if not freq else None,
+              "agg": agg if freq else None,
+              "tolerance_seconds": tolerance_seconds, "dropped_empty_cell": 0}
+    aligned_rows = []
+    valid_base = [(i, t) for i, t in enumerate(base_times) if t is not None]
+
+    if freq:
+        # ---- 栅格模式：时间轴离散成固定间隔，栅格内按 agg 合并 ----
+        if not valid_base:
+            return None, {"error": "主表没有可解析的时间点，无法做时间对齐"}
+        t0 = min(t for _i, t in valid_base)
+        t1 = max(t for _i, t in valid_base)
+        step = _dt.timedelta(seconds=freq)
+        # 每个系列预先按时间排序：时间单独成列用于二分定位栅格，
+        # 不能直接对 (time, row_index) 元组列表二分——拿 datetime 去比元组会 TypeError。
+        import bisect as _bs
+        idxs, tlists = [], []
+        for _n, times, _nc, _tb in series:
+            _pairs = sorted([(t, j) for j, t in enumerate(times) if t is not None])
+            idxs.append(_pairs)
+            tlists.append([t for t, _j in _pairs])
+        grid, cur = [], t0
+        while cur <= t1:
+            grid.append(cur)
+            cur = cur + step
+        for gt in grid:
+            row = []
+            ok = True
+            for si, (name, times, numcols, tb) in enumerate(series):
+                _seq = idxs[si]
+                # 落在 [gt, gt+step) 内的所有采样
+                k = _bs.bisect_left(tlists[si], gt)
+                cell = []
+                while k < len(_seq) and _seq[k][0] < gt + step:
+                    cell.append(_seq[k][1])
+                    k += 1
+                if not cell:
+                    # 栅格里确实没有数据：整点丢弃，不填 0。
+                    ok = False
+                    break
+                ci = [tb.col_index(c) for c in numcols]
+                for cpos, c in enumerate(numcols):
+                    vals = [T.to_number(tb.rows[j][ci[cpos]]) for j in cell]
+                    row.append(_agg_values(vals, agg))
+            if ok:
+                aligned_rows.append([gt.strftime("%Y-%m-%d %H:%M:%S")] + row)
+            else:
+                report["dropped_empty_cell"] += 1
+    else:
+        # ---- 配对模式：以主表每个时间点为锚，其余表按 how 选点 ----
+        for i, bt in valid_base:
+            row = []
+            ok = True
+            for si, (name, times, numcols, tb) in enumerate(series):
+                if si == 0:
+                    for c in numcols:
+                        row.append(T.to_number(tb.rows[i][tb.col_index(c)]))
                     continue
-                d = abs((t - bt).total_seconds())
-                if best_d is None or d < best_d:
-                    best_j, best_d = j, d
-            if best_j is None or (tolerance_seconds and best_d > tolerance_seconds):
-                ok = False
-                break
-            for c in numcols:
-                row.append(T.to_number(tb.rows[best_j][tb.col_index(c)]))
-        if ok:
-            aligned_rows.append([bt.strftime("%Y-%m-%d %H:%M:%S")] + row)
-        else:
-            report["dropped_unmatched"] += 1
+                best_j, best_d = None, None
+                for j, t in enumerate(times):
+                    if t is None:
+                        continue
+                    d = (t - bt).total_seconds()
+                    if how == "prev":
+                        if d > 0:
+                            continue
+                    elif how == "next":
+                        if d < 0:
+                            continue
+                    ad = abs(d)
+                    if best_d is None or ad < best_d:
+                        best_j, best_d = j, ad
+                if best_j is None or (tolerance_seconds and best_d > tolerance_seconds):
+                    ok = False
+                    break
+                for c in numcols:
+                    row.append(T.to_number(tb.rows[best_j][tb.col_index(c)]))
+            if ok:
+                aligned_rows.append([bt.strftime("%Y-%m-%d %H:%M:%S")] + row)
+            else:
+                report["dropped_unmatched"] += 1
+
     cols = ["timestamp"] + ["%s::%s" % (n, c) for n, c in used_cols]
     report["aligned"] = len(aligned_rows)
+    if not aligned_rows:
+        report["warning"] = ("对齐后 0 行：%s"
+                             % ("栅格内没有数据，检查 freq_seconds 是否小于采样间隔"
+                                if freq else "各表时间点没有配对成功，检查时间列与容差"))
     return T.Table(cols, aligned_rows, "aligned"), report
 
 

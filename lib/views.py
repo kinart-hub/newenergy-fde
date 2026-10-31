@@ -87,12 +87,18 @@ def _now():
 
 
 def _meta(result, view):
+    # 生成时间取**分析实际开始的时刻**，而不是渲染报告的时刻。
+    # 溯源里记了 started_at 却没人读，报告头就一直显示"渲染时的 now"——
+    # 于是复跑同一份数据、隔天重新导出，报告上的时间会变，
+    # 溯源链上就对不上"这一版结论是哪一次运行产出的"。
+    _started = ((result.get("provenance") or {}).get("started_at") or "").strip()
     return {
         "视角": "%s（%s）" % (VIEW_LABEL.get(view, view), view),
         "工序": result.get("process_name") or result.get("process") or "—",
         "目标列": result.get("target") or "—",
         "置信度": (result.get("confidence") or {}).get("level") or "—",
-        "生成时间": _now(),
+        "分析开始时间": _started or _now(),
+        "报告渲染时间": _now(),
         "引擎版本": result.get("analyzer_version") or "—",
     }
 
@@ -200,6 +206,15 @@ def view_process(result):
         rep.callout(s, "数据缺口 %d 项，会限制结论可靠性：%s"
                     % (len(gaps), "；".join(str(g.get("item") or g)[:40]
                                             for g in gaps[:3])), "warn")
+    # 权重校准状态：排序靠权重，而权重没被现场真值验证过。
+    # 只写进 warnings 的话，看报告的人在这里读到"优先动这个参数"时看不见它——
+    # 风险披露必须长在**结论旁边**，不是长在附录里。
+    _wvs = rc.get("weights_validation_status")
+    if _wvs:
+        rep.kv(s, [("排序权重校准状态", _wvs)])
+        rep.callout(s, "上面的排序依赖权重，而权重**尚未经现场真值验证**——"
+                       "排序只表示「按当前权重的相对强弱」，不代表权重已被证明正确。"
+                       "调整参数前须由责任工程师按现场认知复核顺序。", "warn")
 
     s = rep.section("2. 参数调整建议")
     rows = []

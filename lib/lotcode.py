@@ -193,7 +193,7 @@ def split_values(values, pattern=None):
                     "请用 --lot-pattern 给出正则。"}
 
 
-def segment_stats(seg, total=None):
+def segment_stats(seg):
     """单段的画像：取值数、组内样本中位数、能不能当分组维度。
 
     kind 的含义：
@@ -259,6 +259,31 @@ def _date_like(seg):
     return None
 
 
+def _to_num(v):
+    """把单元格转成数值；转不出来返回 None（不抛异常、不返回 0）。
+
+    不返回 0 是硬要求：把"读不出来"当成 0 会让那一行以真实数值的身份
+    参与 η² 计算，等于用假数据把解释力稀释掉。
+    """
+    if v is None:
+        return None
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)):
+        try:
+            import math
+            return None if (math.isnan(v) or math.isinf(v)) else float(v)
+        except Exception:
+            return None
+    s = str(v).strip().replace(",", "")
+    if not s:
+        return None
+    try:
+        return float(s)
+    except Exception:
+        return None
+
+
 def _eta2(seg_vals, y_vals):
     """段对目标的解释力（单因素 η²）。算不出来返回 None。"""
     try:
@@ -290,6 +315,17 @@ def analyze(table, col, target=None, pattern=None, y_vals=None):
     if sv.get("status") != "ok":
         return {"col": col, "status": sv.get("status"),
                 "note": sv.get("note"), "segments": []}
+    # target 是列名、y_vals 是预先取好的数值列。两者都收，但**只用 y_vals**——
+    # 于是 `analyze(table, col, target="不良率(%)")` 这种最自然的调用拿不到
+    # 解释力排序，而调用方完全看不出来（参数收了不用比不收更糟）。
+    # 这里补上：给了列名就自己取列，别让调用方去做本该由本函数做的事。
+    if y_vals is None and target:
+        try:
+            _raw = table.column(target)
+            if _raw:
+                y_vals = [_to_num(v) for v in _raw]
+        except Exception:
+            y_vals = None
     parts = sv["parts"]
     n_parts = sv["n_parts"]
     segs = []
@@ -326,11 +362,31 @@ def analyze(table, col, target=None, pattern=None, y_vals=None):
         cands.sort(key=lambda s: (-(s.get("eta2") or 0), s["idx"]))
     else:
         cands.sort(key=lambda s: s["idx"])
+    # 段间样本量极差必须说出来：η² 是在各组样本量上算出来的，
+    # 一个只有 1～2 个样本的段照样能算出漂亮的 η²（自由度小、方差估计不稳），
+    # 拿它排第一就会把根因指向"那个只有两片的批次"。
+    # min_size/max_size 算出来了却没人读，等于默认使用者自己会去看——他不会。
+    _sizes = [(s.get("min_size"), s.get("max_size"))
+              for s in segs if s.get("min_size") is not None]
+    _lo = min((a for a, _b in _sizes), default=None)
+    _hi = max((b for _a, b in _sizes), default=None)
+    _imbalance = (_hi is not None and _lo is not None and _lo > 0
+                  and _hi / float(_lo) >= 10)
+    _notes = []
+    if _imbalance:
+        _notes.append(
+            "各段样本量极不均衡（最少 %d / 最多 %d，相差 %.0f 倍）：样本量最小的段"
+            "其 η² 由极少观测估计而来，不可作为分组依据，须先补足该段数据再判。"
+            % (_lo, _hi, _hi / float(_lo)))
+    # 注意：只把结论转成 warnings 往外带，**不再另加 min/max 汇总字段**——
+    # 新字段没人读就是新的断头路（C 类）。段级的 min_size/max_size 已由
+    # 上面 s.get(...) 真实读取，不需要再造一个同义的汇总键。
     return {"col": col, "status": "ok", "sep": sv.get("sep"),
             "pattern": sv.get("pattern"),
             "n_parts": n_parts, "segments": segs,
             "candidates": [s["name"] for s in cands],
-            "note": sv.get("note")}
+            "note": sv.get("note"),
+            "warnings": _notes}
 
 
 def enrich(table, target_col=None, pattern=None, max_derive=2,
@@ -364,6 +420,11 @@ def enrich(table, target_col=None, pattern=None, max_derive=2,
             rejected.append({"col": col, "reason": info.get("status"),
                              "note": info.get("note")})
             continue
+        # analyze 给出的段样本量不均衡告警必须往上报。
+        # notes 是有消费者的（pipeline 把它写进 result.warnings 与 lot_segments），
+        # 穿过来的话才真的进报告；留在这里等于把警告锁在函数内部。
+        for _w in (info.get("warnings") or []):
+            notes.append("「%s」%s" % (col, _w))
         taken = 0
         _by_name = {s["name"]: s for s in info["segments"]}
         # 按 analyze 排好的候选顺序取（有 η² 时解释力优先，否则前缀优先）

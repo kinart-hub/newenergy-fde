@@ -346,6 +346,26 @@ def test_doe():
     sn_large = DOE.sn_ratio([1, 2, 3], "larger")
     check("信噪比 望小/望大 可计算", sn_small is not None and sn_large is not None,
           "%.2f/%.2f" % (sn_small or 0, sn_large or 0))
+    # 望目特性的 target 曾经收了完全不用：只看波动、不看偏靶，
+    # 于是"均值整体偏了 3 个单位但很稳"会被判成高信噪比——那是系统性偏靶，
+    # 不是质量好。这里用闭式解比对（不能只断言"能算出来"）。
+    _on = [10.0, 10.1, 9.9, 10.05, 9.95]      # 命中靶心，波动小
+    _off = [13.0, 13.1, 12.9]                  # 同样稳，但均值偏了 +3
+    _sn_on = DOE.sn_ratio(_on, "nominal", target=10)
+    _sn_off = DOE.sn_ratio(_off, "nominal", target=10)
+    # 手算：off 组 m=13、样本方差 v=0.01、偏差²=9 → 10·log10(169/9.01)
+    import math as _m
+    _expect_off = 10 * _m.log10(169.0 / 9.01)
+    check("望目 SN 比：偏靶组与闭式解一致",
+          _sn_off is not None and abs(_sn_off - _expect_off) < 1e-9,
+          "%.6f vs %.6f" % (_sn_off or 0, _expect_off))
+    check("望目 SN 比：命中靶心明显高于偏靶（target 真的进了分母）",
+          _sn_on is not None and _sn_off is not None and _sn_on - _sn_off > 20,
+          "on=%.2f off=%.2f" % (_sn_on or 0, _sn_off or 0))
+    check("望目 SN 比：不给 target 时不假装考虑靶心（偏靶组仍得高分）",
+          DOE.sn_ratio(_off, "nominal") is not None
+          and DOE.sn_ratio(_off, "nominal") > 40,
+          "%.2f" % (DOE.sn_ratio(_off, "nominal") or 0))
     # 响应面：y = -(x-0.5)^2 + 10，最优点应在 0.5
     import random
     random.seed(1)
@@ -527,8 +547,8 @@ def test_devices():
     convs = prof.get("unit_conversions") or {}
     pairs = [(c.get("from"), c.get("to"), float(c["factor"]))
              for c in convs.values() if c.get("factor")]
-    rev_ok = all(D._conv_factor(convs, None, t, f) is not None and
-                 approx(D._conv_factor(convs, None, t, f), 1.0 / fac, 1e-9)
+    rev_ok = all(D._conv_factor(convs, t, f) is not None and
+                 approx(D._conv_factor(convs, t, f), 1.0 / fac, 1e-9)
                  for f, t, fac in pairs)
     check("单位换算双向可逆", rev_ok and len(pairs) >= 10, "%d 条换算规则" % len(pairs))
 
@@ -2307,6 +2327,50 @@ def test_v19_delivery():
               and len(ctb.src_rows) == len(ctb.rows))
         check("重复行也留痕", any("重复" in (lg.get("reason") or "") for lg in log),
               [lg.get("reason") for lg in log])
+
+        # 时间对齐：freq_seconds / how / agg 曾经收了却完全不生效（空壳参数），
+        # 调用方传 agg="mean" 拿到的是"最近邻单点"。这里用**已知真值**锁住实现：
+        # 断言具体数值，而不是"返回了东西"。
+        _t1 = T.Table(["时间", "温度"],
+                      [["2026-01-01 08:00:00", "20"],
+                       ["2026-01-01 08:01:00", "21"],
+                       ["2026-01-01 08:02:00", "25"],
+                       ["2026-01-01 08:03:00", "24"]], "A")
+        _t2 = T.Table(["时间", "湿度"],
+                      [["2026-01-01 08:00:30", "50"],
+                       ["2026-01-01 08:01:30", "52"],
+                       ["2026-01-01 08:02:30", "60"]], "B")
+        _pa, _rp = PP.time_align([(_t1, "时间"), (_t2, "时间")],
+                                 tolerance_seconds=120)
+        check("配对模式：mode=pair", (_rp or {}).get("mode") == "pair",
+              str((_rp or {}).get("mode")))
+        check("配对模式：锚点取主表 4 行", _pa is not None and len(_pa.rows) == 4,
+              "%d 行" % len(_pa.rows or []))
+        check("配对模式：最近邻取到 08:00:30 的 50",
+              _pa is not None and _pa.rows[0][2] == 50.0,
+              str(_pa.rows[0] if _pa else None))
+        _ra, _rr = PP.time_align([(_t1, "时间"), (_t2, "时间")],
+                                 freq_seconds=60, agg="mean")
+        check("栅格模式：mode=resample", (_rr or {}).get("mode") == "resample",
+              str((_rr or {}).get("mode")))
+        check("栅格 60s：合成 3 个栅格（08:03 无 B 数据被丢）",
+              _ra is not None and len(_ra.rows) == 3,
+              "%d 行" % len(_ra.rows or []))
+        _rb, _r2 = PP.time_align([(_t1, "时间"), (_t2, "时间")],
+                                 freq_seconds=120, agg="max")
+        # 08:00 栅格内 A=[20,21]→max 21；B=[50,52]→max 52。
+        # 断言真值而不是"行数对"——只查行数时 agg 写坏了照样绿。
+        check("栅格 120s + agg=max：A 取 21",
+              _rb is not None and _rb.rows[0][1] == 21.0,
+              str(_rb.rows[0] if _rb else None))
+        check("栅格 120s + agg=max：B 取 52",
+              _rb is not None and _rb.rows[0][2] == 52.0,
+              str(_rb.rows[0] if _rb else None))
+        _rc, _r3 = PP.time_align([(_t1, "时间"), (_t2, "时间")],
+                                 freq_seconds=120, agg="mean")
+        check("同栅格换 agg=mean：A 取 20.5（证明 agg 真的生效）",
+              _rc is not None and abs(_rc.rows[0][1] - 20.5) < 1e-9,
+              str(_rc.rows[0] if _rc else None))
 
         # 结果表导出：能在 Excel 打开，且判异点带得回原始行号
         res = {
@@ -5463,7 +5527,11 @@ def test_coherence_audit():
         check(n, ok, d)
     # 棘轮：基线里已有的不算新增；人为造一个新签名必须被判为新增
     base = CA.load_baseline()
-    check("基线文件存在且非空", bool(base), "%s 条" % (len(base or [])))
+    # 基线**空**是期望终态（五类全清），不是故障：早先这里断言"非空"，
+    # 结果把缓存里的存量大扫除完成的那一刻，自检反倒报红——判据写成了
+    # "必须还欠着债"。正确判据是：基线文件存在且是合法列表，内容可以为空。
+    check("基线文件存在且可解析（允许为空＝已全清）", isinstance(base, (set, list)),
+          "%s 条" % (len(base or [])))
     fake = set(base or []) | {"ORPHAN|lib/__nonexistent__.py|ghost_func"}
     check("棘轮能识别出新增条目",
           bool(fake - (base or set())), "")
@@ -5688,8 +5756,21 @@ def test_scope_declaration():
           == "ok", "")
     tb = TB.Table(["班次", "值"],
                   [["甲班", 1.0], ["乙班", 2.0]] * 6)
-    check("短标签（甲班/乙班）判为轮班制 → warn",
-          CXF.shift_scope(tb, "班次", times, None)["status"] == "warn", "")
+    # 班次边界告警曾经"只要像轮班制就报"，不看数据是否真的跨午夜，
+    # 于是不跨午夜的产线（ times 全是 06:00）也被警告——告警一泛滥就没人看。
+    # 现在按 times 实测：不跨午夜 → ok；跨午夜 → warn；给不出 times → 保守 warn。
+    check("短标签判为轮班制但不跨午夜 → ok（不滥用告警）",
+          CXF.shift_scope(tb, "班次", times, None)["status"] == "ok",
+          CXF.shift_scope(tb, "班次", times, None).get("notes"))
+    _night = ([D.datetime(2026, 3, 1, 23, 0, 0)] * 5
+              + [D.datetime(2026, 3, 2, 1, 0, 0)] * 5)
+    _r_night = CXF.shift_scope(tb, "班次", _night, None)
+    check("采样确实跨午夜且未登记边界 → warn（该报的时候必须报）",
+          _r_night["status"] == "warn" and _r_night.get("crosses_midnight") is True,
+          str(_r_night.get("status")))
+    _r_none = CXF.shift_scope(tb, "班次", None, None)
+    check("给不出 times 时保守 warn（不能因为无法判断就不报）",
+          _r_none["status"] == "warn", str(_r_none.get("status")))
     tb2 = TB.Table(["班次", "值"],
                    [["张三组", 1.0], ["李四组", 2.0], ["王五组", 3.0]] * 4)
     check("人名/班组名（张三组）不是轮班 → ok",
@@ -5975,6 +6056,160 @@ def test_full_rules_precondition():
             pass
 
 
+def test_rootcause_interface_wiring():
+    """根因接口层接线：SPC 自身状态参与排序 + 5Why 第 1 层由数据确认「出现」。
+
+    这两处原先都是"签名收了参数、函数体从不读取"：spc_res 与 target_col。
+    断言给的是闭式真值（0.5×1.15 / 0.5×0.85 直接算出来比对），
+    不是"存在且为正"——后者在把系数改回 1.0 时照样绿。
+    """
+    print("\n[根因接口层接线]")
+    from lib import pipeline as PL, rootcause as RC, table as T
+
+    # ---- A. data_driven_rootcause：候选因子自己到底动没动 ----
+    # 两个候选与目标的相关强度**完全相同**（0.5），唯一差别是自身 SPC 状态。
+    assoc = [{"param": "压力A", "abs_effect": 0.5},
+             {"param": "温度B", "abs_effect": 0.5}]
+    spc_res = [
+        {"column": "压力A", "violations": [{"rule": 1}, {"rule": 5}],
+         "exclusion_review": {"shift_segments": [{"a": 1}, {"a": 2}]}},
+        {"column": "温度B", "violations": [], "exclusion_review": {},
+         "baseline": {"stable": True}},
+    ]
+    out = PL.data_driven_rootcause(assoc, spc_res, {}, "", "目标Y")
+    by = {c["param"]: c for c in (out or {}).get("candidates") or []}
+    check("自身判异的因子被加权（0.5×1.15=0.575）",
+          "压力A" in by and abs(by["压力A"]["evidence_score"] - 0.575) < 1e-9,
+          str((by.get("压力A") or {}).get("evidence_score")))
+    check("自身长期受控的因子被降权（0.5×0.85=0.425）",
+          "温度B" in by and abs(by["温度B"]["evidence_score"] - 0.425) < 1e-9,
+          str((by.get("温度B") or {}).get("evidence_score")))
+    check("相关强度相同时，动过的排在没动过的前面",
+          by.get("压力A", {}).get("score", 0) > by.get("温度B", {}).get("score", 0),
+          "%s vs %s" % ((by.get("压力A") or {}).get("score"),
+                        (by.get("温度B") or {}).get("score")))
+    check("判异侧写清自己动过（判异条数 + 整段偏移段数）",
+          "判异 2 条" in ((by.get("压力A") or {}).get("detail") or {}).get("note", "")
+          and "整段偏移 2 段" in ((by.get("压力A") or {}).get("detail") or {}).get("note", ""),
+          str(((by.get("压力A") or {}).get("detail") or {}).get("note"))[:80])
+    check("受控侧写清『没动过解释不了变化』",
+          "统计受控状态" in ((by.get("温度B") or {}).get("detail") or {}).get("note", ""),
+          str(((by.get("温度B") or {}).get("detail") or {}).get("note"))[:80])
+    # 反序：受控者排到 assoc 首位（天然占 0.92 的位置优势），加权后应被反超。
+    # 0.5×1.15×0.92 = 0.529 > 0.5×0.85 = 0.425
+    out2 = PL.data_driven_rootcause([{"param": "温度B", "abs_effect": 0.5},
+                                     {"param": "压力A", "abs_effect": 0.5}],
+                                    spc_res, {}, "", "目标Y")
+    c2 = (out2 or {}).get("candidates") or []
+    check("反序时仍由判异者居首（0.529 > 0.425）",
+          bool(c2) and c2[0]["param"] == "压力A",
+          str([(x["param"], x["score"]) for x in c2]))
+
+    # ---- B. build_5why：第 1 层「出现」必须先被这批数据确认 ----
+    tb = T.Table(["目标Y", "压力A"], [["1.0", "10"], ["2.0", "11"], ["3.0", "12"]])
+    lead = [{"param_name": "压力A", "score": 0.5,
+             "detail": {"r": 0.9, "p": 0.01, "n": 3}}]
+    l1_ok = RC.build_5why("面密度超差", lead, tb, "目标Y")[0]
+    check("目标列有实测值时，第 1 层写明『出现』已由数据确认",
+          "已由数据确认" in (l1_ok.get("because") or ""),
+          str(l1_ok.get("because"))[-45:])
+    check("工序机理已收录 + 目标列有实测值 → 第 1 层有支撑",
+          l1_ok.get("supported") is True, str(l1_ok.get("supported")))
+    check("确认语里带有效实测点数（3 个）",
+          "3 个有效实测值" in (l1_ok.get("because") or ""),
+          str(l1_ok.get("because"))[-45:])
+    l1_miss = RC.build_5why("面密度超差", lead, tb, "不存在的列")[0]
+    check("目标列在表里找不到时，第 1 层不得标称有支撑",
+          l1_miss.get("supported") is False, str(l1_miss.get("supported")))
+    check("『列缺失』与『列在但无有效值』分开表述（不说去查不存在的列）",
+          "没有目标列" in (l1_miss.get("because") or ""),
+          str(l1_miss.get("because"))[-45:])
+    tb2 = T.Table(["目标Y", "压力A"], [["", "10"], ["", "11"]])
+    l1_empty = RC.build_5why("面密度超差", lead, tb2, "目标Y")[0]
+    check("列在但全是空值 → 同样不得标称有支撑",
+          l1_empty.get("supported") is False, str(l1_empty.get("supported")))
+    l1_none = RC.build_5why("面密度超差", lead, tb, None)[0]
+    check("未给目标列时保持原口径（不谎称已确认）",
+          "已由数据确认" not in (l1_none.get("because") or ""), "")
+
+
+def test_shift_scan_status():
+    """段级偏移检测必须区分「确实没有」与「没做」（不能都返回 []）。
+
+    旧实现三条路径全返回 []：样本不足、尺度不可估、真的没检出。
+    报告层据此写"未发现整体偏移段"，读者读成"过程很干净"——
+    实际可能只有 10 个点、或序列根本没变异，这项检查压根没执行。
+    """
+    print("\n[段级偏移检测的状态留痕]")
+    from lib import spc as SPC, status as ST
+
+    # 1) 样本不足：n=10 < 12
+    rep = {}
+    r1 = SPC.detect_shift_segments([10.0 + 0.01 * i for i in range(10)], report=rep)
+    check("样本不足时状态为 INSUFFICIENT_DATA（不是 NO_FINDING）",
+          rep.get("status") == ST.INSUFFICIENT_DATA, str(rep.get("status")))
+    check("样本不足仍返回空列表（向后兼容）", r1 == [], str(r1))
+    check("样本不足必须写明 n 与门槛，不许只说『未检出』",
+          rep.get("n") == 10 and "n=10" in (rep.get("reason") or ""),
+          str(rep.get("reason"))[:60])
+
+    # 2) 序列无变异：稳健尺度为 0
+    rep2 = {}
+    r2 = SPC.detect_shift_segments([5.0] * 30, report=rep2)
+    check("序列无变异时状态为 INSUFFICIENT_DATA",
+          rep2.get("status") == ST.INSUFFICIENT_DATA, str(rep2.get("status")))
+    check("无变异要说明『不是没有偏移』", "不是『没有偏移』" in (rep2.get("reason") or ""),
+          str(rep2.get("reason"))[:50])
+
+    # 3) 真偏移：40 正常 + 20 点整体上移 3σ
+    import random as _rnd
+    _rr = _rnd.Random(20261031)
+    vals = [_rr.gauss(10.0, 0.1) for _ in range(40)] + \
+           [_rr.gauss(10.3, 0.1) for _ in range(20)]
+    rep3 = {}
+    r3 = SPC.detect_shift_segments(vals, report=rep3)
+    check("有真偏移时状态为 SUCCESS 且段数≥1",
+          rep3.get("status") == ST.SUCCESS and len(r3) >= 1,
+          str(rep3.get("status")))
+    check("SUCCESS 的对象数与非空返回一致",
+          rep3.get("n_segments") == len(r3), "%s vs %s" % (rep3.get("n_segments"), len(r3)))
+    check("检出的段落在第 41–60 点区间内",
+          bool(r3) and 38 <= (r3[0].get("start") or 0) <= 45, str(r3[0] if r3 else None)[:60])
+
+    # 4) 有同侧候选段、但幅度没过阈值 → NO_FINDING，且要给出最接近的候选差多少。
+    #    构造（确定性，不用随机数，避免浮点实现差异导致断言时稳时红）：
+    #      前 40 点 9.6/10.0 交替 → 每点自成一段，段外 MAD 大（rs_out≈0.297）
+    #      后 20 点 10.05+0.001i 紧密排列且整体高于全段中位数 10.0 → 连续 20 点同侧
+    #    段内 10.0595 vs 段外 9.8，z≈0.875σ，过不了 2.00σ 幅度门槛。
+    vals4 = [(9.6 if i % 2 == 0 else 10.0) for i in range(40)] + \
+            [10.05 + 0.001 * i for i in range(20)]
+    rep4 = {}
+    r4 = SPC.detect_shift_segments(vals4, report=rep4)
+    check("幅度不够时状态为 NO_FINDING（不是 INSUFFICIENT_DATA）",
+          rep4.get("status") == ST.NO_FINDING, str(rep4.get("status")))
+    check("NO_FINDING 且返回空列表", r4 == [], str(r4))
+    check("NO_FINDING 要交代最接近的候选差在哪（不是一句『没有』）",
+          isinstance(rep4.get("closest"), dict)
+          and abs((rep4["closest"] or {}).get("z") - 0.875) < 1e-9
+          and rep4.get("n_runs") == 1,
+          str(rep4.get("closest"))[:70])
+    check("候选段长度与段内中位数是实测值（20 点 / 10.0595）",
+          (rep4.get("closest") or {}).get("n") == 20
+          and abs(((rep4.get("closest") or {}).get("median_in") or 0) - 10.0595) < 1e-9,
+          str(rep4.get("closest"))[:70])
+
+    # 5) 不给 report 时不许崩（旧调用点保持可用）
+    check("report 缺省时行为不变（只返回值）",
+          isinstance(SPC.detect_shift_segments(vals), list), "")
+
+    # 6) phase1_limits 必须把状态带出来（否则状态造了没人读 = 新断头路）
+    p1 = SPC.phase1_limits(vals)
+    check("phase1_limits 回传 shift_scan",
+          isinstance((p1 or {}).get("shift_scan"), dict)
+          and (p1["shift_scan"].get("status") == ST.SUCCESS),
+          str((p1 or {}).get("shift_scan"))[:60])
+
+
 if __name__ == "__main__":
     print("newenergy-fde 自检开始")
     test_table()
@@ -6029,6 +6264,8 @@ if __name__ == "__main__":
     test_process_fallback()
     test_license_notice()
     test_full_rules_precondition()
+    test_rootcause_interface_wiring()
+    test_shift_scan_status()
     test_quality_manager_guide()
     test_reliability_weibull_alt()
     test_fmea_rpn_and_gate()

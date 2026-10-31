@@ -609,6 +609,10 @@ def derive_d6(res, lead=None):
         "metric": tgt, "sigma_within": sigma,
         "mdd_table": rows,
         "rule_of_three": r3,
+        # lead 必须落到产出里。一份没有责任人的验证方案，等于没人负责执行——
+        # 而"结果栏留空等现场填"这条纪律能立住，前提是先说清**谁**来填。
+        # 原先收了 lead 却丢弃，D6 卡片上的负责人栏永远是空的。
+        "owner": lead,
         "current_rate_pct": round(rate_ref * 100, 4) if rate_ref else None,
         "criteria": [
             "连续 N 批（N 由 MDD 表按你的产能选定）指标回到控制限内且无判异",
@@ -1073,6 +1077,9 @@ def derive_d8(res, lead=None, card=None):
             ST = None
     out["status"] = (ST.NO_FINDING if cc["can_close"] else ST.INSUFFICIENT_DATA) \
         if ST else ("可以结案" if cc["can_close"] else "不具备结案条件")
+    # lead 进产出：结案清单上必须写明"谁签字确认"，
+    # 否则 can_close 判 true 也只是一份没人认领的清单。
+    out["owner"] = lead
     return out
 
 

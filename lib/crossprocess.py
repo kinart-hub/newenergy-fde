@@ -110,7 +110,7 @@ def _process_of_alias(kb, name):
     return None
 
 
-def _pick_spec(spec, col, table_meta, params=None):
+def _pick_spec(spec, col, table_meta):
     """
     取某列的上下限 —— **只认企业/用户提供的规格**。
 
@@ -161,15 +161,61 @@ def _downstream(process, chain_hops=1):
     return out
 
 
+def _upstream_process_keys(pkey, kb):
+    """某工序的**上游工序 key 集合**。
+
+    processes[*].upstream 记的是中文名（如"涂布"），而知识库里其它地方
+    （carry_over_from 等）用的是英文 key（battery_coating）。两边口径不同，
+    不做解析就没法比对——这正是 current_process 长期没法参与过滤的原因。
+    解析不出来的一律原样保留，绝不静默丢弃（丢了就等于说"它不是上游"）。
+    """
+    procs = (kb or {}).get("processes") or {}
+    node = procs.get(pkey) or {}
+    out = set()
+    for u in (node.get("upstream") or []):
+        u = str(u)
+        hit = None
+        for k, v in procs.items():
+            if u == k or u == (v.get("name") or "") or u in (v.get("alias") or []):
+                hit = k
+                break
+        out.add(hit or u)
+    return out
+
+
 def carry_over_defects(defect, current_process=None):
-    """某缺陷有可能是从哪些上游工序带入的（嫌疑清单，不是结论）"""
+    """某缺陷有可能是从哪些上游工序带入的（嫌疑清单，不是结论）。
+
+    current_process 给出时，**只保留真正位于本工序上游链上的带入来源**。
+    不过滤就会出现"辊压工序被提示去查注液工序带过来的问题"——
+    注液在辊压下游，它不可能把东西带进辊压；照着查是纯浪费，
+    而且会让人怀疑整条追溯链是不是随便连的。
+    """
     kb = load_kb()
     node = kb.get("defect_rootcause", {}).get(defect)
     if not node:
         return {"carry_over_from": [], "clearing_evidence": [], "note": "该缺陷未在知识库登记"}
-    return {"carry_over_from": list(node.get("carry_over_from") or []),
+    co = list(node.get("carry_over_from") or [])
+    note = "carry_over_from 是嫌疑清单，必须以实测数据证实或排除"
+    excluded = []
+    in_chain = None
+    if current_process:
+        up_keys = _upstream_process_keys(current_process, kb)
+        if up_keys:
+            in_chain = [c for c in co if c in up_keys]
+            excluded = [c for c in co if c not in up_keys]
+            co = in_chain
+            if excluded:
+                note += ("；已排除 %s —— 它不在「%s」的上游链上，不可能把缺陷带入本工序"
+                         % ("、".join(excluded), current_process))
+            if not co:
+                note += "；该缺陷登记的带入来源均不在本工序上游链上，本次无上游嫌疑来源"
+    # 不回传 current_process：调用方自己知道传了什么，回传一个没人读的镜像
+    # 就是新的断头路。过滤依据已经写进 note 与 excluded_not_upstream。
+    return {"carry_over_from": co,
             "clearing_evidence": list(node.get("clearing_evidence") or []),
-            "note": "carry_over_from 是嫌疑清单，必须以实测数据证实或排除"}
+            "excluded_not_upstream": excluded,
+            "note": note}
 
 
 # ------------------------------------------------------------------ 多表对齐
@@ -243,7 +289,8 @@ def align(tables, join=None, tolerance_seconds=None):
     if mode == "time":
         pairs = [(tb, tc) for tb, tc in zip(tables, info.get("key") or []) if tc]
         try:
-            aligned, rep = PP.time_align(pairs, None, tolerance_seconds=tolerance_seconds)
+            # 时间列由 pairs 里的每张表自带，不再传 keys（原来只能传 None 占位）。
+            aligned, rep = PP.time_align(pairs, tolerance_seconds=tolerance_seconds)
         except Exception as e:
             return None, {"mode": "time", "error": "时间对齐失败：%s" % e}
         if aligned is None or len(aligned.rows) == 0:
@@ -313,11 +360,44 @@ def _post_check(aligned, tables, owner):
     present = set(owner.values())
     # 主表（join 的左侧）的列不带表名前缀，它本身不算丢失
     dropped = [tb.name for tb in tables[1:] if tb.name not in present]
+    # 光看"列在不在"不够——列可以在、值全空：对齐把它的每一行都配不上，
+    # 于是它名义上参与了分析，实际一条数据都没贡献。原先只看 owner（列名归属），
+    # 这种"在场但全空"的表会被判成正常参与，正是 docstring 里那个坑的变体。
+    # 所以还要回到对齐结果本身，逐表检查是否至少有一个非空值。
+    empty = []
+    if aligned is not None:
+        try:
+            cols = list(aligned.columns)
+            rows = list(aligned.rows)
+            by_owner = {}
+            for _c in cols:
+                _o = owner.get(_c)
+                if _o:
+                    by_owner.setdefault(_o, []).append(aligned.col_index(_c))
+            for _o, _idxs in by_owner.items():
+                _has = False
+                for _r in rows:
+                    for _i in _idxs:
+                        if _i is not None and _i < len(_r) and _r[_i] not in (None, ""):
+                            _has = True
+                            break
+                    if _has:
+                        break
+                if not _has:
+                    empty.append(_o)
+        except Exception:
+            empty = []
+    for _o in empty:
+        if _o not in dropped:
+            dropped.append(_o)
     if dropped:
         owner["__dropped__"] = dropped
-        owner["__warning__"] = ("对齐后 %s 的数据没有进入分析（缺批次号或时间列），"
+        owner["__dropped_empty__"] = empty
+        owner["__warning__"] = ("对齐后 %s 的数据没有进入分析（%s），"
                                 "本次追溯只覆盖了其余工序，结论可能失真"
-                                % "、".join(dropped))
+                                % ("、".join(dropped),
+                                   "缺批次号或时间列" if not empty
+                                   else "缺批次号/时间列，或对齐后该表取值全为空"))
 
 
 # ------------------------------------------------------------------ 统计基础
@@ -517,9 +597,16 @@ def trace(tables, table_meta, target_col, current_process, defect=None,
 
     # 上游一律走到源头：化成的问题常常源头在涂布（隔 3-4 跳），取太浅会把真凶漏掉
     ups = upstream_of(current_process)
-    carry = carry_over_defects(defect) if defect else {"carry_over_from": [], "clearing_evidence": []}
+    # current_process 必须传下去：不传的话 carry_over_defects 只能返回全量嫌疑，
+    # 里面会混进本工序**下游**的工序——那是不可能把缺陷带进来的方向。
+    carry = carry_over_defects(defect, current_process=current_process) if defect \
+        else {"carry_over_from": [], "clearing_evidence": []}
     out["upstream_processes"] = ups
     out["carry_over"] = carry
+    if carry.get("excluded_not_upstream"):
+        out["notes"].append(
+            "已排除 %s：不在「%s」的上游链上，不可能把缺陷带入本工序"
+            % ("、".join(carry["excluded_not_upstream"]), current_process))
 
     aligned, rep = align(tables)
     if aligned is None:
@@ -594,7 +681,7 @@ def trace(tables, table_meta, target_col, current_process, defect=None,
             degrade.note("crossprocess.align_corr", _dg_e)
         probe = None
         if bad_idx:
-            sp = _pick_spec(spec, c, table_meta, params)
+            sp = _pick_spec(spec, c, table_meta)
             probe = probe_margin(aligned, c, bad_idx, good_idx, sp,
                                  kb_params=params, pkey=pkey)
             if probe:
@@ -652,6 +739,13 @@ def _decide(contrib, probes, ups, bad_idx):
                   and S.is_sig((c["corr"] or {}).get("p"))]
     marginal = [p for p in (probes or []) if p.get("verdict") == "upstream_marginal"]
     violating = [p for p in (probes or []) if p.get("verdict") == "upstream_violating"]
+    # 上游到底有没有真的参与本次对齐。ups 原先收了不用，于是"本工序主导"这条
+    # 结论会在**压根没有上游数据**时也写"上游同批次数据未显示区分力"——
+    # 那是把"没查"说成"查过没问题"，是最危险的一类措辞。
+    _up_present = [c for c in contrib if c.get("role") == "upstream"]
+    _no_up_data = (not ups) or (not _up_present)
+    _no_up_note = ("**本次没有上游数据参与**（未提供上游表，或对齐后未留下上游列）："
+                   "下面的结论只覆盖本工序，**不能据此排除上游带入**")
 
     if not bad_idx:
         top = contrib[0]
@@ -681,19 +775,21 @@ def _decide(contrib, probes, ups, bad_idx):
             % "、".join([c["column"] for c in strong_up[:3]]),
             "建议按来料批次/供应商做分层复核"], "中"
     if strong_cur and not strong_up:
-        return "本工序主导", [
-            "与目标显著相关的参数全部来自本工序：%s"
-            % "、".join([c["column"] for c in strong_cur[:3]]),
-            "上游同批次数据未显示区分力"], "中高"
+        _r = ["与目标显著相关的参数全部来自本工序：%s"
+              % "、".join([c["column"] for c in strong_cur[:3]])]
+        # 有上游数据才可以说"上游未显示区分力"；没有就必须换成"未排除"。
+        _r.append(_no_up_note if _no_up_data else "上游同批次数据未显示区分力")
+        return "本工序主导", _r, ("中" if _no_up_data else "中高")
     if strong_cur and strong_up:
         return "混合作用（两者叠加）", [
             "本工序参数 %s 与上游参数 %s 都与目标相关"
             % ("、".join([c["column"] for c in strong_cur[:2]]),
                "、".join([c["column"] for c in strong_up[:2]])),
             "必须做 DOE 或分组试验才能分离两者贡献，不要在此直接下结论"], "中"
-    return "尚无显著证据", [
-        "所有参数与目标的相关性均未达到 |r|≥0.4 且 p<0.05",
-        "优先怀疑未被记录的变量（来料批次、环境、换型、人员），先补数据"], "低"
+    _r = ["所有参数与目标的相关性均未达到 |r|≥0.4 且 p<0.05"]
+    _r.append(_no_up_note if _no_up_data
+              else "优先怀疑未被记录的变量（来料批次、环境、换型、人员），先补数据")
+    return "尚无显著证据", _r, "低"
 
 
 # ------------------------------------------------------------------ 横向排查

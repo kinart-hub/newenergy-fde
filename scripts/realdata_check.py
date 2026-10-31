@@ -137,6 +137,21 @@ def integrity(case_dir, data_path, meta):
     if not data_path:
         return False, info, ["用例目录里没有可识别的数据文件（%s）"
                              % "/".join(DATA_EXTS)]
+    # 数据文件必须真的在本用例目录里。case_dir 原先收了不用，
+    # 于是"引用了别处的文件"不会被发现——那个文件的 sha256 再对，
+    # 也证明不了**这个用例**用的是这份数据，溯源链从这里就断了。
+    if case_dir:
+        try:
+            _cd = os.path.abspath(case_dir)
+            _dp = os.path.abspath(data_path)
+            _inside = os.path.commonpath([_cd, _dp]) == _cd
+        except Exception:
+            _inside = True      # 路径不可比时不臆断，按未发现问题处理
+        info["inside_case_dir"] = _inside
+        if not _inside:
+            problems.append("数据文件不在用例目录内（用例 %s / 文件 %s）："
+                            "溯源链断裂，无法证明本用例用的是这份数据"
+                            % (os.path.basename(_cd), _dp))
 
     # 行数/列数：走项目自己的读表器，顺带验证它吃得下
     try:
@@ -245,7 +260,7 @@ def run_coverage(data_path):
     return out
 
 
-def caliber_compare(data_path, limit=40):
+def caliber_compare(data_path):
     """把真实数据落在知识库 typical_range 内/外的情况统计出来。
 
     这是"印证是否符合行业要求"最硬的一条读数：

@@ -609,7 +609,16 @@ def effects(design, responses, factor_names, levels=2):
 
 
 def sn_ratio(responses, goal="nominal", target=None):
-    """Taguchi 信噪比 dB"""
+    """Taguchi 信噪比 dB。
+
+    goal="nominal"（望目特性）时 `target` 的含义：
+        望目特性要同时压两件事——**波动大** 和 **均值偏离目标**。
+        只除方差（当前实现的 m²/v）会把"均值整体偏了 5 个单位、但很稳"
+        算成高信噪比，可它分明是系统性偏靶。
+        给了 target 就把偏差项并进分母：η = 10·log10(m² / (v + (m−target)²))；
+        没给 target 则退化为只看波动的 m²/v，并在调用方无感的情况下
+        **不再假装考虑了靶心**——所以下面 nominal 分支会如实标注基准。
+    """
     rs = [r for r in responses if r is not None]
     if not rs:
         return None
@@ -621,7 +630,19 @@ def sn_ratio(responses, goal="nominal", target=None):
     # nominal
     m = S.mean(rs)
     v = S.variance(rs) or 0.0
-    if m == 0 or v == 0:
+    if m == 0:
+        return None
+    # 有目标：把"偏离靶心"与"波动"一起算进损失
+    if target is not None:
+        try:
+            dev = (m - float(target)) ** 2
+        except Exception:
+            dev = 0.0
+        denom = v + dev
+        if denom <= 0:
+            return None
+        return 10 * math.log10(m * m / denom)
+    if v == 0:
         return None
     return 10 * math.log10(m * m / v)
 

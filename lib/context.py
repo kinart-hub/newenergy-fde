@@ -220,12 +220,50 @@ def shift_scope(table=None, shift_col=None, times=None, declared_boundary=None):
             "按普通分组维度处理（不做跨午夜边界检查）。"
             % (shift_col, "、".join(uniq[:5]))]}
 
+    # times 是本函数判断"到底有没有跨午夜"的唯一依据，原先收了不用，
+    # 于是只要班次列像轮班制就一律 warn——不跨午夜的产线也被警告，
+    # 警告一泛滥就没人看了（与 SPC 判异规则默认只开基本集是同一个道理）。
+    _cross = None
+    _n_times = 0
+    _n_nohour = 0
+    if times:
+        _hs = set()
+        for _t in times:
+            _n_times += 1
+            try:
+                _hs.add(int(getattr(_t, "hour", -1)))
+            except Exception:
+                # 取不到时刻说明该元素不是 datetime（可能是 None 或原始字符串）。
+                # 不能只 continue：全部取不到时 _cross 会是 False 以外的 None，
+                # 而"没有一个时间戳可用"与"时间戳都不跨午夜"是两回事，
+                # 前者必须保守告警并说明有几个不可用。
+                _n_nohour += 1
+                continue
+        _hs.discard(-1)
+        # 同时出现"深夜(≥22 点)"与"凌晨(<6 点)"的采样 = 确实跨午夜
+        _cross = bool(_hs) and any(h >= 22 for h in _hs) and any(h < 6 for h in _hs)
+    # 时间戳全不可用 → 退回"判不了就保守告警"，并在说明里点出不可用条数。
+    _unusable_note = ("；另有 %d/%d 个时间戳取不到时刻，未参与跨午夜判断"
+                      % (_n_nohour, _n_times)) if _n_nohour else ""
+    if _cross is False:
+        return {"status": "ok", "notes": [
+            "班次列「%s」有 %d 个取值，但采样时刻未出现跨午夜（同时含 ≥22 点与 <6 点）"
+            "的情况，班次边界未登记不影响本次分组口径%s。"
+            % (shift_col, len(uniq), _unusable_note)]}
+
     return {"status": "warn", "boundary": None,
-            "notes": ["班次列「%s」有 %d 个取值（%s），但**班次边界未登记**。"
-                      "若产线跨午夜换班，同一班的数据会被时间戳切到两天、"
-                      "分组统计被拆成两半。请用 --shift-boundary 登记各班的起止"
-                      "时刻（如 早:06:00-14:00 / 中:14:00-22:00 / 夜:22:00-06:00）。"
-                      % (shift_col, len(uniq), "、".join(uniq[:6]))]}
+            "crosses_midnight": _cross,
+            "notes": ["班次列「%s」有 %d 个取值（%s），%s"
+                      "但班次边界未登记："
+                      "同一班的数据会被时间戳切到两天、分组统计被拆成两半。"
+                      "请用 --shift-boundary 登记各班的起止时刻"
+                      "（如 早:06:00-14:00 / 中:14:00-22:00 / 夜:22:00-06:00）。"
+                      % (shift_col, len(uniq), "、".join(uniq[:6]),
+                         "且**采样确实跨越午夜**（同时出现 ≥22 点与 <6 点的记录），"
+                         if _cross else
+                         "（本次未能确认采样是否跨午夜："
+                         + ("时间戳都取不到时刻" if _n_nohour else "未提供时间戳")
+                         + "，按保守口径告警）")]}
 
 
 # ---------------------------------------------------------------- 汇总入口

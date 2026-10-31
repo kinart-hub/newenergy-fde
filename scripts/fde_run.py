@@ -258,6 +258,22 @@ def _print_deliverables(result_json, outdir, d2_card=None):
             if ap not in files:
                 files.append(ap)
 
+    # d2_card 必须交代：它是 8D 流程的**入口素材**（现场把问题现象填进去），
+    # 生成了却不在产出清单里点名，等于把最关键的那份东西混在一堆文件里
+    # 让使用者自己找。原先收了形参从不使用，清单里永远看不到它。
+    if d2_card:
+        _p = str(d2_card)
+        _ap = os.path.abspath(_p)
+        _exists = os.path.isfile(_p)
+        if _exists and _ap not in files:
+            files.append(_ap)
+        print("")
+        print("  [D2 录入卡] %s" % ("已生成：%s" % _ap if _exists
+                                    else "**路径无效，未生成**：%s" % _ap))
+        if _exists:
+            print("             这是 8D 的起点素材：请把它交给现场，"
+                  "由发现问题的人填写现象（不要由分析者代填）。")
+
     if not files:
         return
 
@@ -378,6 +394,49 @@ def _write_failure_diagnosis(result_json, outdir, steps):
     for t in _diagnose(fails):
         L.append("- %s" % t)
     L.append("")
+    # result_json 必须参与：只列"哪一步 FAIL"是不够的，
+    # 结果里记的 errors / degraded_sections 才是真正说明"坏在哪"的东西。
+    # 原先收了它却从不读，诊断文件里只剩步骤名与退出码，
+    # 使用者拿到手只知道"失败了"，不知道失败时程序自己已经说了什么。
+    _rj = None
+    try:
+        if result_json and os.path.exists(str(result_json)):
+            _rj = json.load(io.open(result_json, encoding="utf-8"))
+    except Exception:
+        _rj = None
+    if isinstance(_rj, dict):
+        _errs = [e for e in (_rj.get("read_errors") or _rj.get("errors") or [])]
+        _degr = _rj.get("degraded_sections") or []
+        _warn = _rj.get("warnings") or []
+        L.append("## 2-bis. 结果文件里已经记录的问题")
+        L.append("")
+        if _errs:
+            L.append("**读取/计算错误（%d 条）**" % len(_errs))
+            L.append("")
+            for e in _errs[:10]:
+                _d = e.get("error") if isinstance(e, dict) else str(e)
+                _f = (e.get("file") if isinstance(e, dict) else None) or "—"
+                L.append("- `%s`：%s" % (_f, str(_d)[:200]))
+            L.append("")
+        if _degr:
+            L.append("**降级小节（%d 个）**：这些环节没有算出结论，"
+                     "报告里的对应部分为空，不代表没有问题。" % len(_degr))
+            L.append("")
+            for d in _degr[:10]:
+                _s = d.get("section") if isinstance(d, dict) else str(d)
+                _e = (d.get("error") if isinstance(d, dict) else "") or ""
+                L.append("- %s：%s" % (_s, str(_e)[:160]))
+            L.append("")
+        if _warn:
+            L.append("**告警（%d 条）**" % len(_warn))
+            L.append("")
+            for w in _warn[:10]:
+                L.append("- %s" % str(w)[:200])
+            L.append("")
+        if not (_errs or _degr or _warn):
+            L.append("（结果文件里没有额外记录：本次失败发生在结果落盘之前，"
+                     "只能依据上面的步骤信息排查。）")
+            L.append("")
     L.append("## 3. 环境信息")
     L.append("")
     L.append("- Python：%s" % sys.version.split()[0])
@@ -3280,6 +3339,84 @@ def rule_actions_not_gated_by_multifile():
     return _r(True, "", {"ok": True})
 
 
+def rule_shift_scan_not_silent_empty():
+    """段级偏移检测必须区分「确实没有」与「这项没做」，不得都返回 []。
+
+    事故：`detect_shift_segments` 在样本不足（n<12）与序列无变异（稳健尺度为 0）时
+    和"真的没检出"一样返回 []。于是 10 个点的序列在报告里被写成
+    "未发现整体偏移段"——读者读成"过程很干净"，实际这项检查压根没执行。
+    这是**"没算"冒充"没有"**，比算错更危险：算错会有人质疑，没算没人质疑。
+
+    判据（形态级，只认不变量，不钉死具体字面文案）：
+      1. 函数必须有 report 留痕入口，且 report 有三个互不相同的终态；
+      2. 样本不足与无变异两条早退分支必须返回 INSUFFICIENT_DATA 而非「无发现」；
+      3. phase1_limits 必须把状态回传给调用方（否则状态造了没人读＝新断头路）；
+      4. pipeline 必须把它收进 exclusion_review（否则报告层拿不到）。
+    """
+    spc = _read(os.path.join("lib", "spc.py")) or ""
+    pipe = _read(PIPELINE_FILE) or ""
+    if not spc:
+        return _r(False, "读不到 lib/spc.py")
+    if "report=None" not in spc:
+        return _r(False, "detect_shift_segments 没有 report 留痕入口——"
+                         "返回 [] 的含义无法区分『没有偏移』与『没做检测』")
+    # 三条早退分支：样本不足 / 无变异 必须是"数据不足"，不能是"无发现"
+    _n_insuf = len(re.findall(r'_rep\(\s*"INSUFFICIENT_DATA"', spc))
+    if _n_insuf < 2:
+        return _r(False, "只有 %d 处把早退标成 INSUFFICIENT_DATA（应 ≥2：样本不足、无变异）"
+                         % _n_insuf)
+    if not re.search(r'_rep\(\s*"NO_FINDING"', spc):
+        return _r(False, "没有 NO_FINDING 终态：『确实没有』与『没做』还是分不开")
+    if not re.search(r'_rep\(\s*"SUCCESS"', spc):
+        return _r(False, "没有 SUCCESS 终态：检出偏移段这件事本身没有留痕")
+    # phase1 必须回传（否则没人消费）
+    if '"shift_scan": seg_scan' not in spc:
+        return _r(False, "phase1_limits 没有回传 shift_scan——状态造出来没人读")
+    if '"shift_scan"' not in pipe:
+        return _r(False, "pipeline 没有把 shift_scan 收进结果——报告层拿不到该状态")
+    return _r(True, "", {"ok": True})
+
+
+def rule_factor_self_state_counts():
+    """归因候选必须看「这个因子自己动没动」，不能只看它和目标的相关。
+
+    事故：`data_driven_rootcause(assoc, spc_res, ...)` 签名收了 spc_res
+    却从不读取。于是"一个全程统计受控、从没变动过的参数"与"一个刚刚整段
+    上移 3σ 的参数"，在相关强度相同时排序完全一样——现场最常见的误判
+    就是把从头到尾没动过的参数排到根因第一位，然后去调一个本来就没问题的阀。
+
+    判据（形态级）：
+      1. 必须建立"列 → 其 SPC 结果"的索引（否则无法逐列取自身状态）；
+      2. 判异/整段偏移存在的分支必须**加权**（乘一个 >1 的系数），
+         稳定受控的分支必须**降权**（乘 <1），两者方向相反；
+      3. 降权/加权的理由必须写进候选的 detail.note（否则使用者只看到分数变了）。
+    """
+    pipe = _read(PIPELINE_FILE) or ""
+    if not pipe:
+        return _r(False, "读不到 " + PIPELINE_FILE)
+    if "def data_driven_rootcause(" not in pipe:
+        return _r(False, "找不到 data_driven_rootcause")
+    # 取函数体（到下一个顶层 def 为止）
+    i = pipe.index("def data_driven_rootcause(")
+    j = pipe.find("\ndef ", i + 10)
+    body = pipe[i:j if j > 0 else len(pipe)]
+    if not re.search(r"for\s+_?\w+\s+in\s+\(?spc_res\s+or\s+\[\]\)?", body):
+        return _r(False, "data_driven_rootcause 没有遍历 spc_res——参数收了不用，"
+                         "『因子自己动没动』不参与排序")
+    # 加权与降权必须是两个方向相反的乘数，且都在 spc 状态分支里
+    up = re.search(r"ev\s*=\s*\(ev\s+or\s+0\.0\)\s*\*\s*([0-9.]+)", body)
+    down = re.findall(r"ev\s*=\s*\(ev\s+or\s+0\.0\)\s*\*\s*([0-9.]+)", body)
+    if not up:
+        return _r(False, "没有按 SPC 自身状态加权（ev = ev * 系数）")
+    _coefs = [float(x) for x in down]
+    if not (any(c > 1 for c in _coefs) and any(c < 1 for c in _coefs)):
+        return _r(False, "加权系数没有一升一降（实测 %s）：判异与受控必须方向相反，"
+                         "否则『动过的优先』这个结论不成立" % _coefs)
+    if "_spc_note" not in body or "note" not in body:
+        return _r(False, "加权没有写进 detail.note——使用者只看到分数变了，不知道为什么")
+    return _r(True, "", {"ok": True})
+
+
 def rule_spec_entry_any_shape():
     """规格条目必须按"可能是单版本 dict、也可能是多版本 list"来消费。
 
@@ -4812,6 +4949,39 @@ AUDIT_RULES = [
           _mutant("归一化入口消失（修复退化：各消费方各自假设形态）",
                   _sub('def spec_entry_bounds(', 'def _spec_entry_bounds_gone('),
                   os.path.join("lib", "preprocess.py"))]),
+    Rule("段级偏移检测必须区分『确实没有』与『这项没做』",
+         rule_shift_scan_not_silent_empty,
+         "detect_shift_segments 在样本不足/无变异时必须标 INSUFFICIENT_DATA，"
+         "不得与「无发现」一样返回 []；状态必须经 phase1 回传进 pipeline。"
+         "否则 10 个点的序列会被报告写成『未发现整体偏移段』——没算冒充没有。",
+         os.path.join("lib", "spc.py"),
+         [_mutant("样本不足伪装成『确实没有』（修复退化：没做冒充没问题）",
+                  _sub('return _rep("INSUFFICIENT_DATA",\n'
+                       '                    "样本 n=%d < 12',
+                       'return _rep("NO_FINDING",\n'
+                       '                    "样本 n=%d < 12'),
+                  os.path.join("lib", "spc.py")),
+          _mutant("状态不再回传给调用方（修复退化：造了没人读）",
+                  _sub('"shift_scan": seg_scan,', '"_shift_scan_unused": seg_scan,'),
+                  os.path.join("lib", "spc.py")),
+          _mutant("留痕入口被摘掉（修复退化：又回到只返回 []）",
+                  _sub('min_sig=None, min_outside=None, report=None):',
+                       'min_sig=None, min_outside=None):'),
+                  os.path.join("lib", "spc.py"))]),
+    Rule("归因候选必须看『因子自己动没动』，不能只看与目标的相关",
+         rule_factor_self_state_counts,
+         "data_driven_rootcause 收了 spc_res 就必须用它：自身判异/整段偏移 → 加权，"
+         "自身统计受控 → 降权，并把理由写进 detail.note。"
+         "否则一个从没动过的参数会和刚偏移 3σ 的参数排得一样前。",
+         PIPELINE_FILE,
+         [_mutant("spc_res 收了不用（修复退化：没动过的参数照样排第一）",
+                  _sub('for _sd in (spc_res or []):',
+                       'for _sd in (None or []):'),
+                  PIPELINE_FILE),
+          _mutant("受控侧改成加权（修复退化：方向反了，越受控越靠前）",
+                  _sub('ev = (ev or 0.0) * 0.85',
+                       'ev = (ev or 0.0) * 1.05'),
+                  PIPELINE_FILE)]),
 ]
 
 
@@ -5612,6 +5782,15 @@ def flow_verify(args):
         #    但**任何新增都必须拦住**——这才是"不许再犯同样的错"的机制。
         run_cmd("9. 全局连贯性（棘轮）",
                 [PY, "scripts/coherence_audit.py", "--gate"], timeout=args.timeout),
+        # 10. 模块孤岛（棘轮）：前 9 步查的都是**函数与字段**层面的脱节，
+        #     查不到"整个模块在数据流上两头不沾"这种结构性缺陷。
+        #     判据是使用者给的公理：一个模块存在的理由 = 既有上游（拿得到
+        #     别的模块的推导结果）、又有下游（自己的产出被别人分发走）。
+        #     判定单元是**跨模块函数调用 + 常量读取 + 子进程启动**，
+        #     不是 import——import 只证明文件被打开过。
+        #     同样用棘轮：存量不阻断，但新增孤岛一律拦。
+        run_cmd("10. 模块孤岛（棘轮）",
+                [PY, "scripts/module_graph.py", "--gate"], timeout=args.timeout),
     ]
     return finish("质量闸门全套", steps, args.report, started=started)
 
@@ -5928,7 +6107,7 @@ def _config_profile_block(prods, role, cross=False):
               "生成待填模板：config --init-products --products ...）")
 
 
-def _config_init_from_data(args, path, params, tpl, kb):
+def _config_init_from_data(args, path, params, tpl):
     """按数据文件里的真实列名生成规格模板。
 
     键名直接取数据列名，保证 match_spec_key 一定对得上——
@@ -6018,7 +6197,7 @@ def _config_init(args):
     # 自己的规格）。按知识库的别名生成，撞对的概率很低。
     inputs = getattr(args, "input", None) or []
     if inputs:
-        return _config_init_from_data(args, inputs[0], params, tpl, kb)
+        return _config_init_from_data(args, inputs[0], params, tpl)
 
     tpl["_说明"] = ("企业规格模板（按知识库参数生成）。lsl/usl/target 必须填贵司"
                     "受控规格书的数值；留 null 表示不参与 Cpk 判定。"

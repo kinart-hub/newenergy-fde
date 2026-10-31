@@ -89,6 +89,15 @@ def diagnose(table, col_map, kb=None, process=None):
         return issues
     kb = kb if kb is not None else (PP.load_knowledge() if PP else {})
     params = (kb or {}).get("params", {})
+    # process 必须参与判定。知识库按工序组织（processes.<工序>.key_params），
+    # 不用它就会出现"涂布的表里认出了焊接的参数"却一声不响——
+    # 与 identify_defects 跨工序借机理是同一类错误：串过去的结论看起来一样漂亮，
+    # 现场照着做就是错的。这里显式把它报成一类字段问题。
+    proc_params = None
+    if process:
+        _pt = ((kb or {}).get("processes") or {}).get(process) or {}
+        _kp = _pt.get("key_params") or []
+        proc_params = set(_kp) if _kp else None
 
     # 1) 表内重复列名：csv 里很常见，下游取列会静默取到第一个
     seen = {}
@@ -123,6 +132,20 @@ def diagnose(table, col_map, kb=None, process=None):
                            "detail": "「%s」等 %d 列都命中参数 %s，保留 %s，其余退出工艺判定"
                                      % ("、".join(cols), len(cols), k, keep),
                            "severity": "high", "fixable": "auto"})
+
+    # 2-bis) 列命中了**别的工序**的参数：串工序比认不出来更危险。
+    #    认不出来会去问现场；串过去了会直接产出一条看似正确的工艺结论，
+    #    而这条结论用的机理、窗口、单位都属于另一道工序。
+    if proc_params:
+        for c, k in (col_map or {}).items():
+            if not k or k in proc_params:
+                continue
+            issues.append({"type": "param_out_of_process", "column": c, "param": k,
+                           "process": process,
+                           "detail": "「%s」被认成参数 %s，但它不属于「%s」工序的关键参数；"
+                                     "用它得出的结论属于**别的工序**的机理，须人工确认后"
+                                     "再从字段层面排除" % (c, k, process),
+                           "severity": "high", "fixable": "manual"})
 
     # 3) 单位冲突：列带单位但与库里登记的不一致，且没有可用换算
     for c, k in (col_map or {}).items():
@@ -192,7 +215,7 @@ def _conversion_factor(src, dst):
         prof = DEV.load_profiles() or {}
         conv = prof.get("unit_conversions") or {}
         # 注意签名是 (convs, key, src, dst)，别按直觉写成 (src, dst, convs)
-        return DEV._conv_factor(conv, None, src, dst)
+        return DEV._conv_factor(conv, src, dst)
     except Exception:
         return None
 
@@ -249,7 +272,7 @@ def apply_safe(table, issues, col_map):
     return table, col_map, applied
 
 
-def queue_candidates(issues, kb=None, source=None, auto_approve=False):
+def queue_candidates(issues, source=None, auto_approve=False):
     """
     把"需要新知识才能解决"的问题变成候选，投进（租户的）待审区。
     auto_approve=True 时也会走 sync，但**只落到租户层**——基线不受影响。
@@ -267,7 +290,7 @@ def queue_candidates(issues, kb=None, source=None, auto_approve=False):
             continue
         try:
             if i["type"] == "unmatched_column":
-                guess = _guess_param(i["column"], kb)
+                guess = _guess_param(i["column"])
                 if guess:
                     payload = {"param_key": guess[0], "alias": i["column"],
                                "note": "自动适配提议：把「%s」登记为参数 %s 的别名（相似度 %.2f）"
@@ -296,8 +319,18 @@ def queue_candidates(issues, kb=None, source=None, auto_approve=False):
                                                  "review": {"reviewer": "auto_adapt",
                                                             "note": "自动适配（仅租户层生效）"}})
                 r = KBS.sync(reviewer="auto_adapt")
-                queued.append({"type": i["type"], "ok": True, "id": rec["id"],
-                               "auto_approved": True, "sync": r.get("merged")})
+                # locked_out 必须读：拿不到写库锁时 sync 一条都没合进去，
+                # 但 merged=[] 与"确实没有待合条目"在返回值上长得一模一样。
+                # 不读它，自动适配会报 ok=True —— 使用者以为候选已进库，
+                # 实际上库里什么都没变。这是"静默假成功"，比报错危险。
+                if r.get("locked_out"):
+                    queued.append({"type": i["type"], "ok": False,
+                                   "id": rec["id"], "auto_approved": True,
+                                   "locked_out": True,
+                                   "error": "写库锁被占用，候选未合入基线，须稍后重试"})
+                else:
+                    queued.append({"type": i["type"], "ok": True, "id": rec["id"],
+                                   "auto_approved": True, "sync": r.get("merged")})
             else:
                 queued.append({"type": i["type"], "ok": True, "id": rec["id"],
                                "auto_approved": False})
@@ -312,7 +345,7 @@ def _slug(name):
     return s or "unknown_param"
 
 
-def _guess_param(col, kb, floor=0.72):
+def _guess_param(col, floor=0.72):
     """给认不出来的列找个最像的参数，用于生成别名候选（不是判定）"""
     try:
         hit = PP.match_param(col, prefer_process=None)
@@ -339,7 +372,7 @@ def adapt(table, col_map, kb=None, process=None, auto_approve=False,
         table2, col_map2, applied = apply_safe(table, issues, col_map)
         out["table"], out["col_map"], out["applied"] = table2, col_map2, applied
         if queue:
-            out["queued"] = queue_candidates(issues, kb=kb, source=source,
+            out["queued"] = queue_candidates(issues, source=source,
                                              auto_approve=auto_approve)
         unmatched = [i for i in issues if i["type"] in ("unmatched_column",)
                      or (i["type"] == "unit_conflict" and not i.get("convertible"))]

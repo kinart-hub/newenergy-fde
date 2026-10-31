@@ -233,6 +233,10 @@ def interview(table, path=None, device_id=None):
         "missing": missing,
         "unmapped_columns": unknown,
         "suggested_format": fmt,
+        # device_id 必须回传：它是这份问卷要登记的**主键**。
+        # 原先收了不用，登记时只能拿厂商+型号拼 key——同厂商同型号的两台设备
+        # 会撞成同一个档案，后登记的把先登记的悄悄覆盖掉。
+        "device_id": device_id,
         "questions": [{"field": f, "label": lbl, "hint": hint}
                       for f, lbl, hint in REQUIRED_FIELDS if f in missing],
         "note": ("已能自动认出，无需录入" if (identified or {}).get("device")
@@ -279,6 +283,8 @@ def build_profile(answers, table=None, path=None, device_id=None):
             unit_map[str(k)] = v
 
     prof = {
+        # 显式给了 device_id 就以它为准，不靠厂商+型号去拼（会撞）。
+        "device_id": device_id,
         "name": name,
         "vendor": vendor or "unknown",
         "model": model or "",
@@ -362,6 +368,13 @@ def register(profile, key, tenant=None, force=False):
     """
     if tenant:
         TN.set_tenant(tenant)
+    # 没显式给 key 时，优先用档案里登记的 device_id，
+    # 而不是放由调用方拿厂商+型号去拼——拼出来的 key 同型号会撞，
+    # 后登记的把先登记的那台悄悄覆盖掉，且不报错。
+    if not key:
+        _did = (profile or {}).get("device_id")
+        if _did:
+            key = str(_did).strip() or None
     target = _tenant_profile_path()
     if not target:
         return {"ok": False, "error": "未启用企业隔离（未指定 --tenant），拒绝写入共享基线。"

@@ -94,7 +94,7 @@ def build(res, lead=None):
 
     # ---- D6 先建一张"验证方案"卡（它是最该发给现场做的那张）----
     if d6:
-        d6_cards = _d6_cards(d6, res)
+        d6_cards = _d6_cards(d6)
         cards.extend(d6_cards)
     else:
         notes.append("D6 验证方案未产出，行动卡片只有 D5 方向性条目。")
@@ -123,7 +123,7 @@ def build(res, lead=None):
     return {"cards": cards, "n": len(cards), "notes": notes}
 
 
-def _d6_cards(d6, res):
+def _d6_cards(d6):
     """把 D6 验证方案展开成一张（或多张）卡。
 
     验证批次（样本量）不替人拍——MDD 表按 10/30/100 三个档给出"要检出多少改善

@@ -303,8 +303,14 @@ def cluster_report(res, entity_label="组件"):
     w = res["worst"]
     wq = res["worst"].get("q")
     wq = 1.0 if wq is None else wq
-    return ("%s=%s 的缺陷数是均匀期望的 %.2f 倍（实测 %s vs 期望 %s，"
+    # 期望值是不是按暴露量加权的，必须写进结论。
+    # 等权期望与按暴露量加权的期望是两个不同的基准：
+    # 某个位置缺陷多，可能只是因为它产量大。不说明基准，
+    # 读者会把"暴露加权的 2.1 倍"当成"这个位置真的坏"，从而查错地方。
+    _basis = ("按暴露量加权的期望" if res.get("exposure_weighted")
+              else "等权（未加权）期望")
+    return ("%s=%s 的%s数是%s的 %.2f 倍（实测 %s vs 期望 %s，"
             "BH 校正后 q=%.4f）。指向该位置的机构性问题（排版/焊接/层压缓冲/压针），"
             "建议先查这一个定点，而不是全工序铺开整改。"
-            % (res["factor"], w["level"], w["ratio"], w["observed"],
-               w["expected"], wq))
+            % (res["factor"], w["level"], entity_label, _basis,
+               w["ratio"], w["observed"], w["expected"], wq))

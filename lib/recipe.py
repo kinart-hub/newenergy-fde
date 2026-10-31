@@ -74,8 +74,13 @@ def _group(values_by_recipe):
     return out, dropped
 
 
-def _bh_fdr(pvals, alpha=0.05):
-    """Benjamini-Hochberg 校正。返回与输入同序的校正后 p。"""
+def _bh_fdr(pvals):
+    """Benjamini-Hochberg 校正。返回与输入同序的校正后 p。
+
+    不收 alpha：BH 产出的是 q 值，与 alpha 无关（alpha 属判定环节）。
+    原先签名有 alpha=0.05 而函数体从不读它，等于在 API 上写假承诺。
+    判显著由调用方做：`p_adj <= alpha`。
+    """
     m = len(pvals)
     if m == 0:
         return []
@@ -268,11 +273,21 @@ def in_recipe_drift(values, recipe_name=None):
     out["stable"] = (base or {}).get("stable")
     out["baseline"] = base
     try:
-        segs = spc.detect_shift_segments(xs)
+        _scan = {}
+        segs = spc.detect_shift_segments(xs, report=_scan)
+        out["shift_scan"] = _scan
     except Exception as e:
         segs = []
+        out["shift_scan"] = {"status": ST.FAILED,
+                             "reason": "偏移段检测抛异常：%s" % str(e)[:120]}
         out["warnings"].append("偏移段检测失败：%s" % str(e)[:80])
     out["shift_segments"] = segs or []
+    # 「没检出偏移段」与「样本太少没法判」是两回事，后者必须显式说出来，
+    # 否则配方对比的读者会把"没做"当成"做了、没问题"。
+    _ss = out.get("shift_scan") or {}
+    if _ss.get("status") == ST.INSUFFICIENT_DATA:
+        out["warnings"].append("未做偏移段检测：%s。配方对比期间设备是否漂移，"
+                               "本条不提供判断" % (_ss.get("reason") or ""))
     if out["shift_segments"]:
         out["warnings"].append(
             "配方 %s 内部检测到 %d 个偏移段：配方参数没变而产出变了，"

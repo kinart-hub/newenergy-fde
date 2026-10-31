@@ -192,7 +192,7 @@ def _is_upstream(processes, proc, candidate):
     return False
 
 
-def _bump(ver, kind="minor"):
+def _bump(ver):
     try:
         a, b, c = [int(x) for x in str(ver).split(".")]
     except Exception:

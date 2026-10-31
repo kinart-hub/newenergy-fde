@@ -382,15 +382,49 @@ def pick_primary_defect(defects, table):
 # ------------------------------------------------------------------ Pareto
 
 def pareto(categories, weights=None):
-    """categories: {名称: 数量} 或 [(名称, 数量)] -> Pareto 表 + ABC 分级"""
+    """Pareto 表 + ABC 分级。
+
+    categories —— {名称: 数量} 或 [(名称, 数量)]。
+    weights    —— {名称: 权重} 或 [(名称, 权重)]。给了就**按权重而非次数**
+                  来排序与算占比。这不是可选的风味参数，是两种不同结论：
+                  「发生 30 次、只损失 200 元」与「发生 3 次、损失 5 万元」
+                  按次数排和按金额排得到的前三项往往完全不同，
+                  整改资源投错地方的代价就是在这里产生的。
+                  权重缺失的名称**退回用次数**，并在 note 里说明有几个没权重
+                  ——静默按 0 处理会把它们挤到末位，看着像"不重要"，
+                  实际只是没登记权重。
+    """
     items = categories.items() if isinstance(categories, dict) else categories
     items = [(k, float(v)) for k, v in items if v is not None]
-    items.sort(key=lambda kv: -kv[1])
-    total = sum(v for _, v in items) or 1.0
-    rows, cum = [], 0.0
+    wmap = {}
+    if weights:
+        try:
+            wmap = dict(weights.items() if isinstance(weights, dict) else weights)
+        except Exception:
+            wmap = {}
+    _weighted = bool(weights)
+    _missing_w = []
+    scored = []
     for k, v in items:
-        cum += v
-        pct = v / total * 100
+        if _weighted:
+            w = wmap.get(k)
+            if w is None:
+                _missing_w.append(k)
+                w = v
+            try:
+                w = float(w)
+            except Exception:
+                _missing_w.append(k)
+                w = v
+        else:
+            w = v
+        scored.append((k, v, w))
+    scored.sort(key=lambda t: -t[2])
+    total = sum(t[2] for t in scored) or 1.0
+    rows, cum = [], 0.0
+    for k, v, w in scored:
+        cum += w
+        pct = w / total * 100
         cum_pct = cum / total * 100
         if cum_pct <= 80:
             cls = "A"
@@ -398,15 +432,22 @@ def pareto(categories, weights=None):
             cls = "B"
         else:
             cls = "C"
-        rows.append({"item": k, "value": v, "pct": pct, "cum_pct": cum_pct, "abc": cls})
-    return {"rows": rows, "total": total,
-            "top": rows[0] if rows else None,
-            "vital_few": [r for r in rows if r["abc"] == "A"]}
+        rows.append({"item": k, "count": v, "weight": (w if _weighted else None),
+                     "value": w, "pct": pct, "cum_pct": cum_pct, "abc": cls})
+    out = {"rows": rows, "total": total,
+           "top": rows[0] if rows else None,
+           "vital_few": [r for r in rows if r["abc"] == "A"],
+           "weighted": _weighted}
+    if _weighted and _missing_w:
+        out["note"] = ("有 %d 项没有登记权重，已退回按次数计入：%s。"
+                       "补上权重后重排，顺序可能变化。"
+                       % (len(set(_missing_w)), "、".join(list(sorted(set(_missing_w)))[:5])))
+    return out
 
 
 # ------------------------------------------------------------------ 证据计算
 
-def _data_evidence(table, param_key, target_col, defect_proc):
+def _data_evidence(table, param_key, target_col):
     """计算某参数对目标的证据强度，返回 (score 0-1, detail)"""
     kb = _kb()
     spec = kb["params"].get(param_key, {})
@@ -633,7 +674,7 @@ def rank_root_causes(defect_name, table, target_col=None, top=5,
         if case:
             hist[pk] = case
             prior = min(1.3, prior + bonus)
-        ev, det = _data_evidence(table, pk, target_col, proc or info["process"])
+        ev, det = _data_evidence(table, pk, target_col)
         tscore, tdet = 0.0, None
         if det.get("column") and target_col:
             tscore, tdet = _temporal_match(table, det["column"], target_col)
@@ -687,7 +728,7 @@ def rank_root_causes(defect_name, table, target_col=None, top=5,
             pproc = pspec.get("process")
             if allowed and pproc and pproc not in allowed:
                 continue                       # 挡掉跨工序串味的参数
-            ev, det = _data_evidence(table, pk, target_col, proc or pproc or "")
+            ev, det = _data_evidence(table, pk, target_col)
             if det.get("status") != ST.SUCCESS:
                 continue
             r = det.get("r")
@@ -1083,12 +1124,44 @@ def build_5why(defect_name, top_causes, table=None, target_col=None):
     fallback = _unregistered_hint(defect_name, "process") if not known else \
         "该工序的工艺机理尚未在知识库中细化"
 
+    # 第 1 层问的是「为什么出现这个缺陷」，而「出现」这件事本身必须先被这批数据确认。
+    # target_col 原先收了完全不用，于是"知识库里写了这个工序的机理"就被当成
+    # "这批数据里确实出了这个缺陷"，第 1 层 supported=True —— 5Why 变成在解释
+    # 一个未被证实的现象，后面四层再严谨也是空中楼阁。
+    _l1_supported = bool(pnotes)
+    _l1_data = ""
+    if target_col:
+        # 「列不存在」与「列在但取不到值」是两回事，文案要分开说，
+        # 否则使用者会去查一个根本没有的列。
+        _idx = None
+        if table is not None:
+            try:
+                _idx = table.col_index(target_col)
+            except Exception:
+                _idx = None
+        if _idx is None:
+            _l1_data = ("；当前数据表里没有目标列「%s」，『出现』这一前提未经数据确认"
+                        % target_col)
+            _l1_supported = False
+        else:
+            try:
+                _vals = list(table.column(target_col) or [])
+            except Exception:
+                _vals = []
+            _n_t = sum(1 for v in _vals if v not in (None, ""))
+            if _n_t:
+                _l1_data = ("；本批目标列「%s」有 %d 个有效实测值，『出现』已由数据确认"
+                            % (target_col, _n_t))
+            else:
+                _l1_data = ("；当前数据表的目标列「%s」无有效实测值，"
+                            "『出现』这一前提未经数据确认" % target_col)
+                _l1_supported = False
     chain.append({
         "level": 1,
         "why": "为什么出现「%s」？" % defect_name,
-        "because": pnotes or fallback,
+        "because": (pnotes or fallback) + _l1_data,
         "evidence": "知识库工序机理" if pnotes else "知识库未收录（可补录）",
-        "supported": bool(pnotes),
+        "supported": _l1_supported,
     })
     chain.append({
         "level": 2,
@@ -1108,6 +1181,20 @@ def build_5why(defect_name, top_causes, table=None, target_col=None):
             ev.append("CV=%.2f%%" % d["cv_pct"])
         if d.get("status") == ST.INSUFFICIENT_DATA:
             ev.append("该参数在当前数据中不存在，需补充：%s" % d.get("need"))
+        # 用 table 复核这一层：聚合结果里说"指向这个参数"，
+        # 但**这张表里到底有没有这一列**是另一回事。
+        # table/target_col 原先收了完全不用，于是"指向一个表里不存在的列"
+        # 也能理直气壮地写进 5Why —— 现场照着去找，会发现根本没有这个参数。
+        _col = lead.get("param_name") or lead.get("column")
+        _in_table = None
+        if table is not None and _col:
+            try:
+                _in_table = table.col_index(_col) is not None
+            except Exception:
+                _in_table = None
+        if _in_table is False:
+            ev.append("复核：当前数据表里没有「%s」这一列，上述证据来自其它环节，"
+                      "须确认列口径后再按此方向行动" % _col)
         chain.append({
             "level": 3,
             "why": "为什么指向「%s」？" % lead.get("param_name"),

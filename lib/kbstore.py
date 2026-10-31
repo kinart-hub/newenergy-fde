@@ -943,11 +943,14 @@ def merge_one(rec, force=False):
 
 
 def _provenance(rec):
+    # candidate_id 已移除：它与展示层「条目编号」取的是同一个 rec["id"]，
+    # 而展示层已经把 id 单独打出来了；_kbmeta 里再存一份没有任何读取方。
+    # 两个地方存同一个 id 还有个隐患——将来若两处口径漂移（比如导出时换成
+    # 内部流水号），没人会发现，因为没人比对。删掉，只留一处真源。
     return {
         "source": (rec.get("source") or {}).get("site_code") or (rec.get("source") or {}).get("site") or "未提供",
         "date": (rec.get("created") or "")[:10],
         "by": rec.get("proposed_by"),
-        "candidate_id": rec.get("id"),
         "method": (rec.get("verification") or {}).get("method"),
     }
 

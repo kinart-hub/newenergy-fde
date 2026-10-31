@@ -44,7 +44,7 @@ def g(r, mu, sd, lo=None, hi=None):
     return clamp(v, lo, hi) if (lo is not None and hi is not None) else v
 
 
-def wr(path, header, rows, unit_row=None, footer=None, bom=False, dirty=None):
+def wr(path, header, rows, unit_row=None, footer=None, bom=False):
     """写 CSV。unit_row=第二行单位（双行表头）；footer=合计尾行；bom=utf-8-sig"""
     os.makedirs(os.path.dirname(path), exist_ok=True)
     enc = "utf-8-sig" if bom else "utf-8"

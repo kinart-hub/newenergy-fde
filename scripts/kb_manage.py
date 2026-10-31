@@ -259,6 +259,14 @@ def cmd_devices(a):
             if q["identified_as"]:
                 print("\n这台设备已在档案库里，无需录入。")
                 return
+            # 先让人确认"我是按这个版式读你的文件的"。
+            # 版式认错（长表当宽表、有单位行当没有）会让后面所有自动填好的值
+            # 全部错位，而这种错不会报错、只会静静地填出一堆似是而非的答案。
+            if q.get("suggested_format"):
+                _f = q["suggested_format"]
+                print("\n我按这个版式读的（错了请改 JSON 里的 format 再重跑）：")
+                for k, v in _f.items():
+                    print("   %-16s %s" % (k, json.dumps(v, ensure_ascii=False)[:90]))
             print("\n已自动填好（可直接改）：")
             for k, v in (q["auto_filled"] or {}).items():
                 if v:
@@ -521,11 +529,19 @@ def cmd_sync(a):
     r = KBS.sync(ids=a.id, force=a.force, reviewer=a.by or "工艺负责人")
     emit(r, a.json, "知识库同步结果")
     if not a.json:
+        # locked_out 必须单独说出来：它是"整个同步根本没执行"，
+        # 与"执行了但某条失败"是两回事，混在 failed 列表里会被当成一条普通错误。
+        if r.get("locked_out"):
+            print("⚠ 写库锁被占用，本次同步**未执行**，知识库未发生任何变更。稍后重试。")
         print("已合并 %d 条，失败 %d 条" % (len(r["merged"]), len(r["failed"])))
         for L in r["logs"]:
             print("   ✓ %s（-> v%s）" % (L["text"], L["version"]))
         for f in r["failed"]:
             print("   × %s：%s" % (f["id"], f["error"]))
+        # 索引刷新时间：合并之后若检索不到新条目，第一个要核对的就是它——
+        # 索引没刷新会让人以为"合并失败"，实际只是索引还是旧的。
+        if r.get("index_date"):
+            print("索引刷新时间：%s" % r["index_date"])
         if r["merged"]:
             print("变更记录追加到 knowledge/CHANGELOG.md；旧版本备份在 knowledge/backups/")
             print("回滚： python scripts/kb_manage.py rollback --target specs "
@@ -1060,6 +1076,8 @@ def cmd_upgrade(a):
     res = KBS.sync(reviewer=getattr(a, "by", None) or "基线维护")
     emit(res, getattr(a, "json", False), "基线升级完成")
     if not getattr(a, "json", False):
+        if res.get("locked_out"):
+            print("⚠ 写库锁被占用，基线升级**未执行**，知识库未发生任何变更。稍后重试。")
         print("已合并 %d 条：%s" % (len(res.get("merged", [])),
                                     "、".join(res.get("merged", []))))
         for f in res.get("failed", []):

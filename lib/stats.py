@@ -673,8 +673,15 @@ def fmt_p(p, digits=4):
     return "%.*g" % (digits, p)
 
 
-def bh_adjust(pvals, alpha=0.05):
+def bh_adjust(pvals):
     """Benjamini-Hochberg 多重比较校正，返回 q 值（与原顺序一致）。
+
+    **这里刻意不收 alpha**。BH 校正出来的是 q 值，它与 alpha 无关——
+    alpha 是"判显著"的阈值，属于判定环节而不是校正环节。
+    原先签名里有个 alpha=0.05，函数体一次都没读过它，
+    调用方却以为"传了 alpha 就按这个水平校正过了"。
+    判显著请由调用方自行比较：`q <= alpha`。
+    （删参数不是省事：留一个不生效的 alpha，等于在 API 上写假承诺。）
 
     一次分析往往要检验几十个相关/分组，0.05 水准下必然挑出几个假阳性。
     12 个电池列逐个卡方就是典型场景：不校正几乎必然"发现"一个热点。

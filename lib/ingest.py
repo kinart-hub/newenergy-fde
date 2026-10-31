@@ -275,10 +275,15 @@ def merge(tables, key_cols=None, time_col=None, dedup=True,
         keep = list(range(len(tb.rows)))
         info = {"key_mode": "single", "key_cols": None, "n_dup": 0,
                 "n_conflict": 0, "conflicts": [], "warning": None}
+        # 字段名与主合并路径统一为 columns_union。
+        # 原先这里叫 unions、主路径叫 columns_union，两个分支返回不同键名，
+        # 下游只能各取一个——单表时 columns_union 恒为 None 而 unions 有值，
+        # 于是"合并后到底有哪些列"在单表分支上永远读不到。
         return {"table": tb, "n_in": len(tb.rows),
                 "batches": [_batch_meta(tb, len(tb.rows), len(tb.rows), time_col)],
                 "n_dup": 0, "n_conflict": 0, "conflicts": [],
-                "key_mode": "single", "unions": [c for c in tb.columns]}
+                "key_mode": "single", "columns_union": [c for c in tb.columns],
+                "n_columns_added": 0}
 
     # 列并集（保持首次出现顺序；后出现的表缺列填 None）
     cols = []

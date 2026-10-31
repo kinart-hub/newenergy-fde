@@ -719,8 +719,11 @@ _TEMPLATE_FIELDS = (
 )
 
 
-def init_template(products, root=None):
+def init_template(products):
     """生成产品档待填模板。
+
+    （原先收了 root 却从不使用——落盘路径由 write_template 负责，
+      本函数只构造模板内容。留着它只会让调用方以为"传了 root 就写到那"。）
 
     模板里的值**一律留空并标注待确认**：本工具不替企业编参数。
     编出来的默认值会被当成"系统给的"直接交付，那比留空危险得多。
@@ -770,8 +773,8 @@ def init_template(products, root=None):
     return tpl
 
 
-def write_template(products, path=None, root=None):
-    tpl = init_template(products, root)
+def write_template(products, path=None):
+    tpl = init_template(products)
     path = path or PRODUCT_PROFILE_FILE
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     with io.open(path, "w", encoding="utf-8") as f:

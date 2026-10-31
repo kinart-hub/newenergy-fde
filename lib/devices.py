@@ -123,7 +123,7 @@ def get_profile(device_key):
 
 # ---------------------------------------------------------------- 设备识别
 
-def _head_meta_text(path, max_lines=12):
+def _head_meta_text(path):
     """读取文件顶部若干行原文，用于抓设备型号/厂商字符串"""
     if not path or not os.path.exists(path):
         return ""
@@ -420,7 +420,7 @@ def _absorb_unit_row(table, mode="suffix"):
     return T.Table(colnames, table.rows[1:], table.name, table.source_path), units
 
 
-def _looks_pivotable(table, key_col, value_col, group_col=None):
+def _looks_pivotable(table, key_col, value_col):
     """
     是否真的需要 pivot。判据：同一 group 内出现多个不同 key（即纵向堆叠）。
     若一行一样品（key 唯一或 key 就是样本名），则本来就是宽表，不该转。
@@ -646,7 +646,7 @@ def _canon_unit(u):
     return hit
 
 
-def _conv_factor(convs, key, src_unit, dst_unit):
+def _conv_factor(convs, src_unit, dst_unit):
     if not src_unit or not dst_unit:
         return None
     su, du = _canon_unit(src_unit), _canon_unit(dst_unit)
@@ -701,7 +701,7 @@ def apply_units(table, profile, col_map=None):
             warns.append("「%s」的标准单位在知识库中未定义，未做换算" % base)
             continue
 
-        f = _conv_factor(convs, None, src_unit, dst_unit)
+        f = _conv_factor(convs, src_unit, dst_unit)
         if isinstance(exp, dict) and exp.get("conversion") in convs:
             cv = convs[exp["conversion"]]
             f = cv["factor"] if cv["from"] == src_unit else f
@@ -803,7 +803,7 @@ def apply_attr_maps(table, profile, col_map=None):
 
 # ---------------------------------------------------------------- 统一入口
 
-def ingest(path, sheet=None, prefer_process=None, verbose=False, device=None):
+def ingest(path, sheet=None, prefer_process=None, device=None):
     """
     读一个文件 -> 识别设备 -> 归一版式 -> 单位换算 -> 列名映射。
     返回 dict，任何一步失败都降级并记 note，绝不抛异常中断主流程。

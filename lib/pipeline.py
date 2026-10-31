@@ -175,7 +175,7 @@ if EV is not None and EV.__name__ != "lib.events":
 KB = PP.load_knowledge()
 _fmt = RPT._fmt
 
-ANALYZER_VERSION = "2.19.10"
+ANALYZER_VERSION = "2.19.11"
 
 
 # 空数据排查清单。
@@ -905,6 +905,9 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
             "key_cols": _ing_report.get("key_cols"),
             "on_conflict": _ing_report.get("on_conflict"),
             "n_columns_added": _ing_report.get("n_columns_added"),
+            # 合并后的列并集：多文件场景下"这列来自哪张表"只能靠它追溯，
+            # 缺了它，后面任何"某列不存在/某列数值异常"都无法定位到源文件。
+            "columns_union": _ing_report.get("columns_union"),
             "batches": (_ing_report.get("batches") or [])[:50],
             "conflicts": (_ing_report.get("conflicts") or [])[:10],
         }
@@ -1700,7 +1703,7 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
                     tgt = _ds.get("target") if isinstance(_ds, dict) else None
                     _spec_src = "设备档案"
                 else:
-                    lsl, usl, tgt = SPC.resolve_spec(ctrl, mu, sd)
+                    lsl, usl, tgt = SPC.resolve_spec(ctrl, mu)
                     _spec_src = ("知识库推定" if (lsl is not None or usl is not None) else None)
             # Phase I/II：先用稳定期建限，再拿这个限监控全段。
             # 直接用全段算限的话，异常自己会把 σ 撑大、把控制限撑宽，
@@ -1943,6 +1946,10 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
                     # 只给"剔除了 13 个点"，使用者没法判断这 13 点是散落噪声
                     # 还是第 80–109 点整段偏了 —— 后者才是要去找原因的那种事。
                     "shift_segments": (p1 or {}).get("shift_segments", []),
+                    # 段级检测的结论状态（SUCCESS / NO_FINDING / INSUFFICIENT_DATA）。
+                    # 只有段列表而不给状态，"没检出偏移段"与"样本不够没做"在报告里
+                    # 长得一模一样——后者会被读成"过程无结构性偏移"。
+                    "shift_scan": (p1 or {}).get("shift_scan") or {},
                 },
                 "values": vals,
             })
@@ -2061,6 +2068,16 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
             root.setdefault("notes", []).append(
                 "运行时处于「%s」模式，本根因结论只用数据统计、未用工序知识库机理先验；"
                 "它描述这批数据的关联，不是该工序的工艺结论。" % _proc_mode)
+        # 权重校准状态：排序靠权重，而权重本身没被现场真值验证过。
+        # rootcause 已经把它算出来了，但**不进 warnings 就等于没说**——
+        # 报告里只看到"排序第一"，看不到"排序所依赖的权重未经验证"，
+        # 使用者会当作已校准的结论去改工艺。这是风险披露，不是一般信息。
+        _wvs = (root or {}).get("weights_validation_status")
+        if _wvs:
+            root.setdefault("notes", []).append("权重校准状态：%s" % _wvs)
+            result.setdefault("warnings", []).append(
+                "根因排序所依赖的权重尚未经现场真值验证：%s。"
+                "排序只表示「按当前权重的相对强弱」，不表示权重已被证明正确。" % _wvs)
         # 单元级热点：16 个通道里只有 CH-07 坏、两家供应商只有 B 差 ——
         # 这种"个别单元跑偏"是产线最常见的根因形态，但单因素 ANOVA 抓不到
         # （效应被正常单元摊薄，η² 0.05、p=0.41 判不显著），只能逐水平比较。
@@ -2618,7 +2635,7 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
 
     # 14. 生成报告
     rep = build_report(result, work, spc_res, corr, assoc, pare, root, gaps, conf,
-                       doe_plan, gcomp, lags, strong, tcol, times, max_charts)
+                       doe_plan, gcomp, lags, strong, tcol, max_charts)
     files = RPT.save_report(rep, outdir, "工艺分析报告")
     # Word 原生导出：报告要进 8D 系统、要发客户、要走签核，对面要的是 .docx。
     # 以前只有 HTML 可打印，使用者得自己转一遍——多一次手工转换就多一次
@@ -2914,6 +2931,14 @@ def data_driven_rootcause(assoc, spc_res, col_map, process_key, y_col, recog=Non
                 r1, r2 = r_with_y.get(c1, 0.0), r_with_y.get(c2, 0.0)
                 loser = _pick_redundant(c1, c2, r1, r2, kb)
                 excluded.add(loser)
+    # 各列自身的 SPC 状态（判异 / 整段偏移 / 基线是否受控）。
+    # 相关系数只说"两个量一起变"，不说"这个因子自己变没变" ——
+    # 一个全程统计受控、没有异常变动的因子，解释不了目标为什么突然变坏。
+    # 现场最常见的误判就是把一个从头到尾没动过的参数排到根因第一位。
+    _spc_by_col = {}
+    for _sd in (spc_res or []):
+        if isinstance(_sd, dict) and _sd.get("column"):
+            _spc_by_col[_sd["column"]] = _sd
     skipped = []
     for i, a in enumerate(assoc[:10]):
         nm = a["param"]
@@ -2965,6 +2990,28 @@ def data_driven_rootcause(assoc, spc_res, col_map, process_key, y_col, recog=Non
             ev = max(ev or 0.0, indirect * 0.9)
             chain_note = ("经「%s」间接传导到目标（直接 r=%.2f，传导强度 %.2f）"
                           % (via, a.get("r") or 0.0, indirect))
+        _spc_note = ""
+        _sd = _spc_by_col.get(nm) or {}
+        if _sd:
+            _vios = _sd.get("violations") or []
+            _shifts = ((_sd.get("exclusion_review") or {}).get("shift_segments")) or []
+            if _vios or _shifts:
+                # 它自己先动了，才谈得上"它把目标带坏的"
+                ev = (ev or 0.0) * 1.15
+                _spc_note = ("该参数自身有异常变动（判异 %d 条%s），具备解释目标变化的前提"
+                             % (len(_vios),
+                                "、整段偏移 %d 段" % len(_shifts) if _shifts else ""))
+            elif (_sd.get("baseline") or {}).get("stable") is True:
+                # 它自始至终没动过，相关再强也只是"两个量长期一起待着"
+                ev = (ev or 0.0) * 0.85
+                _spc_note = ("该参数自身处于统计受控状态，未观测到异常变动；"
+                             "仅凭相关性强弱不足以认定它驱动了目标异常，已降权")
+        _dnote = chain_note or (
+            "该列是结果指标，与目标高度共线，属同一现象的不同量法，"
+            "不是可独立调控的原因" if is_response
+            else "数据驱动排序，未经缺陷机理库加权")
+        if _spc_note:
+            _dnote = "%s；%s" % (_dnote, _spc_note)
         cands.append({
             "param_key": key, "param": nm, "param_name": spec.get("name", nm),
             "unit": spec.get("unit", ""),
@@ -2976,10 +3023,7 @@ def data_driven_rootcause(assoc, spc_res, col_map, process_key, y_col, recog=Non
             "detail": {"status": ST.SUCCESS, "param": key or nm, "column": nm,
                        "r": a.get("r"), "p": a.get("p"), "n": a.get("n"),
                        "via": via, "indirect": round(indirect, 3) if via else None,
-                       "note": chain_note or (
-                           "该列是结果指标，与目标高度共线，属同一现象的不同量法，"
-                           "不是可独立调控的原因" if is_response
-                           else "数据驱动排序，未经缺陷机理库加权")},
+                       "note": _dnote},
             "note": spec.get("note", ""),
         })
     if not cands:
@@ -3112,7 +3156,7 @@ def _add_history_cases(rep, sec, root):
 
 
 def build_report(res, work, spc_res, corr, assoc, pare, root, gaps, conf,
-                 doe_plan, gcomp, lags, strong, tcol, times, max_charts):
+                 doe_plan, gcomp, lags, strong, tcol, max_charts):
     try:
         from . import scope as SC
     except Exception:
@@ -3550,6 +3594,24 @@ def build_report(res, work, spc_res, corr, assoc, pare, root, gaps, conf,
             rep.text(s4, "这几段不是单点尖峰，而是**连续一段时间整体偏高/偏低**——"
                      "请对照该时间段的生产记录（换料、换班、设备参数调整、"
                      "量具更换），而不是按随机离群点忽略。")
+        else:
+            # 没检出偏移段时要交代「为什么没检出」。段级检测在样本不足或
+            # 序列无变异时返回空列表，这与"确实没有整体偏移"是两回事；
+            # 不写这一句，读者会把"没做这项检查"当成"查过了、过程很干净"。
+            _ss = (d.get("exclusion_review") or {}).get("shift_scan") or {}
+            _sst = _ss.get("status")
+            if _sst == ST.INSUFFICIENT_DATA:
+                rep.callout(s4, "%s：**未做偏移段检测**——%s。本段不涉及『有无整体偏移』的判断，"
+                                "不要读成过程无结构性偏移。"
+                            % (title, _ss.get("reason") or ""), "warn")
+            elif _sst == ST.FAILED:
+                rep.callout(s4, "%s：偏移段检测执行失败（%s），该项结论缺失。"
+                            % (title, _ss.get("reason") or ""), "warn")
+            elif _sst == ST.NO_FINDING:
+                rep.text(s4, "%s：已做段级偏移检测（n=%s，最短段长 %s 点），未发现整体偏移段%s。"
+                         % (title, _ss.get("n"), _ss.get("min_run"),
+                            "；最接近的候选也差 %.2fσ" % _ss["closest"]["z"]
+                            if isinstance(_ss.get("closest"), dict) else ""))
         add_chart(s4, CH.control_chart(d["values"], d["center"], d["lcl"], d["ucl"],
                                        title=title + " X-MR 控制图",
                                        ylabel="测量值 %s" % d["unit"],
@@ -3761,6 +3823,18 @@ def build_report(res, work, spc_res, corr, assoc, pare, root, gaps, conf,
                                               _cl.get("defect_type") or "全部"), "warn")
     if res.get("negative_verdict"):
         rep.callout(s8, "【无可行动根因】%s" % res["negative_verdict"]["text"], "warn")
+        # 阴性结论必须带"查了多少、最强的是哪个、离阈值差多少"。
+        # 只说"没找到"，读者无法区分"只查了 2 项"与"查了 40 项都没过"——
+        # 这两种"没找到"的可信度完全不同，而它们当前的文本长得一模一样。
+        _nv = res["negative_verdict"]
+        _nv_kv = [("已检验工艺参数", _nv.get("n_process_tests")),
+                  ("已检验工况项", _nv.get("n_condition_tests"))]
+        if _nv.get("strongest_process"):
+            _nv_kv.append(("最强但未达阈值的方向", "%s（|r|=%s）"
+                           % (_nv["strongest_process"], _nv.get("max_process_r"))))
+        if _nv.get("strongest_condition"):
+            _nv_kv.append(("最强工况", _nv["strongest_condition"]))
+        rep.kv(s8, [kv for kv in _nv_kv if kv[1] is not None])
     if root:
         rep.kv(s8, [("缺陷/问题", root["defect"]), ("所属工序", root["process_name"]),
                     ("机理", root.get("mechanism") or "—")])
@@ -4099,6 +4173,21 @@ def _render_msa_gate(rep, sec, res):
                 ("，ndc=%.1f" % _m["ndc"]) if _m.get("ndc") is not None else "",
                 _m.get("source") or _m.get("method") or "—"))
         rep.callout(sec, "".join(_line), _kind)
+        # 分级依据、观测数、GRR 绝对量必须一并给出：
+        # ① 分级阈值是谁定的（AIAG 手册 vs 企业自定义）决定这个"可接受"能不能
+        #    直接拿去用——不写来源，读者会以为是行业通则；
+        # ② 观测数决定结论稳不稳，10 次测量与 90 次测量的 %GRR 可信度不同；
+        # ③ %GRR 是相对量（除以公差/过程变差），公差一改它就变，
+        #    绝对量 GRR 才是"测量系统本身抖多少"的稳定刻画。
+        _msa_kv = []
+        if _m.get("grading_source"):
+            _msa_kv.append(("分级依据", _m["grading_source"]))
+        if _m.get("n_obs"):
+            _msa_kv.append(("观测数", _m["n_obs"]))
+        if _m.get("grr") is not None:
+            _msa_kv.append(("GRR（绝对量）", _m["grr"]))
+        if _msa_kv:
+            rep.kv(sec, _msa_kv)
         if _m.get("action") == "block":
             rep.callout(sec, "本次<b>未产出根因排序</b>：观测到的变差里测量误差占主导，"
                              "在上面排任何榜都是给噪声编故事。"

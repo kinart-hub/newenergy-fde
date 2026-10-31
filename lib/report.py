@@ -127,7 +127,7 @@ class Report(object):
             return ["```", b["content"], "```"]
         return []
 
-    def render_html(self, chart_dir=None):
+    def render_html(self):
         css = """
 :root{--bd:#e2e8f0;--tx:#0f172a;--mu:#64748b;--bg:#f8fafc;--ac:#2563eb;}
 *{box-sizing:border-box}
@@ -171,14 +171,14 @@ pre{background:var(--bg);padding:12px;border-radius:6px;overflow-x:auto;border:1
             _lv = max(2, min(6, int(sec.get("level") or 2)))
             out.append("<h%d>%s</h%d>" % (_lv, sec["title"], _lv))
             for b in sec["blocks"]:
-                out.append(self._html_block(b, chart_dir))
+                out.append(self._html_block(b))
         out.append('<div class="foot">本报告由 workbuddy skill <b>newenergy-fde</b> 自动生成 ｜ '
                    '生成时间 %s ｜ 结论需结合现场工艺与设备状态复核后执行</div>'
                    % datetime.datetime.now().strftime("%Y-%m-%d %H:%M"))
         out.append("</div></body></html>")
         return "\n".join(out)
 
-    def _html_block(self, b, chart_dir):
+    def _html_block(self, b):
         t = b["type"]
         if t == "text":
             return "<p>%s</p>" % b["content"]
@@ -231,7 +231,7 @@ def save_report(rep, outdir, basename, chart_rel="charts"):
                     f.write(b["svg"])
                 saved.append(p)
     md = rep.render_md(chart_dir=cdir, chart_rel=chart_rel)
-    html = rep.render_html(chart_dir=cdir)
+    html = rep.render_html()
     mp = os.path.join(outdir, basename + ".md")
     hp = os.path.join(outdir, basename + ".html")
     with io.open(mp, "w", encoding="utf-8") as f:

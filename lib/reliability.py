@@ -202,7 +202,7 @@ def _eta_from_beta(beta, u, r, scale):
     return ((s / r) ** (1.0 / beta)) * scale
 
 
-def _profile_ci(u, r, s1_fail, scale, beta_hat, ll_max, conf):
+def _profile_ci(u, r, s1_fail, beta_hat, ll_max, conf):
     """剖面似然区间：解 2(lnL_max − lnL(β)) = χ²_q,df=1 的两侧根。"""
     target = ll_max - 0.5 * _chi2_q_df1(conf)
 
@@ -324,10 +324,10 @@ def weibull_fit(times, censored=None, conf=0.95,
     out["beta"] = beta
     out["eta"] = eta
     out["beta_interpret"] = _beta_text(beta)
-    out["goodness_r2"] = _weibull_plot_r2(t, c, beta, eta)
+    out["goodness_r2"] = _weibull_plot_r2(t, beta, eta)
 
     try:
-        b_lo, b_hi = _profile_ci(u, r, s1_fail, scale, beta, ll_max, conf)
+        b_lo, b_hi = _profile_ci(u, r, s1_fail, beta, ll_max, conf)
         out["beta_ci"] = [b_lo, b_hi]
         e_lo = _eta_from_beta(b_lo, u, r, scale)
         e_hi = _eta_from_beta(b_hi, u, r, scale)
@@ -376,7 +376,7 @@ def weibull_fit(times, censored=None, conf=0.95,
     return out
 
 
-def _weibull_plot_r2(t, c, beta, eta):
+def _weibull_plot_r2(t, beta, eta):
     """Weibull 概率图上的 R²（中位秩 Bernard 近似）。
 
     注意：R² 高**不代表 Weibull 合适**（小样本时会虚高），只作为"明显不吻合"的
@@ -572,8 +572,10 @@ def availability(mtbf, mttr_val):
         return {"availability": None, "reason": "输入非数值"}
     if m1 <= 0 or m2 < 0:
         return {"availability": None, "reason": "MTBF 须 >0，MTTR 须 ≥0"}
-    return {"availability": m1 / (m1 + m2), "mtbf": m1, "mttr": m2,
-            "downtime_pct": 100.0 * m2 / (m1 + m2)}
+    # downtime_pct 已移除：它恒等于 100×(1−availability)，是同一件事的第二种写法，
+    # 而全库没有任何消费者读它。留着一个"无人读且与主指标完全互导"的字段，
+    # 只会让后来者纠结"该信哪个"，是负资产。需要它的人按 100×(1−A) 换算即可。
+    return {"availability": m1 / (m1 + m2), "mtbf": m1, "mttr": m2}
 
 
 def rbd_reliability(kind, reliabilities):

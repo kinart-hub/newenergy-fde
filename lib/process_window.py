@@ -248,7 +248,7 @@ def joint_two(pa, pb, rho):
     return joint_two_bounds((-za, za), (-zb, zb), rho)
 
 
-def joint_conformance(params, corr=None, n_mc=60000, seed=20261030, alpha=0.05):
+def joint_conformance(params, corr=None, n_mc=60000, seed=20261030):
     """多参数联合合格率。
 
     params: [{"name": str, "values": [...], "lsl": x|None, "usl": y|None}, ...]

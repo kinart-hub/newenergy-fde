@@ -162,6 +162,19 @@ def control_chart(values, center, lcl, ucl, title="控制图", ylabel="",
     # 轴标签
     s.append('<text x="%d" y="%d" font-size="10" fill="%s" text-anchor="middle">%s</text>'
              % (ml + pw // 2, H - 12, C_GRAY, _esc(ylabel or "样本序号")))
+    # X 轴刻度标签：判异点必须能对应到**具体哪个批/哪个时间点**，
+    # 否则图上只说"第 37 个点越限"，现场还得回头去数行号。
+    # labels 原先收了完全不用，控制图永远没有横轴刻度。
+    if labels:
+        n_lab = len(labels)
+        # 点密时全画会糊成一片：按可用宽度留出至少 46px 一个标签
+        step_l = max(1, int(n_lab * 46 // max(1, pw)) or 1)
+        for i in range(0, n_lab, step_l):
+            lab = labels[i]
+            if lab is None:
+                continue
+            s.append('<text x="%.1f" y="%d" font-size="9" fill="%s" text-anchor="middle">%s</text>'
+                     % (X(i), H - 26, C_GRAY, _esc(str(lab)[:12])))
     s.append('</svg>')
     return "".join(s)
 
@@ -527,6 +540,13 @@ def scatter(xs, ys, xlabel="", ylabel="", title="相关性散点图", width=640,
                  % (ml + pw - 260, mt + 12, "#334155", r, p or 0, (r * r), n))
     s.append('<text x="%d" y="%d" font-size="10" fill="%s" text-anchor="middle">%s</text>'
              % (ml + pw // 2, H - 10, C_GRAY, _esc(xlabel)))
+    # Y 轴名：散点图原先只标 xlabel，纵向那个量叫什么全靠读者猜——
+    # "温度 vs 不良率"和"湿度 vs 不良率"两张图会画得一模一样。
+    # ylabel 收了不用，等于让看图的人自己回去查列名。
+    if ylabel:
+        s.append('<text x="16" y="%d" font-size="10" fill="%s" text-anchor="middle" '
+                 'transform="rotate(-90 16 %d)">%s</text>'
+                 % (mt + ph // 2, C_GRAY, mt + ph // 2, _esc(ylabel)))
     s.append('</svg>')
     return "".join(s)
 
