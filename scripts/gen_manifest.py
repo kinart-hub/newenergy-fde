@@ -48,6 +48,10 @@ OPTIONAL_RUNTIME = [
     "knowledge/inbox.jsonl",
     "knowledge/backups",
     "knowledge/index.json.lock",
+    # 工作区卫生基线是**开发机**的状态快照（本机工作区里有哪些待清的临时目录）。
+    # 接收方的机器上这些路径根本不存在，随包发过去只会让首次运行报一堆
+    # 与自己无关的"已清掉"。它是治理工具的一部分，与 workspace_hygiene.py 同进退。
+    "knowledge/workspace_hygiene_baseline.json",
 ]
 
 # 仓库侧治理工具：必须在仓库里（verify/CI/打包前置闸门都要跑它），
@@ -58,7 +62,13 @@ OPTIONAL_RUNTIME = [
 # 而 manifest.deployment.required 仍把它算作「部署必需」，
 # 于是清单声称 81 项、实际包内 80 项，按清单核验的人只会得到一个假缺件。
 # 两个口径必须机器可对齐：repository_files = 仓库应齐全；deployment.required = 部署最小集。
-REPO_ONLY_TOOLS = ["scripts/prepublish_audit.py"]
+REPO_ONLY_TOOLS = [
+    "scripts/prepublish_audit.py",
+    # 工作区卫生检查：扫的是**工作区根**（skill 的父目录）的临时目录与堆积产物，
+    # 那是开发者本机的布局。接收方只有 skill 目录本身，没有"工作区"这个概念，
+    # 随包外发只会让它在别人的机器上报一堆与自己无关的路径。
+    "scripts/workspace_hygiene.py",
+]
 
 # 示例与社区物料：不影响离线可用性
 EXTRA_DIRS = ["examples", "promotion", "assets", "docs", ".github"]

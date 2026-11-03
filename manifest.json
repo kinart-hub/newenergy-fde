@@ -1,7 +1,7 @@
 {
   "name": "newenergy-fde",
   "display_name": "新能源产线工艺数据分析师（FDE）",
-  "version": "2.19.11",
+  "version": "2.19.12",
   "description": "面向锂电池与光伏工艺工程师的产线数据分析技能包。上传涂布、卷绕、化成、硅片、EL 缺陷、组件 IV 等检测设备导出的 CSV/Excel，自动完成工序判定、数据清洗、SPC 判异与过程能力、参数相关性、不良 Pareto、根因定位与 5Why、DOE 参数寻优，输出标准化诊断报告与 8D 初稿。内置检测设备适配层：识别导出来自哪台仪器，自动归一竖表/多级表头/单位行/统计尾行，换算 mm↔μm、mA↔A、Ω↔mΩ、%↔ppm 等单位，并处理「同名异物」（先确定设备，再确定参数），未登记的仪器降级处理不失败。支持跨工序追溯：同时提供上下游工序数据时，按批次/时间对齐并判定问题归属（本工序主导 / 上游不合格流入 / 上游合格但已到边缘 / 混合作用），给出横向排查清单、永久措施候选与预防性参数窗口建议；缺企业规格时如实标注不定性，不用行业典型值冒充合格线。字段对不上标准参数时自动仲裁并降级不中断（重名列/多列同参/单位冲突/未识别列各有处置，认不出来的列退出工艺判定但不拦报告）；多企业部署下知识库分基线层（共享只读）与租户层（私有可写），读取合并、写入隔离、原子写加跨进程锁，任何一家的改动都影响不到别家与基线。支持知识库持续演进：分析过程自动产出知识候选，现场经 PDCA/PFMEA 验证的改善措施与新设备档案可人工选择审核后沉淀入库，后续同类分析自动复用（附版本、变更记录与回滚）。",
   "author": "WorkBuddy / 工艺工程",
   "license": "Elastic-2.0",
@@ -210,6 +210,7 @@
     "knowledge/module_island_baseline.json",
     "knowledge/process_specs.json",
     "knowledge/product_profiles.json",
+    "knowledge/workspace_hygiene_baseline.json",
     "knowledge/光伏工序知识库.md",
     "knowledge/分析方法与判读指南.md",
     "knowledge/材料测试工序知识库.md",
@@ -289,7 +290,8 @@
     "scripts/static_scan.py",
     "scripts/sync_install.py",
     "scripts/upgrade_process_chain.py",
-    "scripts/verify_rev_fixes.py"
+    "scripts/verify_rev_fixes.py",
+    "scripts/workspace_hygiene.py"
   ],
   "license_url": "https://www.elastic.co/licensing/elastic-license",
   "license_note": "源码可得（source-available），非 OSI 开源。允许免费自用与内部商业使用、允许修改与内部分发；禁止对外提供托管/管理服务。本仓库不含任何许可密钥或授权校验代码，故 LICENSE 已删除官方文本中的「许可密钥功能」条款（见 LICENSE 末尾 Modification notice）。",
@@ -316,6 +318,7 @@
       "knowledge/module_island_baseline.json",
       "knowledge/process_specs.json",
       "knowledge/product_profiles.json",
+      "knowledge/workspace_hygiene_baseline.json",
       "knowledge/光伏工序知识库.md",
       "knowledge/分析方法与判读指南.md",
       "knowledge/材料测试工序知识库.md",
@@ -397,13 +400,15 @@
       "scripts/verify_rev_fixes.py"
     ],
     "not_deployed": [
-      "scripts/prepublish_audit.py"
+      "scripts/prepublish_audit.py",
+      "scripts/workspace_hygiene.py"
     ],
     "not_deployed_note": "仓库侧治理工具：verify/CI 与打包前置闸门需要它，但源码内含一整套『不许出现的东西』的正则字面量，随包外发会污染接收方自己的隐私扫描。故 required（部署最小集）不含它们；打包侧须按 required 核对包内齐全性，且不得把 not_deployed 打进包。",
     "optional": [
       "knowledge/inbox.jsonl",
       "knowledge/backups",
-      "knowledge/index.json.lock"
+      "knowledge/index.json.lock",
+      "knowledge/workspace_hygiene_baseline.json"
     ],
     "extra": [
       ".github/",

@@ -1,0 +1,4 @@
+{
+  "known": [],
+  "note": "工作区卫生基线。只许减不许增——清掉一条就 --update-baseline 收紧一次。签名 = kind|path，不含 size/mtime（它们会天天变，进签名等于天天报警）。"
+}

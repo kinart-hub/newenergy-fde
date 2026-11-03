@@ -1215,6 +1215,94 @@ def scan_alias_conflict():
     return out
 
 
+def scan_duplicate_block():
+    """跨文件复制粘贴的代码块（>=8 行）。
+
+    为什么需要：项目里已经出现过"两处各写一份清单"（S7 抓的是常量），
+    但函数级复制粘贴没有判据——`lib/defectchar.py` / `lib/recipe.py` /
+    `lib/toolmatch.py` 三个模块各自带一份 `_fnum()` 和相同的降级导入模板，
+    改一处忘两处是必然的，而三份都还在正常跑，没有任何报错。
+
+    判据（形态级）：
+      - 只在**函数体**内取行（AST 的 lineno..end_lineno），
+        跳过 docstring / import / 注释 / 空行；
+      - 归一化 = 去首尾空白后逐行拼接，8 行滑窗；
+      - 同一个块出现在 **2 个以上不同文件** 才报（同文件内重复噪声大，
+        且多半是有意的分支并列）。
+
+    首版（2026-10-27 的临时脚本）没有跳过 docstring 与 import，
+    于是 19 组"重复"里大半是三份文件共有的模块头注释和 `import math`——
+    **告警一泛滥就没人看了**，那等于没有这条判据。
+    """
+    out = []
+    WIN = 8
+    buckets = {}     # 归一化块 -> set(rel)
+
+    for rel in _py_files():
+        text = _read(rel)
+        try:
+            tree = ast.parse(text)
+        except SyntaxError as _e12:
+            # 解析不了 → 这份文件的重复块检查压根没做。必须说出来，
+            # 否则"0 处重复"会被读成"查过了、很干净"。
+            sys.stderr.write("[S12] 跳过无法解析的文件 %s：%r\n" % (rel, _e12))
+            continue
+        lines = text.split("\n")
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            body = list(node.body)
+            # 跳过 docstring（它是 Expr(Constant str)）
+            if body and isinstance(body[0], ast.Expr) and \
+                    isinstance(getattr(body[0], "value", None), ast.Constant) and \
+                    isinstance(body[0].value.value, str):
+                body = body[1:]
+            if not body:
+                continue
+            lo = min(getattr(b, "lineno", node.lineno) for b in body)
+            hi = max(getattr(b, "end_lineno", getattr(b, "lineno", lo)) or lo
+                     for b in body)
+            norm = []
+            for i in range(lo - 1, min(hi, len(lines))):
+                s = lines[i].strip()
+                if not s or s.startswith("#"):
+                    continue
+                if re.match(r"^(from\s+\S+\s+)?import\s", s):
+                    continue
+                norm.append(s)
+            if len(norm) < WIN:
+                continue
+            for i in range(len(norm) - WIN + 1):
+                key = "\x00".join(norm[i:i + WIN])
+                buckets.setdefault(key, set()).add(rel)
+
+    # 按**文件对**聚合，而不是按每个滑窗位置各报一条。
+    # 首版没聚合：process_window.py 与 reliability.py 之间同一段重复被
+    # 5 个不同起点各报了一次，10 条里 5 条说的是同一件事——
+    # 同一事实报 N 次，读者会以为有 N 个问题，报告随即失效。
+    pairs = {}       # (file_a, file_b) -> {head, count}
+    for key, files in buckets.items():
+        if len(files) < 2:
+            continue
+        head = key.split("\x00")[0]
+        fl = sorted(files)
+        for i in range(len(fl)):
+            for j in range(i + 1, len(fl)):
+                ent = pairs.setdefault((fl[i], fl[j]),
+                                       {"head": head, "count": 0})
+                ent["count"] += 1
+    for (fa, fb), ent in sorted(pairs.items()):
+        out.append(Finding(
+            "S12", "MED", fa, 0,
+            "%s 与 %s 之间有 %d 处 ≥%d 行的重复代码，首个重复段首行「%s」"
+            % (fa, fb, ent["count"], WIN, ent["head"][:46]),
+            "复制粘贴出去的实现不会同步演进：改一处忘一处是必然，"
+            "而每一份都还在正常跑，没有任何报错来提醒你漏改了。",
+            "抽成单一来源（公共函数/常量模块），其余改为调用；"
+            "确实需要独立的，用 # scan:keep 注明为什么不能共用"))
+    return out
+
+
 CHECKS = [
     ("S1", "静默吞异常", scan_silent_except),
     ("S2", "定义未调用（死代码）", scan_dead_code),
@@ -1227,6 +1315,7 @@ CHECKS = [
     ("S9", "编码完整性（乱码）", scan_encoding),
     ("S10", "主流程接线（模块是否真的被 analyze 走到）", scan_wiring),
     ("S11", "导入别名/分支不一致", scan_alias_conflict),
+    ("S12", "跨文件复制粘贴代码块", scan_duplicate_block),
 ]
 
 

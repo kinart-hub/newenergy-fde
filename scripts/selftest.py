@@ -6210,6 +6210,49 @@ def test_shift_scan_status():
           str((p1 or {}).get("shift_scan"))[:60])
 
 
+def test_workspace_hygiene_gate():
+    """工作区卫生判据：清理不能靠人肉 ls，必须有机读判据且接进门禁。
+
+    这一条本身是对"元问题"的检查——用户已多次要求清理垃圾，仍然反复漏，
+    根因是这件事从来没有机器判据。所以不仅要检查判据存在，还要检查
+    **它接了门禁**（脚本写在仓库里但 verify 不跑，等于没有）。
+    """
+    print("\n[工作区卫生：判据与门禁接线]")
+    import subprocess
+    hyg = os.path.join(ROOT, "scripts", "workspace_hygiene.py")
+    check("卫生检查脚本存在", os.path.exists(hyg), hyg)
+
+    # 判据自检（会翻红才算有效——内部含"删掉样本后不再报"的反向验证）
+    r = subprocess.run([sys.executable, hyg, "--selftest"],
+                       capture_output=True, text=True, encoding="utf-8", errors="replace")
+    check("卫生判据自检通过（含反向验证）", r.returncode == 0,
+          (r.stdout or "").strip().split("\n")[-1][:60])
+    check("自检断言数 ≥10（覆盖缓存/临时/脚本/密钥保留/堆积/棘轮/签名）",
+          "通过 " in (r.stdout or "") and
+          int(re.search(r"通过 (\d+) /", r.stdout).group(1)) >= 10,
+          re.search(r"通过 \d+ / 失败 \d+", r.stdout or "").group(0)
+          if re.search(r"通过 \d+ / 失败 \d+", r.stdout or "") else "未读到")
+
+    # 门禁接线：verify 必须真的跑它，否则"写了不跑"等于没有
+    run_txt = open(os.path.join(ROOT, "scripts", "fde_run.py"), encoding="utf-8").read()
+    check("verify 已接入第 11 步（工作区卫生棘轮）",
+          "workspace_hygiene.py" in run_txt and "--gate" in run_txt, "")
+    check("卫生检查被声明为不随包外发（它依赖工作区布局，接收方没有这个概念）",
+          "workspace_hygiene.py" in
+          open(os.path.join(ROOT, "scripts", "gen_manifest.py"), encoding="utf-8").read(), "")
+
+    # 基线文件必须存在且可解析（允许为空＝已全清）
+    bp = os.path.join(ROOT, "knowledge", "workspace_hygiene_baseline.json")
+    ok = False
+    try:
+        d = json.load(open(bp, encoding="utf-8"))
+        ok = isinstance(d.get("known"), list)
+    except Exception as _e:
+        ok = False
+        detail = repr(_e)
+    check("卫生基线存在且可解析（允许为空）", ok, "")
+
+
 if __name__ == "__main__":
     print("newenergy-fde 自检开始")
     test_table()
@@ -6266,6 +6309,7 @@ if __name__ == "__main__":
     test_full_rules_precondition()
     test_rootcause_interface_wiring()
     test_shift_scan_status()
+    test_workspace_hygiene_gate()
     test_quality_manager_guide()
     test_reliability_weibull_alt()
     test_fmea_rpn_and_gate()

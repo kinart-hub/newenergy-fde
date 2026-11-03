@@ -674,6 +674,9 @@ AUDIT_FILES = [
     os.path.join("scripts", "prepublish_audit.py"),
     os.path.join("scripts", "package.py"),
     os.path.join("scripts", "fde_run.py"),
+    # 规则 #89 的变异目标就是它本身；不进 AUDIT_FILES 时副本里读不到，
+    # 会报"副本下基线就没过"——那不是判据失败，是副本不全（已知坑）。
+    os.path.join("scripts", "workspace_hygiene.py"),
     os.path.join("lib", "pipeline.py"),
     os.path.join("lib", "exclude.py"),
     os.path.join("lib", "context.py"),
@@ -3417,6 +3420,63 @@ def rule_factor_self_state_counts():
     return _r(True, "", {"ok": True})
 
 
+def rule_workspace_hygiene_never_deletes():
+    """工作区卫生判据必须存在、必须接门禁、且**自己绝不动手删文件**。
+
+    这条规则回答的是一个元问题：用户已多次要求"及时清理缓存和垃圾"，
+    却反复漏掉。根因不是记性问题，是这件事从来没有机器判据——
+    没有判据的事就是没有人负责的事。所以判据本身要被钉住。
+
+    三个不变量（都是"抹掉它就应该翻红"的形态）：
+      1. 判据脚本存在，且带棘轮（--gate / --update-baseline 两个入口）；
+      2. 它在 verify 的步骤里被真的执行（写在仓库里但不跑 = 没有）；
+      3. **它的生产代码路径里不许出现删除调用**（os.remove / unlink / rmtree）。
+         扫描器自动清理会把自己变成风险源——删错一次，这个工具就再没人敢用。
+         自检函数里清理临时目录是允许的（那是它自己造的沙箱），
+         所以判据只查 `_selftest` 之外的区间。
+    """
+    # 必须走 _read（它读的是 ROOT，而规则自检会把 ROOT 重定向到变异副本）。
+    # 首版用 os.path.join(ROOT, ...) + open()，看着等价，实则绕过了重定向：
+    # 三个变异注进副本、判据却还在读真实文件 → 一个都没抓到，报"未抓到变异"。
+    # 判据读哪个文件，就必须和变异打的是同一个文件。
+    t = _read(os.path.join("scripts", "workspace_hygiene.py"))
+    if not t:
+        return _r(False, "scripts/workspace_hygiene.py 不存在——"
+                         "工作区垃圾又回到靠人肉 ls 加记性的状态")
+    # ① 入口必须出现在 add_argument 调用里。
+    #   首版写 `if "--gate" not in t`：文件的 docstring 里就写着用法
+    #   `python scripts/workspace_hygiene.py --gate`，于是把 argparse 摘掉之后
+    #   判据照样过——**判据停在字样层，命中的是文档不是代码**。
+    for flag in ("--gate", "--update-baseline"):
+        if not re.search(r'add_argument\(\s*"%s"' % re.escape(flag), t):
+            return _r(False, "缺 %s 的 add_argument 入口：没有棘轮就无法区分"
+                             "「存量」与「新增」，要么一次报一堆然后被忽略，"
+                             "要么永远看不见新垃圾" % flag)
+    run = _read(os.path.join("scripts", "fde_run.py")) or ""
+    if "workspace_hygiene.py" not in run:
+        return _r(False, "verify 没有跑它——不进 verify 的检查等于没有检查")
+    # ② gate 分支必须真的返回非零。只查"有 --gate 参数"不够：
+    #   `if False:` 一开关掉，参数还在、行为没了，那才是最难发现的那种退化。
+    _gate_blk = t[t.find('if args.gate and ev["new"]:'):]
+    if 'if args.gate and ev["new"]:' not in t:
+        return _r(False, "gate 分支不存在或判据被短路（门禁形同虚设）")
+    if "return 1" not in _gate_blk[:400]:
+        return _r(False, "gate 分支里没有非零退出码——门禁永远返回成功，等于没有门禁")
+    # ③ 只查生产路径：_selftest 里清理自己的临时目录是合法的。
+    #   查 `.rmtree(` / `.remove(` / `.unlink(` 而不带模块名：
+    #   首版写成 `shutil\.rmtree`，`import shutil as _sh; _sh.rmtree(...)`
+    #   一行就绕过去了——别名导入是这类判据的常见漏网方式。
+    cut = t.find("def _selftest(")
+    prod = t[:cut] if cut > 0 else t
+    for pat, name in ((r"\.rmtree\s*\(", ".rmtree("),
+                      (r"(?:\bos|\b_os|\bpath)\.remove\s*\(", "os/path.remove("),
+                      (r"\.unlink\s*\(", ".unlink(")):
+        if re.search(pat, prod):
+            return _r(False, "生产路径里出现了 %s —— 扫描器自己删文件是把自己变成风险源。"
+                             "清理动作必须由人执行，工具只负责发现问题" % name)
+    return _r(True, "", {"ok": True})
+
+
 def rule_spec_entry_any_shape():
     """规格条目必须按"可能是单版本 dict、也可能是多版本 list"来消费。
 
@@ -4982,6 +5042,28 @@ AUDIT_RULES = [
                   _sub('ev = (ev or 0.0) * 0.85',
                        'ev = (ev or 0.0) * 1.05'),
                   PIPELINE_FILE)]),
+    Rule("工作区卫生判据必须存在、接门禁、且自己绝不动手删文件",
+         rule_workspace_hygiene_never_deletes,
+         "清理垃圾这件事反复没做到，根因是从来没有机器判据。"
+         "本规则钉住三个不变量：判据存在且带棘轮、verify 真的跑它、"
+         "生产路径里不许出现删除调用（扫描器自动清理＝把自己变成风险源）。",
+         os.path.join("scripts", "workspace_hygiene.py"),
+         [          _mutant("棘轮入口被摘掉（修复退化：无法区分存量与新增）",
+                  _sub('ap.add_argument("--gate", action="store_true"',
+                       'ap.add_argument("--_gone_gate", action="store_true"'),
+                  os.path.join("scripts", "workspace_hygiene.py")),
+          # 变异锚点必须跟随被测源码的当前形态：删掉未使用形参 skill_root 之后
+          # 旧锚点匹配不上，变异做不出来 → 自检记 SKIP。SKIP 比 FAIL 危险得多：
+          # 它让"这条规则验过了"这句话变成假的。（踩过一次，记在这里。）
+          _mutant("扫描器开始自己删文件（修复退化：工具变成风险源）",
+                  _sub('def scan(workspace=DEFAULT_WORKSPACE):',
+                       'def scan(workspace=DEFAULT_WORKSPACE):\n'
+                       '    import shutil as _sh; _sh.rmtree("/tmp/nonexistent", ignore_errors=True)'),
+                  os.path.join("scripts", "workspace_hygiene.py")),
+          _mutant("退出码恒 0（修复退化：门禁形同虚设）",
+                  _sub('    if args.gate and ev["new"]:',
+                       '    if False:'),
+                  os.path.join("scripts", "workspace_hygiene.py"))]),
 ]
 
 
@@ -5791,6 +5873,16 @@ def flow_verify(args):
         #     同样用棘轮：存量不阻断，但新增孤岛一律拦。
         run_cmd("10. 模块孤岛（棘轮）",
                 [PY, "scripts/module_graph.py", "--gate"], timeout=args.timeout),
+        # 11. 工作区卫生（棘轮）：前 10 步查的全是**源码内部**的正确性，
+        #     没有一步看"工作区本身脏不脏"。于是"清理缓存和垃圾"这件事
+        #     一直靠人肉 ls 加记性——用户已多次要求，仍然反复漏
+        #     （根目录的两个临时目录从 10-12 躺到 11-03 没人碰）。
+        #     没有机器判据的事，就是没有人负责的事。
+        #     判据只认客观可判的（字节码缓存/临时后缀/产物堆积/根上散落脚本），
+        #     密钥与私密目录走"必须保留"通道并写明理由。
+        #     工具本身**永不删文件**：扫描器自动清理＝把自己变成风险源。
+        run_cmd("11. 工作区卫生（棘轮）",
+                [PY, "scripts/workspace_hygiene.py", "--gate"], timeout=args.timeout),
     ]
     return finish("质量闸门全套", steps, args.report, started=started)
 
