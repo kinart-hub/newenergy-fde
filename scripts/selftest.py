@@ -6253,6 +6253,67 @@ def test_workspace_hygiene_gate():
     check("卫生基线存在且可解析（允许为空）", ok, "")
 
 
+def test_rootcause_chain_consistency():
+    """根因四环节一致性：分析→推导→取值→验证 必须是同一条结论。
+
+    这一条测的不是"有没有断"（前 11 步门禁已覆盖），而是**"断着但还连着"**：
+    字段有人读、结论有产出，但读出来的东西与推导出来的不是一回事。
+    用户的原话就是「各个环节的根因逻辑分析、推导、取值、验证还是会脱节？」
+    """
+    print("")
+    print("[根因四环节一致性]")
+    import subprocess
+    audit = os.path.join(ROOT, "scripts", "rootcause_chain_audit.py")
+    check("链路审计脚本存在", os.path.exists(audit), audit)
+
+    r = subprocess.run([sys.executable, audit, "--selftest"],
+                       capture_output=True, text=True, encoding="utf-8", errors="replace")
+    _out = (r.stdout or "")
+    check("判据自检通过（含反向验证：好数据不误报）", r.returncode == 0,
+          _out.strip().split("\n")[-1][:50])
+    _lines = [ln for ln in _out.split("\n") if "[OK" in ln or "[FAIL" in ln]
+    check("判据自检 ≥10 条（R1~R5 各含正反两向）", len(_lines) >= 10, "%d 条" % len(_lines))
+
+    # 真实数据必须零违规（这条会在改坏口径时翻红）
+    r2 = subprocess.run([sys.executable, audit, "--gate"],
+                        capture_output=True, text=True, encoding="utf-8", errors="replace")
+    _out2 = (r2.stdout or "")
+    check("真实示例四环节一致（0 违规）", r2.returncode == 0,
+          [ln.strip()[:50] for ln in _out2.split("\n") if "合计" in ln][:1])
+
+    # 无样本时必须退出码 2，不许"0 个示例 → 0 违规 → 通过"
+    import tempfile, shutil as _sh
+    _t = tempfile.mkdtemp(prefix="nosample-")
+    try:
+        os.makedirs(os.path.join(_t, "scripts"))
+        _sh.copy2(audit, os.path.join(_t, "scripts", "rca.py"))
+        r3 = subprocess.run([sys.executable, os.path.join(_t, "scripts", "rca.py"), "--gate"],
+                            capture_output=True, text=True, encoding="utf-8", errors="replace")
+        check("无示例时退出码 2（不许把『没验』报成『验过了』）", r3.returncode == 2,
+              "退出码 %d" % r3.returncode)
+    finally:
+        _sh.rmtree(_t, ignore_errors=True)
+
+    # 置信度封顶：根因全是假设时不得报"中高"
+    from lib import rootcause as _RC
+    _hyp = {"candidates": [{"conclusion_status": "机理支持"}]}
+    _c = _RC.confidence_level([], 9, root=_hyp)
+    check("置信度被根因等级封顶（全假设不得报中高）",
+          _c["score"] <= 0.6, "%s %.2f" % (_c["level"], _c["score"]))
+    _ok = {"candidates": [{"conclusion_status": "数据支持"}]}
+    _c2 = _RC.confidence_level([], 9, root=_ok)
+    check("有数据支持时不被无故压低", _c2["score"] >= 0.75,
+          "%s %.2f" % (_c2["level"], _c2["score"]))
+    _low = _RC.confidence_level([{"level": "P0"}, {"level": "P0"}], 9, root=_ok)
+    check("封顶不抬高本就低的置信度", _low["score"] <= 0.3,
+          "%s %.2f" % (_low["level"], _low["score"]))
+
+    # 门禁接线
+    run_txt = open(os.path.join(ROOT, "scripts", "fde_run.py"), encoding="utf-8").read()
+    check("verify 已接入第 12 步（根因链路一致性）",
+          "rootcause_chain_audit.py" in run_txt, "")
+
+
 if __name__ == "__main__":
     print("newenergy-fde 自检开始")
     test_table()
@@ -6310,6 +6371,7 @@ if __name__ == "__main__":
     test_rootcause_interface_wiring()
     test_shift_scan_status()
     test_workspace_hygiene_gate()
+    test_rootcause_chain_consistency()
     test_quality_manager_guide()
     test_reliability_weibull_alt()
     test_fmea_rpn_and_gate()

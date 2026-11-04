@@ -175,7 +175,7 @@ if EV is not None and EV.__name__ != "lib.events":
 KB = PP.load_knowledge()
 _fmt = RPT._fmt
 
-ANALYZER_VERSION = "2.19.12"
+ANALYZER_VERSION = "2.20.0"
 
 
 # 空数据排查清单。
@@ -2127,7 +2127,13 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
             # 混杂的热点一律排在后面：它不是答案，只是需要进一步实验的信号
             hotspots.sort(key=lambda x: 1 if x.get("confounded") else 0)
             result["unit_hotspots"] = hotspots
-            if root and hotspots:
+            # 降级状态下不得再往 candidates 里加东西：
+            # root 已声明"本次未给出根因排序，候选均为未经验证的线索"，
+            # 再 append 一条"数据支持"的单元级结论，就变成
+            # 「说没给排序，榜上却有一条」——报告按 honest_degraded 分支渲染，
+            # 这条结论直接被藏起来（数据造了、没人看，还自相矛盾）。
+            # 单元级/位置结论有自己的独立章节（含校正后 p），信息不会丢。
+            if root and hotspots and not root.get("honest_degraded"):
                 cands = root.setdefault("candidates", [])
                 have = set(str(c.get("param_name") or "") for c in cands)
                 for hs in hotspots[:3]:
@@ -2141,6 +2147,19 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
                         "param_name": nm, "unit": "",
                         "role": "group", "source": "单元级异常检验",
                         "score": round(min(1.0, w["effect"] / 2.0), 4),
+                        # 口径：effect÷2（效应量的粗归一），**不是**四权重加权。
+                        # 与知识库候选放在同一张表里，必须让读者看得出这一行
+                        # 的分数不是按表头那个公式算的。
+                        "score_basis": "unit_effect",
+                        # 分级用校正后的 p：Bonferroni 过不了就不算数据支撑
+                        "conclusion_status": (
+                            "数据支持"
+                            if (w.get("p_adj") is not None and w["p_adj"] <= 0.05)
+                            else "现场待确认"),
+                        "supported_by_data": bool(
+                            w.get("p_adj") is not None and w["p_adj"] <= 0.05),
+                        "is_hypothesis": not (w.get("p_adj") is not None
+                                              and w["p_adj"] <= 0.05),
                         "evidence_score": round(w["effect"], 3),
                         "prior_score": 0.0, "temporal_score": 0.0,
                         "data_status": ST.SUCCESS,
@@ -2170,6 +2189,7 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
         for _cl in (result.get("spatial_clusters") or [])[:1]:
             if not _cl.get("hot_level"):
                 continue
+            # 同上：降级状态下不往 candidates 里塞（否则"未给排序"与"有条目"并存）
             _ratio = float(_cl["worst"].get("ratio") or 0)
             _ev_score = round(min(0.95, _ratio / 5.0), 3)
             root = root or {"defect": defect_name, "process": chosen_proc,
@@ -2180,7 +2200,21 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
                 _cands.insert(0, {
                     "param_key": None, "param": _cl["factor"], "param_name": _nm,
                     "unit": "", "role": "position", "source": "位置聚集检验",
-                    "score": _ev_score, "evidence_score": _ev_score,
+                    "score": _ev_score,
+                    # 口径：比率÷5，同样不是四权重加权
+                    "score_basis": "spatial_ratio",
+                    # 位置聚集检验已有 BH 校正后的 p，用它定级而不是用比率大小
+                    "conclusion_status": (
+                        "数据支持"
+                        if (_cl["worst"].get("p_adj") is not None
+                            and _cl["worst"]["p_adj"] <= 0.05)
+                        else "现场待确认"),
+                    "supported_by_data": bool(
+                        _cl["worst"].get("p_adj") is not None
+                        and _cl["worst"]["p_adj"] <= 0.05),
+                    "is_hypothesis": not (_cl["worst"].get("p_adj") is not None
+                                          and _cl["worst"]["p_adj"] <= 0.05),
+                    "evidence_score": _ev_score,
                     "prior_score": 0.0, "temporal_score": 0.0,
                     "data_status": ST.SUCCESS,
                     "detail": {"status": ST.SUCCESS, "column": _cl["factor"],
@@ -2246,7 +2280,10 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
         result["msa"] = _msa
         result["rootcause"] = root
         gaps = RC.assess_gaps(work, defect_name, y_col, groups)
-        conf = RC.confidence_level(gaps, sum(1 for a in assoc if a.get("significant")))
+        # 必须把 root 传进去：置信度是**结论层面**的属性，
+        # 不能只按"数据看起来够不够"打分（否则会出现"置信中高"配全是假设的根因榜）。
+        conf = RC.confidence_level(gaps, sum(1 for a in assoc if a.get("significant")),
+                                   root=root)
         result["gaps"] = gaps
         result["confidence"] = conf
 
@@ -3012,11 +3049,25 @@ def data_driven_rootcause(assoc, spc_res, col_map, process_key, y_col, recog=Non
             else "数据驱动排序，未经缺陷机理库加权")
         if _spc_note:
             _dnote = "%s；%s" % (_dnote, _spc_note)
+        # 结论分级不能因为"走了兜底路径"就不给：这条路给出的同样是一份候选榜，
+        # 报告里与知识库路径共用同一张表。没有分级，读者分不清哪条有数据支撑、
+        # 哪条只是"同步变化"。分级口径与 rank_root_causes 保持一致：
+        # 统计上显著（|r|≥0.15 且 p≤0.05）才算"数据支持"，否则只是"现场待确认"。
+        _r = a.get("r")
+        _p = a.get("p")
+        _data_backed = (_r is not None and abs(_r) >= 0.15
+                        and (_p is None or _p <= 0.05))
         cands.append({
             "param_key": key, "param": nm, "param_name": spec.get("name", nm),
             "unit": spec.get("unit", ""),
             "role": spec.get("role") or "",
             "score": round(ev * (1 - i * 0.08), 4),
+            # 这条路径的打分是"证据分 × 位置衰减"，不是四权重加权——
+            # 必须如实声明，否则表头那句话对它就是假的。
+            "score_basis": "evidence_only",
+            "conclusion_status": "数据支持" if _data_backed else "现场待确认",
+            "supported_by_data": bool(_data_backed),
+            "is_hypothesis": not _data_backed,
             "evidence_score": round(ev, 3),
             "prior_score": 0.0, "temporal_score": 0.0,
             "data_status": ST.SUCCESS,
@@ -3884,11 +3935,38 @@ def build_report(res, work, spc_res, corr, assoc, pare, root, gaps, conf,
                                 "用 --defect 指定缺陷类型后可获得机理加权结果。", "warn")
                 cap = "候选参数排序（按与目标列的关联强度，未经缺陷机理库加权）"
             else:
-                cap = ("候选根因排序（0.40×数据证据 + 0.35×知识先验 + 0.15×时序吻合 + 0.10×可验证性）")
-            rep.table(s8, ["候选参数", "综合得分", "数据证据", "知识先验", "时序吻合", "数据状态"],
-                      [[c["param_name"], _fmt(c["score"], 3), _fmt(c["evidence_score"], 3),
-                        _fmt(c["prior_score"], 3), _fmt(c["temporal_score"], 3),
+                # 表头不得声称统一公式：本榜可能混有"单元级效应量""位置聚集比"两类候选，
+                # 它们的分数不是按加权公式算的。写一句通用公式在上面，
+                # 等于替所有行撒同一个谎——读者会拿 0.31（效应量÷2）
+                # 和 0.84（四项加权）直接比大小。
+                _bases = set(c.get("score_basis") for c in root["candidates"])
+                if len(_bases) <= 1:
+                    cap = ("候选根因排序（0.40×数据证据 + 0.35×知识先验 + "
+                           "0.15×时序吻合 + 0.10×可验证性）")
+                else:
+                    cap = ("候选根因排序（**评分口径见列**：weighted=四项加权合成，"
+                           "unit_effect=单元级效应量归一，spatial_ratio=位置聚集比率归一，"
+                           "evidence_only=证据分×位置衰减。不同口径的分数不在同一尺度上，"
+                           "不可直接横向比较，只可参考结论等级）")
+            # 结论等级必须进表：rootcause 内部把候选分成"数据支持/机理支持/
+            # 现场待确认/未知"四级，这份分级如果不展示，读者看到的就是
+            # 六条长得一样的候选，会把知识库猜测当数据结论去调机。
+            _basis_label = {"weighted": "加权合成", "unit_effect": "单元效应量",
+                            "spatial_ratio": "位置聚集比", "evidence_only": "证据分"}
+            rep.table(s8, ["候选参数", "综合得分", "结论等级", "评分口径",
+                           "数据证据", "数据状态"],
+                      [[c["param_name"], _fmt(c["score"], 3),
+                        c.get("conclusion_status") or "未分级",
+                        _basis_label.get(c.get("score_basis"),
+                                         c.get("score_basis") or "未声明"),
+                        _fmt(c["evidence_score"], 3),
                         c["data_status"]] for c in root["candidates"]], caption=cap)
+            # 被证据门槛降级的候选，必须在表下单独交代——分数已经乘过 0.45/0.60，
+            # 只把降级后的数字摆出来，读者看不出"这条本来是被降过的"。
+            _gated = [c for c in root["candidates"] if c.get("gate_note")]
+            if _gated:
+                rep.bullets(s8, ["降级说明：%s —— %s"
+                                 % (c["param_name"], c["gate_note"]) for c in _gated[:5]])
             if root.get("five_why"):
                 rep.table(s8, ["层级", "提问", "推断", "依据", "有数据支撑"],
                           [[w["level"], w["why"], w["because"], w["evidence"],

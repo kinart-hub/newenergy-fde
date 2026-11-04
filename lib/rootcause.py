@@ -691,6 +691,9 @@ def rank_root_causes(defect_name, table, target_col=None, top=5,
             "param_name": spec.get("name", pk),
             "unit": spec.get("unit", ""),
             "score": round(base, 4),     # 占位，post-annotation 重算为含可验证性的总分
+            # 评分口径必须显式声明：本榜还混有"单元级效应量""位置聚集比"两种候选，
+            # 三者的分数不在同一尺度上。不声明，读者就会把"来源不同"读成"证据强弱不同"。
+            "score_basis": "weighted",
             "evidence_score": round(ev, 3),
             "prior_score": round(prior, 3),
             "temporal_score": round(tscore, 3),
@@ -750,6 +753,7 @@ def rank_root_causes(defect_name, table, target_col=None, top=5,
                 "param_name": pspec.get("name", pk),
                 "unit": pspec.get("unit", ""),
                 "score": round(base, 4),     # 占位，post-annotation 重算为含可验证性的总分
+                "score_basis": "weighted",
                 "evidence_score": round(ev, 3),
                 "prior_score": round(prior, 3),
                 "temporal_score": round(tscore, 3),
@@ -1277,17 +1281,51 @@ def assess_gaps(table, defect_name=None, target_col=None, groups=None):
     return gaps
 
 
-def confidence_level(gaps, evidence_count):
-    """根据缺口与证据数给出置信度"""
+def confidence_level(gaps, evidence_count, root=None):
+    """根据缺口、统计证据数与**根因结论等级**给出置信度。
+
+    为什么必须吃 root：原实现只看两件事——P0 缺口个数、相关性显著个数。
+    这两项描述的是"数据看起来够不够"，而不是"根因结论站不站得住"。
+    实测 06 示例：相关性显著项够多 → 报"中高 0.75"，
+    而根因榜里一条『数据支持』都没有（全是知识库先验/兜底推断）。
+    读者拿到的是"整体置信中高"配一张全是假设的根因榜——
+    置信度成了替假设背书的东西。
+
+    置信度是**结论层面的**属性，只能由结论自己的证据等级封顶：
+      · 根因榜无一条『数据支持』 → 最高"中"（0.6）
+      · 根因整体降级（没给出排序）→ 最高"中低"（0.5）
+    这条封顶只在"本该更高"时起作用，不会把一个本就低的置信度抬高。
+    """
     p0 = sum(1 for g in gaps if g["level"] == "P0")
     if p0 >= 2:
         return {"level": "低", "score": 0.3,
                 "note": "关键维度缺失较多，结论以知识库先验为主，须现场验证"}
     if p0 == 1:
-        return {"level": "中低", "score": 0.5,
+        base = {"level": "中低", "score": 0.5,
                 "note": "存在 1 项关键缺失，部分结论需现场确认"}
-    if evidence_count >= 3:
-        return {"level": "中高", "score": 0.75,
+    elif evidence_count >= 3:
+        base = {"level": "中高", "score": 0.75,
                 "note": "数据维度基本齐备，有多项统计证据支撑"}
-    return {"level": "中", "score": 0.6,
-            "note": "数据维度齐备但统计证据偏少，建议补充样本后复算"}
+    else:
+        base = {"level": "中", "score": 0.6,
+                "note": "数据维度齐备但统计证据偏少，建议补充样本后复算"}
+
+    if not isinstance(root, dict):
+        return base
+    cands = root.get("candidates") or []
+    if root.get("honest_degraded") or root.get("evidence_insufficient"):
+        if base["score"] > 0.5:
+            return {"level": "中低", "score": 0.5,
+                    "note": "本次未能给出根因排序（%s），"
+                            "置信度按『没有结论』封顶，不代表数据质量差"
+                            % ((root.get("data_sufficiency") or {}).get("reason")
+                               or root.get("insufficient_reason") or "证据不足")}
+        return base
+    if cands and not any(c.get("conclusion_status") == "数据支持" for c in cands):
+        if base["score"] > 0.6:
+            return {"level": "中", "score": 0.6,
+                    "note": "数据维度齐备，但根因榜无一条拿到数据支撑"
+                            "（最高为『%s』），置信度按结论等级封顶"
+                            % next((c.get("conclusion_status") for c in cands
+                                    if c.get("conclusion_status")), "未知")}
+    return base

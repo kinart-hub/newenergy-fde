@@ -5883,6 +5883,16 @@ def flow_verify(args):
         #     工具本身**永不删文件**：扫描器自动清理＝把自己变成风险源。
         run_cmd("11. 工作区卫生（棘轮）",
                 [PY, "scripts/workspace_hygiene.py", "--gate"], timeout=args.timeout),
+        # 12. 根因链路四环节一致性：前 11 步查的是"有没有断"
+        #     （模块有没有调用、字段有没有人读、环境脏不脏），
+        #     查不出"断着但还连着"——字段有人读，但读出来的东西
+        #     与推导出来的不是一回事。
+        #     本步跑真实示例，检查同一条根因结论在
+        #     分析→推导→取值→验证 四个环节里是否自相矛盾：
+        #     R1 排序 vs 展示、R2 分级字段是否齐全、R3 分级是否进报告、
+        #     R4 多口径是否披露、R5 置信度是否高于证据等级。
+        run_cmd("12. 根因链路一致性",
+                [PY, "scripts/rootcause_chain_audit.py", "--gate"], timeout=args.timeout),
     ]
     return finish("质量闸门全套", steps, args.report, started=started)
 
