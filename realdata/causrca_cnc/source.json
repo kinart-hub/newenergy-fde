@@ -1,0 +1,14 @@
+{
+  "source_url": "https://doi.org/10.5281/zenodo.15876410",
+  "retrieved_at": "2026-11-04",
+  "publisher": "Fraunhofer IWU（Mehling / Pieper / Lüke），Zenodo",
+  "license": "Apache-2.0",
+  "caliber_note": "CNC 立式车床（工业设备）数字孪生上的**人为注入故障**实验。取 dig_twin/exp_coolant/exp_22/run_1：注入故障为 HP_Pump_Ok=false、LT_Level_Ok=false（高压泵失效 + 冷却液位低于下限）。原始格式为事件日志长表（time_s, node, value, type），本用例按节点做前向填充转成等间隔宽表（693 时间点 × 51 节点），布尔 True/False 转 1/0，常量列已丢弃。真值见 truth.json：manipulatedVars 即人为设定为故障的变量。",
+  "declared_rows": 693,
+  "declared_cols": 52,
+  "sha256": "4c15a2dcfbad7fc7b1d54104b9b212652ce2719bfe1e1913fa7ed45d13047d6d",
+  "origin_sha256": "bf4f9099c0a61d839cc7d550bbe592ca1cbd5bd4801d90b62926f131a98e5100",
+  "origin_file": "dataset_causRCA.zip (整个压缩包, 3616850 bytes)",
+  "truncated": false,
+  "notes": "**形态与工具前提不匹配，这是本用例最有价值的发现**：本仓库的分析链假设输入是'等间隔宽表 + 工艺参数列'，而 causRCA 是'设备事件日志 + 状态位'。前向填充转宽表会引入**伪重复**（一个状态在 693 个时间点被重复计入），使相关性被样本量放大。因此本用例**只用于检验'根因候选能否命中人为注入的真因'，不用于检验 p 值/显著性水平**。另：exp_22 的故障链为 泄漏→液位低→泵保护→泵停，manipulatedVars 直接设定末端两个状态，所以'真因'在设备层是泵与液位，在工程层是未观测到的泄漏——工具只能到设备层，找不到泄漏本身。"
+}

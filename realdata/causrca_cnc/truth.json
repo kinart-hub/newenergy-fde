@@ -1,0 +1,51 @@
+{
+  "title": "causRCA exp_22 — 冷却系统注入故障（CNC 立式车床数字孪生）",
+  "truth_type": "injected_fault",
+  "target_column": "HP_A_700304",
+  "derivation": {
+    "method": "实验设计直接设定故障变量（不是统计推断，也不是人工事后标注）",
+    "source": "dig_twin/exp_coolant/exp_22/exp_22_description.json",
+    "reproducible": true,
+    "note": "manipulatedVars 是实验者**直接设定为 false** 的变量。这不是'专家认为可能的原因'，而是'我们确实把这个东西弄坏了'——真值等级最高的一种。"
+  },
+  "injected_causes": [
+    {"variable": "HP_Pump_Ok", "set_to": false,
+     "meaning": "高压泵失效",
+     "column_in_data": "HP_Pump_Ok"},
+    {"variable": "LT_Level_Ok", "set_to": false,
+     "meaning": "冷却液位低于最低阈值",
+     "column_in_data": "LT_Level_Ok"}
+  ],
+  "expert_diagnosis": {
+    "id": "diag_9",
+    "name": "Leakage in coolant system.",
+    "comment": "泄漏导致液位低于下限报警，最终触发泵保护",
+    "note": "泄漏本身未被传感器直接观测 —— 真因在设备层是泵/液位，在工程层是泄漏。工具只能到设备层。"
+  },
+  "timeline_s": {
+    "cause_start_at": 106.927,
+    "alarms_detected_at": 155.546,
+    "diagnosis_at": 180.476,
+    "cause_end_at": 205.406,
+    "alarms_resolved_at": 262.931
+  },
+  "expected_behavior": [
+    "以 HP_A_700304（泵报警）为目标时，HP_Pump_Ok 应进入候选前列（实测修复后第 2）",
+    "以 LT_A_700317（液位报警）为目标时，LT_Level_Ok 应进入候选前列（实测第 4）",
+    "M_ErrorActive / M_WarnWithStacklight 这类**汇总状态位**不得占据榜首（它们是结果的总汇，不是原因）"
+  ],
+  "observed_before_fix": [
+    "HP_Pump_Ok 排第 4，榜首被 M_ErrorActive(r=0.984) 与 M_WarnWithStacklight(r=0.984) 霸占",
+    "根因：r_with_y 只从 corr 矩阵取，而 corr 只算前 16 列，第 17 列之后的同源护栏完全不生效"
+  ],
+  "observed_after_fix": [
+    "同源剔除生效：M_ErrorActive / M_WarnWithStacklight 被正确剔除",
+    "HP_Pump_Ok 从第 4 升到第 2"
+  ],
+  "known_limits": [
+    "前向填充引入伪重复，p 值与显著性水平不可用，只可看排序命中",
+    "同级的两个报警（HP_A_700304 与 LT_A_700317）互为'平级结果'，会互相解释，工具尚无法区分'汇总 vs 明细'",
+    "真因在工程层是泄漏（未观测），工具只能定位到设备层的泵与液位",
+    "只有 1 个场景 1 次运行入库（数据集共 3 组 × 多个 run，可扩展）"
+  ]
+}

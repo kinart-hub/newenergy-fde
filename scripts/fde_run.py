@@ -5893,6 +5893,15 @@ def flow_verify(args):
         #     R4 多口径是否披露、R5 置信度是否高于证据等级。
         run_cmd("12. 根因链路一致性",
                 [PY, "scripts/rootcause_chain_audit.py", "--gate"], timeout=args.timeout),
+        # 13. 外部真值校准：前 12 步查的是"内部自洽"——推导与取值一致、
+        #     分级有展示、量纲可比。但自洽不等于"排得对"。
+        #     本步用**外部真实数据 + 真值**校验排序：
+        #       realdata/c45_turning_doe  2^3 正交 DOE（真值=ANOVA 效应量）
+        #       realdata/causrca_cnc      人为注入故障（真值=实验设定）
+        #     判据只拦"真因被排除出候选"（信息丢失、用户永远看不到），
+        #     不拦"排错位"（真因还在列表里，人能看到并复核，报告也标了结论等级）。
+        run_cmd("13. 外部真值校准",
+                [PY, "scripts/calibrate_weights.py", "--gate"], timeout=args.timeout),
     ]
     return finish("质量闸门全套", steps, args.report, started=started)
 

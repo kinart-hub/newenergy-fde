@@ -1,0 +1,14 @@
+{
+  "source_url": "https://data.mendeley.com/datasets/yz37pvtztx/1",
+  "retrieved_at": "2026-11-04",
+  "publisher": "Mendeley Data（University of West Bohemia, M. Gombár）",
+  "license": "CC BY 4.0",
+  "caliber_note": "2^3 全因子切削试验（干切，C45 钢，KNUX 190408-EL P20 刀片，MUS 25 车床）。因子：切削速度 vc(8.792/351.680 m/min)、进给量 f(0.10/0.50 mm)、切深 ap(0.10/3.00 mm)，每 run 5 次重复，共 40 条测量。响应：Rz 与 Ra（Mitutoyo Surftest SJ-301，ISO 4287）。本用例 data.csv 由原 DATA_Final.xlsx 的 5_DOE_RzRa 表转换而来（列名改为带单位的中文写法，数值未改动），仅取 Rz/Ra 两列作响应，试验号列保留原 run 编号。",
+  "declared_rows": 40,
+  "declared_cols": 6,
+  "sha256": "e976e81bbac45191ec6a5663638f81e2833fa35b67511cb00f741991aade1144",
+  "origin_sha256": "db8d1b284dc9e461df3c0aceafc726bd0df3992766d112bb88ddad22f17ce37a",
+  "origin_file": "DATA_Final.xlsx (整个 xlsx, 47849 bytes)",
+  "truncated": false,
+  "notes": "**这是本仓库唯一带可复现真值的真实数据用例**（truth.json 由正交 DOE 分解 + F 检验直接算出，非人工标注、非编造）。价值不在于'数据新'，而在于它把'因'与'果'的关系固定下来了：进给量 f 是主因（eta²=79.9%），Ra 只是 Rz 的兄弟指标（同一零件另一种粗糙度写法）。这正好用来检验'共线剔除会不会把真因当成冗余剔掉'——实测原实现确实会，且因与果双双出局。注意：本数据是**受控切削试验**，不是'产线突发不良的现场根因'；它校准的是'参数敏感度排序'，不能替代现场 8D 的真因确认。"
+}

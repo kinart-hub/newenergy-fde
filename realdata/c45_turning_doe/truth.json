@@ -1,0 +1,65 @@
+{
+  "title": "C45 钢车削 2^3 全因子 DOE — 表面粗糙度 Rz",
+  "truth_type": "orthogonal_doe_anova",
+  "target_column": "表面粗糙度Rz_um",
+  "derivation": {
+    "method": "2^3 全因子正交分解 + F 检验（纯误差取 run 内组内平方和）",
+    "df_effect": 1,
+    "df_error": 32,
+    "mse_Rz": 0.743,
+    "sst_Rz": 19630.6,
+    "sse_Rz": 23.76,
+    "reproducible": true,
+    "note": "效应 = 2*(Σ y·X)/N；SS = (Σ y·X)²/N；F = SS/MSE。任何人用 data.csv 可复算到同样数值。"
+  },
+  "target_Rz": {
+    "grand_mean": 40.25,
+    "main_effects_ranked": [
+      {"param": "进给量_f_mm_r", "column": "进给量_f_mm_r", "effect": 39.61,
+       "eta2": 0.799, "F": 21121.78, "p": 1.05e-46, "significant": true,
+       "direction": "+", "role": "cause"},
+      {"param": "切削速度_vc_m_min", "column": "切削速度_vc_m_min", "effect": -17.64,
+       "eta2": 0.159, "F": 4192.51, "p": 1.65e-35, "significant": true,
+       "direction": "-", "role": "cause"},
+      {"param": "切深_ap_mm", "column": "切深_ap_mm", "effect": 0.59,
+       "eta2": 0.000, "F": 4.77, "p": 0.0365, "significant": true,
+       "direction": "+", "role": "cause",
+       "caveat": "主效应几乎为零（效应 0.59，对比进给量 39.61），但参与的交互项显著（x2×x3 eta²=0.9%）。按主效应排序它应排最后——这不是缺陷，是这份数据的客观事实。"}
+    ],
+    "interactions_ranked": [
+      {"term": "x1×x2×x3", "effect": 5.71, "eta2": 0.017, "F": 438.27},
+      {"term": "x1×x2", "effect": 5.41, "eta2": 0.015, "F": 393.39},
+      {"term": "x2×x3", "effect": -4.12, "eta2": 0.009, "F": 228.02},
+      {"term": "x1×x3", "effect": 1.32, "eta2": 0.001, "F": 23.29}
+    ]
+  },
+  "target_Ra": {
+    "grand_mean": 8.71,
+    "main_effects_ranked": [
+      {"param": "进给量_f_mm_r", "effect": 11.58, "eta2": 0.916, "F": 4749.79,
+       "significant": true, "role": "cause"},
+      {"param": "切削速度_vc_m_min", "effect": -2.91, "eta2": 0.058, "F": 299.46,
+       "significant": true, "role": "cause"},
+      {"param": "切深_ap_mm", "effect": 0.02, "eta2": 0.000, "F": 0.01,
+       "significant": false, "role": "cause"}
+    ]
+  },
+  "derived_relation": {
+    "note": "Ra 与 Rz 是同一零件表面粗糙度的两种写法，不是两个独立的因。",
+    "r_Ra_Rz": 0.974,
+    "implication": "任何把 Ra 当作 Rz 原因的实现都是错的；把 Ra 判为'与目标共线冗余而剔除'是对的，但**不能用它挤掉真正的因（进给量）**。"
+  },
+  "expected_behavior": [
+    "根因榜首位必须是「进给量_f_mm_r」",
+    "「切削速度_vc_m_min」第二位",
+    "「切深_ap_mm」第三位（主效应近零）",
+    "「轮廓算术平均Ra_um」不得出现在原因候选里（它是目标的另一种量法）",
+    "若实现把进给量以'共线冗余'为由剔除，即为缺陷"
+  ],
+  "known_limits": [
+    "受控切削试验，非产线突发不良；校准的是参数敏感度排序，不能替代现场真因确认",
+    "只有 3 个因子、2 水平、无中心点，无法检验曲性效应",
+    "无时序结构，无法校准 temporal 权重",
+    "知识库无机械加工工序，prior 权重在本例中不参与（全部走数据驱动路径）"
+  ]
+}

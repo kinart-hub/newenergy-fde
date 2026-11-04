@@ -175,7 +175,7 @@ if EV is not None and EV.__name__ != "lib.events":
 KB = PP.load_knowledge()
 _fmt = RPT._fmt
 
-ANALYZER_VERSION = "2.20.0"
+ANALYZER_VERSION = "2.21.0"
 
 
 # 空数据排查清单。
@@ -2139,6 +2139,7 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
                 for hs in hotspots[:3]:
                     w = hs["worst"]
                     nm = "%s = %s" % (hs["dim"], w["level"])
+                    _r_eff = S.effect_to_r(w.get("effect")) or 0.0
                     if nm in have:
                         continue
                     cands.append({
@@ -2146,10 +2147,12 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
                         "confounded": bool(hs.get("confounded")),
                         "param_name": nm, "unit": "",
                         "role": "group", "source": "单元级异常检验",
-                        "score": round(min(1.0, w["effect"] / 2.0), 4),
-                        # 口径：effect÷2（效应量的粗归一），**不是**四权重加权。
-                        # 与知识库候选放在同一张表里，必须让读者看得出这一行
-                        # 的分数不是按表头那个公式算的。
+                        # 量纲统一：Cohen's d → 等效 |r|（d/√(d²+4)）。
+                        # 原实现 min(1.0, d/2) 把 d≥2 全截成 1.0，且与参数候选的
+                        # |Pearson r| 完全不在一个尺度上——实测单元级落在 0.89~0.91
+                        # 而参数候选最高 0.70，真因会被分组异常挤下去。
+                        # 现在两者都是"关联强度"，可真正横向比较。
+                        "score": round(_r_eff, 4),
                         "score_basis": "unit_effect",
                         # 分级用校正后的 p：Bonferroni 过不了就不算数据支撑
                         "conclusion_status": (
@@ -2160,7 +2163,8 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
                             w.get("p_adj") is not None and w["p_adj"] <= 0.05),
                         "is_hypothesis": not (w.get("p_adj") is not None
                                               and w["p_adj"] <= 0.05),
-                        "evidence_score": round(w["effect"], 3),
+                        "evidence_score": round(_r_eff, 3),
+                        "raw_effect": round(w["effect"], 3),   # 原始 σ 倍数，供报告展示
                         "prior_score": 0.0, "temporal_score": 0.0,
                         "data_status": ST.SUCCESS,
                         "detail": {"status": ST.SUCCESS, "column": hs["dim"],
@@ -2191,7 +2195,21 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
                 continue
             # 同上：降级状态下不往 candidates 里塞（否则"未给排序"与"有条目"并存）
             _ratio = float(_cl["worst"].get("ratio") or 0)
-            _ev_score = round(min(0.95, _ratio / 5.0), 3)
+            # 量纲统一：位置聚集原本用 ratio÷5 做粗归一，与 |Pearson r| 不可比。
+            # 改为由 BH 校正后的 q 值反推等效相关强度（r = z/√(z²+n)），
+            # 与参数候选同一语义。取不到 q 时退回 ratio 的经验换算并标注。
+            _n_ev = 0
+            try:
+                _n_ev = int(sum(float(r.get("observed") or 0)
+                                for r in (_cl.get("rows") or [])))
+            except Exception:
+                _n_ev = 0
+            _q = _cl["worst"].get("q")
+            _ev_score = S.p_to_r(_q, _n_ev) if (_q is not None and _n_ev > 1) else None
+            if _ev_score is None:
+                # 没有 q 或样本量时给出保守值，并让 score_basis 说明这是估算
+                _ev_score = min(0.95, _ratio / 5.0)
+            _ev_score = round(max(0.0, min(1.0, _ev_score)), 4)
             root = root or {"defect": defect_name, "process": chosen_proc,
                             "candidates": [], "five_why": None}
             _cands = root.setdefault("candidates", [])
@@ -2941,11 +2959,45 @@ def data_driven_rootcause(assoc, spc_res, col_map, process_key, y_col, recog=Non
     kb = KB
     cands = []
     # 预先算好「每个数值列与目标的相关」和「列与列之间相关」，供链式归因用
+    #
+    # ⚠ 2026-11-04 用外部真实根因数据（causRCA，Zenodo 10.5281/zenodo.15876410）
+    # 查出一个正确性缺陷：r_with_y 原本只从 corr 矩阵取，而 corr 是
+    # `CORR.corr_matrix(work, numcols[:16])` —— **只算前 16 列**（性能考虑）。
+    # 于是第 17 列之后的列，r_with_y 里根本没有它们，`r_with_y.get(nm, 0) = 0`，
+    # 同源剔除与共线剔除对它们**完全不生效**。
+    # 实测后果：目标是泵报警，`M_ErrorActive`（机床错误总标志，r=0.984）与
+    # `M_WarnWithStacklight`（警示灯，r=0.984）直接霸占榜首第 1、2 名，
+    # 而人为注入的真因 `HP_Pump_Ok`（r=-0.763）被挤到第 4。
+    # 现场照第 1 名去查"为什么错误激活"，等于原地打转。
+    #
+    # 修法：与目标的相关强度改用 assoc（**全列覆盖**，由 association_with_target 算），
+    # corr 只保留它真正擅长的用途——**列与列**的共线性判断。
+    # 两个变量的职责不同，不能拿一个的截断结果去喂另一个。
     r_with_y = {}
     cols = []
+    if assoc:
+        _bad_eff = 0
+        for _a in assoc:
+            _nm = _a.get("param")
+            _v = _a.get("abs_effect")
+            if _nm and _v is not None:
+                try:
+                    r_with_y[_nm] = abs(float(_v))
+                except (TypeError, ValueError):
+                    # 关联效应对某些列可能不是数字（分类列的 eta² 也可能是 None）。
+                    # 静默跳过会让"这一列没有参与同源判定"变成看不见的事，
+                    # 而同源判定正是拦"结果指标霸榜"的唯一护栏——漏一列就漏一列。
+                    _bad_eff += 1
+                    degrade.note("pipeline.data_driven_rootcause@abs_effect",
+                                 ValueError("abs_effect 非数值：col=%r val=%r"
+                                            % (_nm, _v)))
+        if _bad_eff:
+            degrade.note("pipeline.data_driven_rootcause@abs_effect_total",
+                         ValueError("%d 列因 abs_effect 非数值未参与同源判定" % _bad_eff))
     if corr:
         cols = list(corr.get("columns") or [])
-        if y_col in cols:
+        if not r_with_y and y_col in cols:
+            # assoc 缺失时才退回 corr（覆盖面受限，但聊胜于无）
             yi = cols.index(y_col)
             for j, c in enumerate(cols):
                 try:
@@ -2958,16 +3010,44 @@ def data_driven_rootcause(assoc, spc_res, col_map, process_key, y_col, recog=Non
     # 组件 IV 里 CTM 与 Pmax 就是 r=1.000 —— 两个都留在候选里，等于说
     # 「功率低是因为功率低」。注意判据是列与列共线，不是列与目标共线：
     # CTM 与目标的 r 只有 0.59，光看它到目标的相关性发现不了这个重复。
+    #
+    # ⚠ 2026-11-04 用外部真实数据（C45 车削 DOE，Mendeley/DOI 10.17632/yz37pvtztx.1）
+    # 查出一个致命缺陷：原逻辑"保留与目标更相关的那个"会**必然把真因剔掉**。
+    # 实测：目标是 Rz(表面粗糙度)，进给量 f 与 Rz 的 r=0.894，而 Ra（轮廓算术平均，
+    # 同一个零件的另一种粗糙度指标）与 Rz 的 r=0.974，f 与 Ra 之间 r≥0.95。
+    # 于是 f 被判为"冗余"剔除，留下 Ra；接着 Ra 又因 r≥0.95 被"太相关"规则排除。
+    # **因与果双双出局**，榜首让给了 r=0.40 的切削速度——而 ANOVA 真值里
+    # f 的 eta²=79.9%，是压倒性的第一主效应。
+    #
+    # 根因不是阈值，是方向：影子指标（同一现象的另一种量法）与目标天然更相关，
+    # 按"谁更相关谁留下"排序，永远是留下影子、去掉真因。
+    # 修法：与目标 |r|≥SHADOW_R 的一方是"目标的影子"，共线时必须优先剔除它，
+    # 不看 r 谁大。三方关系（A↔B 共线、A↔Y 近 1）唯一合理的解读是 A 为果、B 为因。
     excluded = set()
+    shadow_cols = []
+    SHADOW_R = 0.95
     if r_with_y and corr and cols:
         for _i, c1 in enumerate(cols):
             for c2 in cols[_i + 1:]:
                 r12 = _corr_of(corr, c1, c2)
                 if r12 is None or abs(r12) < 0.95:
                     continue
+                # 编号/时间/坐标列不参与共线对判断：它们本来就不该进候选，
+                # 让它们参与只会挤掉真候选（实测"试验号"就在共线对里被剔）。
+                if (QG.column_role(c1) not in ("measure", "count")
+                        or QG.column_role(c2) not in ("measure", "count")):
+                    continue
                 r1, r2 = r_with_y.get(c1, 0.0), r_with_y.get(c2, 0.0)
+                s1, s2 = r1 >= SHADOW_R, r2 >= SHADOW_R
+                if s1 != s2:
+                    excluded.add(c1 if s1 else c2)
+                    continue
                 loser = _pick_redundant(c1, c2, r1, r2, kb)
                 excluded.add(loser)
+        # 与目标几乎同一个量的列，单独记下来：它们不是原因，是目标的另一种量法。
+        # 不静默丢弃——报告要能说清"这几列为什么没进候选"。
+        shadow_cols = sorted(c for c, v in r_with_y.items()
+                             if v >= SHADOW_R and c != y_col)
     # 各列自身的 SPC 状态（判异 / 整段偏移 / 基线是否受控）。
     # 相关系数只说"两个量一起变"，不说"这个因子自己变没变" ——
     # 一个全程统计受控、没有异常变动的因子，解释不了目标为什么突然变坏。
@@ -2986,6 +3066,10 @@ def data_driven_rootcause(assoc, spc_res, col_map, process_key, y_col, recog=Non
             skipped.append(nm)
             continue
         if nm in excluded or r_with_y.get(nm, 0) >= 0.95:
+            # 两种被排除的原因要分开记：共线冗余（同量不同写法，剔除无损）
+            # 与"影子列"（与目标几乎是同一个量，本质是结果指标，不能当原因）。
+            # 混成一个 skipped 列表，读者无法判断"这列没进候选"是判重了
+            # 还是判成结果了——两者的处置动作完全不同。
             skipped.append(nm)
             continue
         key = None
@@ -3097,6 +3181,10 @@ def data_driven_rootcause(assoc, spc_res, col_map, process_key, y_col, recog=Non
         "defect": "（未指定缺陷类型 · 数据驱动归因）",
         "evidence_insufficient": insufficient,
         "co_linear_excluded": skipped,
+        # 与目标 |r|≥0.95 的列：本质是"同一个现象的另一种量法"，不能当独立原因。
+        # 单独给一份，报告要说清这几列为什么没进候选——否则读者看到
+        # "候选里没有粗糙度 Ra"会以为漏算了，其实是它有意识地没被当成原因。
+        "same_phenomenon_excluded": shadow_cols,
         "insufficient_reason": reason if insufficient else None,
         "process": process_key or "",
         "process_name": proc.get("name", ""),
@@ -3933,6 +4021,18 @@ def build_report(res, work, spc_res, corr, assoc, pare, root, gaps, conf,
                 rep.callout(s8, "本次未指定缺陷类型，未启用缺陷机理库。下表为 <b>纯数据驱动</b> 的参数归因，"
                                 "只能说明「哪些参数与目标指标同步变化」，不等于已确认根因。"
                                 "用 --defect 指定缺陷类型后可获得机理加权结果。", "warn")
+                # 同源剔除必须说出来：这几列与目标几乎是同一个量（如同一零件的
+                # 粗糙度 Ra 与 Rz），它们是目标的另一种写法，不是原因。
+                # 不讲，读者会以为"漏算了这个参数"，进而把它当被忽略的线索。
+                _shadow = root.get("same_phenomenon_excluded") or []
+                if _shadow:
+                    rep.callout(
+                        s8, "以下 %d 列与目标「%s」的相关系数已达 0.95 以上，"
+                            "判为<b>同一现象的另一种量法</b>（不是独立原因），"
+                            "未计入候选：%s。若其中某一列其实是可独立调控的工艺参数，"
+                            "请用 --defect 或参数登记明确它的角色后重跑。"
+                        % (len(_shadow), res.get("target") or "—",
+                           "、".join(str(x) for x in _shadow[:6])), "info")
                 cap = "候选参数排序（按与目标列的关联强度，未经缺陷机理库加权）"
             else:
                 # 表头不得声称统一公式：本榜可能混有"单元级效应量""位置聚集比"两类候选，
