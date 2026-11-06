@@ -3477,6 +3477,68 @@ def rule_workspace_hygiene_never_deletes():
     return _r(True, "", {"ok": True})
 
 
+def rule_weights_status_all_paths():
+    """权重验证状态必须在**所有**根因返回路径上一致。
+
+    事故（2026-11-06）：`weights_validation_status` 是 2.19.10 为"权重未经
+    现场真值验证"这件事加的披露字段，但只加在**降级分支**（无榜单时）。
+    正常排行榜分支漏了 —— 结果是"有榜单时读者看不到『这套权重没验过』"，
+    而恰恰是有榜单时最需要这句话。后又发现 `data_driven_rootcause`（第三条
+    路径）压根没有这个字段，实测 04/06 示例的该字段为空。
+
+    这类缺陷的共同形态：**同一条声明只在一条返回路径实现**。
+    它不会被单测抓住（每条路径单独看都"正常"，只是缺个字段），
+    也容易在 review 里被忽略（字段名确实存在，只是位置不全）。
+
+    判据：每个产出根因结果的 return 块里，只要有 weights_source，
+    就必须同时有 weights_validation_status。缺一个即 FAIL。
+    """
+    rc = _read(os.path.join("lib", "rootcause.py")) or ""
+    pipe = _read(PIPELINE_FILE) or ""
+    if not rc or not pipe:
+        return _r(False, "读不到 rootcause.py / pipeline.py")
+
+    def _check_blocks(text, fname):
+        """在 return {...} 块里成对检查两字段。"""
+        bad = []
+        # 逐个 return 字典字面量扫描
+        for m in re.finditer(r"return\s*\{", text):
+            start = m.end() - 1
+            depth, i = 0, start
+            while i < len(text):
+                if text[i] == "{":
+                    depth += 1
+                elif text[i] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                i += 1
+            blk = text[start:i + 1]
+            if "weights_source" in blk and "weights_validation_status" not in blk:
+                # 取块首几行做定位
+                head = " ".join(blk.split())[:60]
+                bad.append((fname, head))
+        return bad
+
+    problems = _check_blocks(rc, "rootcause.py")
+    # pipeline 里 data_driven 的 return 也要查（它不在 rootcause.py 里）
+    for m in re.finditer(r'"weights_source"', pipe):
+        # 只关心与 data_driven 返回块相关的：看该行前后 600 字符内有没有验证状态
+        seg = pipe[max(0, m.start() - 400): m.start() + 600]
+        if "weights_validation_status" not in seg:
+            problems.append(("pipeline.py", "weights_source 附近无验证状态字段"))
+
+    if problems:
+        return _r(False, "以下返回路径有 weights_source 但缺 weights_validation_status："
+                         + "；".join("%s: %s" % (f, h) for f, h in problems[:4]))
+    # 反向：至少要有两处（说明确实覆盖了多条路径，不是只有一处就算过）
+    n = rc.count("weights_validation_status") + pipe.count("weights_validation_status")
+    if n < 3:
+        return _r(False, "只有 %d 处披露权重验证状态；根因至少有三条返回路径"
+                         "（rank / degraded / data_driven），少于 3 说明有路径漏了" % n)
+    return _r(True, "", {"ok": True, "n": n})
+
+
 def rule_spec_entry_any_shape():
     """规格条目必须按"可能是单版本 dict、也可能是多版本 list"来消费。
 
@@ -5041,6 +5103,29 @@ AUDIT_RULES = [
           _mutant("受控侧改成加权（修复退化：方向反了，越受控越靠前）",
                   _sub('ev = (ev or 0.0) * 0.85',
                        'ev = (ev or 0.0) * 1.05'),
+                  PIPELINE_FILE)]),
+    Rule("权重验证状态必须在所有根因返回路径上一致",
+         rule_weights_status_all_paths,
+         "同一条声明只在一条返回路径实现，是这类缺陷的固定形态："
+         "单独看每条路径都正常，只是缺个字段；单测抓不住，review 也容易漏"
+         "（字段名确实存在，只是位置不全）。"
+         "实测：该字段只加在降级分支，正常榜单分支漏了——"
+         "而恰恰是有榜单时最需要『这套权重没验过』这句话。",
+         os.path.join("lib", "rootcause.py"),
+         [_mutant("正常路径删掉验证状态（修复退化：有榜单时不提醒）",
+                  # 变异体名称绝不能包含原字段名作为子串：改名成
+                  # "_weights_validation_status_gone" 后，存在性判据仍会命中子串
+                  # → 判据以为字段还在 → 变异"没被抓到"。这是 MEMORY 里记过的坑 6。
+                  _sub('"weights_validation_status": (\n'
+                       '            "工程默认值，尚未在客户真实案例上统计验证',
+                       '"_wvs_gone_normal": (\n'
+                       '            "工程默认值，尚未在客户真实案例上统计验证'),
+                  os.path.join("lib", "rootcause.py")),
+          _mutant("data_driven 路径删掉验证状态（修复退化：第三条路径又漏）",
+                  _sub('"weights_validation_status": (\n'
+                       '            "本路径不含知识库先验与时序权重',
+                       '"_wvs_gone_dd": (\n'
+                       '            "本路径不含知识库先验与时序权重'),
                   PIPELINE_FILE)]),
     Rule("工作区卫生判据必须存在、接门禁、且自己绝不动手删文件",
          rule_workspace_hygiene_never_deletes,

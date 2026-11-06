@@ -6314,6 +6314,79 @@ def test_rootcause_chain_consistency():
           "rootcause_chain_audit.py" in run_txt, "")
 
 
+def test_temporal_precedence():
+    """因果先后：结果不会先于原因发生。这是本模块唯一不依赖领域知识的因果判据。
+
+    为什么必须有：相关性只说"两个量一起变"，而"一起变"里混着两类东西——
+    ① A 变导致 B 变（原因在前）；② 同一上游导致 A、B 同时变（并行后果）。
+    上轮我把"同级结果互相解释"登记为"靠列名判断会误伤，本轮不硬修"，
+    那是偷懒：**时序先后是硬信息，不需要靠列名猜。**
+    实测 causRCA（真值=注入故障）：真因 HP_Pump_Ok 首次变化 @371，目标报警 @372，
+    另一报警 LT_A_700317 @424（晚 52 点）。原实现因 |r|=0.964 把它排第 1，
+    真因被挤到第 4；接入时序降权后真因升到第 1。
+    """
+    print("\n[因果先后判据]")
+    from lib import rootcause as RC, table as TB
+    import csv as _csv, tempfile as _tf, os as _os
+
+    d = _tf.mkdtemp(prefix="prec-")
+    try:
+        p = _os.path.join(d, "t.csv")
+        with open(p, "w", newline="", encoding="utf-8") as fh:
+            w = _csv.writer(fh)
+            w.writerow(["time_s", "cause_early", "target", "consequence", "noise"])
+            for i in range(200):
+                # cause_early 在 100 点翻转；target 在 110；consequence 在 130
+                w.writerow([i,
+                            0 if i < 100 else 1,
+                            0 if i < 110 else 1,
+                            0 if i < 130 else 1,
+                            (i * 7) % 3])
+        tb = TB.read_csv(p)
+        check("识别出单调数值时间轴 time_s", RC.find_time_axis(tb) == "time_s",
+              str(RC.find_time_axis(tb)))
+
+        res = RC.temporal_precedence(tb, "target", ["cause_early", "consequence", "noise"])
+        check("早于目标者判『先于』", res.get("cause_early", {}).get("verdict") == "先于",
+              str(res.get("cause_early")))
+        check("晚于目标者判『晚于』", res.get("consequence", {}).get("verdict") == "晚于",
+              str(res.get("consequence")))
+        check("晚于的差值 = 130-110 = 20",
+              res.get("consequence", {}).get("delta") == 20,
+              str(res.get("consequence", {}).get("delta")))
+
+        # 反向：没有时间轴时必须返回空，不许假装"查过、都没晚"
+        p2 = _os.path.join(d, "nt.csv")
+        with open(p2, "w", newline="", encoding="utf-8") as fh:
+            w = _csv.writer(fh)
+            w.writerow(["a", "b", "c"])
+            for i in range(40):
+                w.writerow([i, i * 2 + (i % 3), i % 2])
+        tb2 = TB.read_csv(p2)
+        check("无时间轴时返回空（不假装查过）",
+              RC.temporal_precedence(tb2, "c", ["a", "b"]) == {}, "")
+
+        # 反向：目标自身不参与比较
+        res3 = RC.temporal_precedence(tb, "target", ["target"])
+        check("目标列不出现在自己的先后表里", "target" not in res3, str(res3))
+    finally:
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+    # 端到端：真值用例的 Top1 必须命中（这条会在时序降权被摘掉时翻红）
+    import subprocess
+    cal = _os.path.join(ROOT, "scripts", "calibrate_weights.py")
+    if _os.path.isdir(_os.path.join(ROOT, "realdata")):
+        r = subprocess.run([sys.executable, cal, "--gate"],
+                           capture_output=True, text=True, encoding="utf-8", errors="replace")
+        out = r.stdout or ""
+        check("真值校准 gate 通过（真因未被排除）", r.returncode == 0,
+              [ln.strip()[:60] for ln in out.split("\n") if "✗" in ln][:1])
+        check("causRCA 的 Top1 命中（时序判据生效）",
+              "causrca_cnc" in out and out.count("未中") == 0,
+              [ln.strip()[:50] for ln in out.split("\n") if "causrca" in ln][:1])
+
+
 if __name__ == "__main__":
     print("newenergy-fde 自检开始")
     test_table()
@@ -6372,6 +6445,7 @@ if __name__ == "__main__":
     test_shift_scan_status()
     test_workspace_hygiene_gate()
     test_rootcause_chain_consistency()
+    test_temporal_precedence()
     test_quality_manager_guide()
     test_reliability_weibull_alt()
     test_fmea_rpn_and_gate()

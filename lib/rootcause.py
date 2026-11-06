@@ -17,6 +17,7 @@ except Exception:                  # 脚本模式（python lib/pipeline.py）无
     import degrade                 # noqa
 import os
 import json
+import re
 from . import quality_guard as QG
 from . import stats as S
 from . import preprocess as PP
@@ -506,6 +507,134 @@ def _data_evidence(table, param_key, target_col):
     return score, detail
 
 
+# 时间轴列名提示（用于"行序是否代表时间"的判断）
+_TIME_AXIS_HINT = re.compile(
+    r"(^|[^a-z])(time|timestamp|ts|sec|second|secs|min|minute|hour|秒|时刻|时间|时序)"
+    r"([^a-z]|$)", re.IGNORECASE)
+
+
+def find_time_axis(table):
+    """找"行序即时间"的依据列。找不到返回 None。
+
+    与 `preprocess.parse_time_column` 职责不同，别混用：
+      · parse_time_column 认的是**日历时间**（年份区间、datetime），
+        用于跨表对齐、班次划分、停机会话切分。
+      · 本函数认的是**单调递增的数值时间轴**（0~316.4 秒这种），
+        只用来回答"这两列谁的动作在前"。
+
+    混用会出事：causRCA 的 `time_s` 是 0~316.4 的秒数，
+    在 parse_time_column 眼里不像年份 → 直接判"不是时间列"，
+    于是因果关系里最重要的"先后"信息整段丢失。
+    """
+    best = None
+    for c in table.columns:
+        if not _TIME_AXIS_HINT.search(str(c)):
+            continue
+        vals = table.numeric_column(c)
+        ok = [v for v in vals if v is not None]
+        if len(ok) < 8 or len(set(ok)) < 3:
+            continue
+        # 必须单调非递减（允许相等，事件日志常有多条同刻记录）
+        mono = all(ok[i] <= ok[i + 1] + 1e-9 for i in range(len(ok) - 1))
+        if mono:
+            return c
+        if best is None:
+            best = c
+    return best
+
+
+def first_deviation(values, frac=0.1, min_base=5):
+    """首个"显著离开基线"的位置。找不到返回 None。
+
+    基线取前 frac 比例的样本（默认前 10%），尺度用稳健 MAD。
+    二值/分类列 MAD=0，此时任何取值变化都算偏离（这正对：状态翻转本身就是事件）。
+    """
+    xs = [v for v in values]
+    n = len(xs)
+    if n < 8:
+        return None
+    nb = max(min_base, int(n * frac))
+    base = [v for v in xs[:nb] if v is not None]
+    if not base:
+        return None
+    center = S.median(base)
+    mad = S.median([abs(v - center) for v in base]) or 0.0
+    scale = 1.4826 * mad
+    for i, v in enumerate(xs):
+        if v is None:
+            continue
+        if scale > 0:
+            if abs(v - center) > 3.0 * scale:
+                return i
+        else:
+            # 尺度为零：只要离开基线值就算偏离
+            if abs(v - center) > 1e-12:
+                return i
+    return None
+
+
+def temporal_precedence(table, target_col, candidate_cols):
+    """用"谁先动"判断因果方向：结果不会先于原因发生。
+
+    这是本模块里唯一**不依赖领域知识**的因果判据，也是它最有价值的地方——
+    相关性只说"两个量一起变"，而"一起变"里有两类完全不同的东西：
+      ① A 变了导致 B 变（原因在前）
+      ② 同一个上游导致 A、B 同时变（并行后果，谁都不是谁的原因）
+
+    上轮我把这类问题登记为"同级结果互相解释，靠列名判断会误伤，本轮不硬修"——
+    那是偷懒。**时序先后是硬信息，不需要靠列名猜。**
+
+    实测（causRCA exp_22，真值=注入故障）：
+      HP_Pump_Ok（真因）首次变化 @371
+      HP_A_700304（目标报警）@372      ← 目标
+      M_WarnWithStacklight @375、M_ErrorActive @376（汇总状态位，后果）
+      LT_A_700317（另一报警）@424      ← 比目标晚 52 点，不可能是原因
+    原实现把它排到第 1（因 |r|=0.964 最高），真因被挤到第 4。
+
+    返回 {col: {"first": idx, "delta": idx-tgt_idx, "verdict": "先于|同相|晚于|未知"}}
+      verdict="晚于" 的含义是**它不可能是目标的原因**（但仍可能是并行后果，
+      所以只降权、不剔除——剔除会丢掉"这里还有第二个异常"的线索）。
+    """
+    if not target_col:
+        return {}
+    axis = find_time_axis(table)
+    if not axis:
+        # 没有时间轴：行序无时间含义，本判据不成立。
+        # 必须返回空并让调用方知道"这次没做时序判断"，不能返回"全部同相"——
+        # 后者会让下游误以为"查过了、都还没晚"。
+        return {}
+    tgt = table.numeric_column(target_col)
+    t_first = first_deviation(tgt)
+    if t_first is None:
+        return {}
+    out = {}
+    for c in candidate_cols or []:
+        if c == target_col:
+            continue
+        try:
+            v = table.numeric_column(c)
+        except Exception as _ce:
+            # 取不到数值列 → 这一列的先后无从判断。不能静默 continue：
+            # 静默的话它既不在"晚于"里、也不在"未知"里，等价于被当成"没晚"，
+            # 于是照样拿满权重。**"没法判"和"判了没问题"必须分开。**
+            degrade.note("rootcause.temporal_precedence@numeric", _ce)
+            out[c] = {"first": None, "delta": None, "verdict": "未知"}
+            continue
+        f = first_deviation(v)
+        if f is None:
+            out[c] = {"first": None, "delta": None, "verdict": "未知"}
+            continue
+        d = f - t_first
+        if d < 0:
+            verdict = "先于"
+        elif d == 0:
+            verdict = "同相"
+        else:
+            verdict = "晚于"
+        out[c] = {"first": f, "delta": d, "verdict": verdict}
+    return out
+
+
 def _temporal_match(table, param_col, target_col):
     """参数异常时段与指标异常时段的重合度（0-1）"""
     x = table.numeric_column(param_col)
@@ -892,6 +1021,13 @@ def rank_root_causes(defect_name, table, target_col=None, top=5,
         # 这句话就会继续报着旧数字，变成一条看起来精确的假信息。
         "weights_used": {k: round(v, 4) for k, v in _w.items()},
         "weights_source": _wsrc,
+        # 2.19.10 曾只在**降级分支**加了这个字段，正常排行榜分支漏了——
+        # 结果是"有榜单时读者看不到『这套权重没验过』"，而恰恰是有榜单时最需要这句话。
+        # 同一条声明必须在两条返回路径上一致，否则等于对最该提醒的人不提醒。
+        "weights_validation_status": (
+            "工程默认值，尚未在客户真实案例上统计验证，须以现场真值复核"
+            if "内置默认" in (_wsrc or "") else
+            "用户配置文件提供，仍须以现场真值复核后方可视为已校准"),
         "score_note": weights_note(_w, _wsrc) + "；不代表该参数确为根因的概率，"
                        "各候选可验证性分项见 verifiability_score、分项贡献见 score_breakdown",
     }

@@ -175,7 +175,7 @@ if EV is not None and EV.__name__ != "lib.events":
 KB = PP.load_knowledge()
 _fmt = RPT._fmt
 
-ANALYZER_VERSION = "2.21.0"
+ANALYZER_VERSION = "2.22.0"
 
 
 # 空数据排查清单。
@@ -2057,7 +2057,8 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
             root = data_driven_rootcause(assoc, spc_res, col_map, chosen_proc, y_col,
                                          recog=result.get("column_recognition_rate"),
                                          corr=corr,
-                                         exclude_cols=result.get("stc_replaced_cols"))
+                                         exclude_cols=result.get("stc_replaced_cols"),
+                                         table=work)
         if root and root.get("insufficient_reason"):
             # 这条说明的是"为什么根因这节给不出可用结论"（列名识别率过低 / 证据太弱）。
             # 产出了却不进 warnings，用户在报告里只会看到"数据不足"，不知道该补什么。
@@ -2951,7 +2952,7 @@ def _resolve_msa(spec, table=None, target=None):
 
 
 def data_driven_rootcause(assoc, spc_res, col_map, process_key, y_col, recog=None, corr=None,
-                          exclude_cols=None):
+                          exclude_cols=None, table=None):
     """未指定缺陷类型时的兜底归因：纯数据驱动，不使用缺陷机理库。
 
     标注清楚"未使用机理库"，避免用户误以为这是经过机理验证的结论。
@@ -3056,6 +3057,25 @@ def data_driven_rootcause(assoc, spc_res, col_map, process_key, y_col, recog=Non
     for _sd in (spc_res or []):
         if isinstance(_sd, dict) and _sd.get("column"):
             _spc_by_col[_sd["column"]] = _sd
+    # 因果先后：结果不会先于原因发生。
+    # 只用它做**降权**（晚于目标 → 不可能是原因），不用它做加权——
+    # "先于"只是必要条件不是充分条件，给先于的加分会让任何早期波动都成候选。
+    _prec = {}
+    if table is None:
+        # 缺 table 就没法判"谁先动"。必须记账：
+        # 不记账的话，下游看到的时序判据为空，会读成"查过了、没有晚于的"——
+        # 而这正是我第一版的实际错法（形参没加，NameError 被 except 吞掉，
+        # 时序降权静默失效，Top1 还是没命中）。
+        degrade.note("pipeline.data_driven_rootcause@precedence",
+                     ValueError("未传入 table，跳过因果先后判定"))
+    else:
+        try:
+            _prec = RC.temporal_precedence(
+                table, y_col,
+                [a.get("param") for a in (assoc or [])[:12] if a.get("param")])
+        except Exception as _prec_e:
+            degrade.note("pipeline.data_driven_rootcause@precedence", _prec_e)
+            _prec = {}
     skipped = []
     for i, a in enumerate(assoc[:10]):
         nm = a["param"]
@@ -3137,6 +3157,16 @@ def data_driven_rootcause(assoc, spc_res, col_map, process_key, y_col, recog=Non
         # 报告里与知识库路径共用同一张表。没有分级，读者分不清哪条有数据支撑、
         # 哪条只是"同步变化"。分级口径与 rank_root_causes 保持一致：
         # 统计上显著（|r|≥0.15 且 p≤0.05）才算"数据支持"，否则只是"现场待确认"。
+        _pv = _prec.get(nm) or {}
+        _sc = ev * (1 - i * 0.08)
+        _pv_note = None
+        if _pv.get("verdict") == "晚于":
+            # 比目标的变化还晚 → 它不可能是目标的原因（因果的时间必要条件不满足）。
+            # 降权而不剔除：它仍是"这里还有第二个异常"的线索，剔掉会丢信息。
+            _sc *= 0.5
+            _pv_note = ("该列的首次显著变化比目标晚 %s 个采样点，"
+                        "**不可能是目标的原因**（更可能是并行后果或同一上游的另一表现）；"
+                        "排查时不要先动它" % _pv.get("delta"))
         _r = a.get("r")
         _p = a.get("p")
         _data_backed = (_r is not None and abs(_r) >= 0.15
@@ -3145,14 +3175,16 @@ def data_driven_rootcause(assoc, spc_res, col_map, process_key, y_col, recog=Non
             "param_key": key, "param": nm, "param_name": spec.get("name", nm),
             "unit": spec.get("unit", ""),
             "role": spec.get("role") or "",
-            "score": round(ev * (1 - i * 0.08), 4),
-            # 这条路径的打分是"证据分 × 位置衰减"，不是四权重加权——
-            # 必须如实声明，否则表头那句话对它就是假的。
+            "score": round(_sc, 4),
+            # 这条路径的打分是"证据分 × 位置衰减"（再乘时序先后系数），
+            # 不是四权重加权——必须如实声明，否则表头那句话对它就是假的。
             "score_basis": "evidence_only",
+            "temporal_precedence": _pv,
             "conclusion_status": "数据支持" if _data_backed else "现场待确认",
             "supported_by_data": bool(_data_backed),
             "is_hypothesis": not _data_backed,
             "evidence_score": round(ev, 3),
+            "precedence_note": _pv_note,
             "prior_score": 0.0, "temporal_score": 0.0,
             "data_status": ST.SUCCESS,
             "detail": {"status": ST.SUCCESS, "param": key or nm, "column": nm,
@@ -3181,6 +3213,14 @@ def data_driven_rootcause(assoc, spc_res, col_map, process_key, y_col, recog=Non
         "defect": "（未指定缺陷类型 · 数据驱动归因）",
         "evidence_insufficient": insufficient,
         "co_linear_excluded": skipped,
+        # 纯数据驱动路径**没有权重**（不参与 prior/temporal 加权），
+        # 但必须显式说明"没有任何权重参与"，而不是让字段缺省成 None——
+        # 缺省会被读成"权重已启用且已验证"，而这恰恰是最需要说清的相反情形。
+        "weights_used": {},
+        "weights_source": "未使用权重（纯数据驱动路径，仅按证据强度排序）",
+        "weights_validation_status": (
+            "本路径不含知识库先验与时序权重，排序只依据数据本身；"
+            "因此不存在「权重是否已校准」的问题，但也**没有先验纠偏能力**"),
         # 与目标 |r|≥0.95 的列：本质是"同一个现象的另一种量法"，不能当独立原因。
         # 单独给一份，报告要说清这几列为什么没进候选——否则读者看到
         # "候选里没有粗糙度 Ra"会以为漏算了，其实是它有意识地没被当成原因。
@@ -4073,6 +4113,21 @@ def build_report(res, work, spc_res, corr, assoc, pare, root, gaps, conf,
                             "是" if w["supported"] else "否"] for w in root["five_why"]],
                           caption="5Why 链条")
             rep.bullets(s8, ["现场快速验证：" + c for c in (root.get("quick_checks") or [])])
+
+        # 传导滞后：参数与目标谁领先谁、领先几步。
+        # 这段数据一直在算（CORR.lagged_correlation），但从来没进报告——
+        # 等于白算。它回答的是"改了参数要等多久才见效"，是现场调机最实际的问题。
+        _lags = res.get("lagged") or []
+        if _lags:
+            rep.table(s8, ["参数", "最优滞后", "该滞后下 r", "解读"],
+                      [[lg.get("param"), ("领先 %d 点" % lg.get("best_lag"))
+                        if lg.get("best_lag") else "同相位",
+                        _fmt(lg.get("best_r"), 3),
+                        (lg.get("interpretation") or "")[:46]] for lg in _lags[:5]],
+                      caption="传导滞后（参数(t−lag) 与目标(t) 的最优相关）")
+            rep.text(s8, "滞后为正表示<b>参数的变化领先于指标</b>，符合上游参数→下游指标的"
+                     "传导特征；同相位则可能是直接因果，也可能是共同受第三方驱动——"
+                     "后者必须靠现场追溯区分，统计上分不出来。")
 
         # 单元级热点：这类问题（某个通道/卷针/供应商单独跑偏）单因素 ANOVA 抓不到，
         # 单独列出来，否则现场只能看到「组间无显著差异」而漏掉它
