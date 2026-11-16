@@ -5968,6 +5968,18 @@ def test_process_fallback():
                         export_xlsx=False, export_docx=False, export_pdf=False)
         check("--process-mode descriptive 强制降级",
               r2.get("process_mode") == "descriptive", str(r2.get("process_mode")))
+        # 非法工序 key 不能静默吞掉（C01 五金 CNC 传 --process generic 却仍被判硅片检测）
+        r3 = PL.analyze([nof], outdir=os.path.join(tdir, "out3"), process="generic",
+                        export_xlsx=False, export_docx=False, export_pdf=False)
+        check("非法工序 key 不静默：显式告警",
+              any("在知识库中不存在" in w and "generic" in w
+                  for w in (r3.get("warnings") or [])), "")
+        check("非法工序 key 强制 descriptive（不套错误工序机理）",
+              r3.get("process_mode") == "descriptive" and not r3.get("process"),
+              "mode=%s process=%s" % (r3.get("process_mode"), r3.get("process")))
+        _rc3 = r3.get("rootcause") or {}
+        check("非法工序 key 的根因也不采信工序先验",
+              _rc3.get("_no_process_prior") is True, str(_rc3.get("_no_process_prior")))
         _rc2 = r2.get("rootcause") or {}
         check("descriptive 模式根因也不采信工序先验",
               _rc2.get("_no_process_prior") is True or r2.get("process_mode") == "descriptive",

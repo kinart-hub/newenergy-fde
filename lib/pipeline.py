@@ -1035,7 +1035,18 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
     else:
         col_map = PP.map_columns(main)
     proc_scores = PP.detect_process(main, col_map)
-    if process and process in KB["processes"]:
+    if process and process not in KB["processes"]:
+        # 非法工序 key 不能静默吞掉：传 --process generic 却仍被判"硅片检测"，
+        # 使用者以为指定了通用模式，实际拿到的是新能源工序结论（C01 实测踩中）。
+        # 明确警告 + 列出合法 key，让错误可见；同时强制 descriptive，
+        # 不拿错误工序的机理去套数据。
+        _valid = "、".join(sorted(KB["processes"].keys()))
+        result.setdefault("warnings", []).append(
+            "指定的工序 key「%s」在知识库中不存在，已忽略并按纯描述性统计处理，"
+            "本次不输出依赖工序机理的结论。合法 key：%s" % (process, _valid))
+        chosen_proc = None
+        _proc_mode = "descriptive"
+    elif process and process in KB["processes"]:
         chosen_proc = process
         _proc_mode = "manual"
     elif (process_mode or "").lower() in ("unknown", "descriptive"):
@@ -2244,6 +2255,15 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
                 })
                 _cands.sort(key=lambda d: -d["score"])
 
+        # 候选集被注入（位置聚集/单元热点）后必须重算「证据不足」标志。
+        # data_driven 算标志时榜首还是弱相关的数据列；注入的候选可能带硬证据
+        # （S4 实测：旧榜首 0.0649 判不足，注入后榜首 0.691、p_adj≈6e-110）。
+        # 不重算 → 够格根因被藏，报告还拿新榜首去配旧的「低于门槛」文案。
+        if root and QG.reevaluate_insufficiency(root):
+            root.setdefault("notes", []).append(
+                "后注入的候选（位置聚集/单元热点）带硬统计证据，"
+                "已重算证据门槛：原「证据不足」标志解除，榜首可进入 D4。")
+
         # v1.11：负例判定。归一化之后所有工艺参数都解释不动目标 —— 真相是
         # "测试方法没归一"，不是"某个参数调错了"。此时必须明说没有根因。
         if result.get("stc_applied"):
@@ -3290,9 +3310,7 @@ def build_summary(res):
             s.append("首要候选根因：%s（综合得分 %.2f）"
                      % (c["param_name"], c["score"]))
         else:
-            s.append("支撑不出根因结论：最高候选 %s 证据得分 %.2f，低于 %.2f 门槛，"
-                     "仅作排查方向，不可据此调整工艺参数"
-                     % (c["param_name"], c.get("evidence_score") or 0, QG.EVIDENCE_GATE))
+            s.append("支撑不出根因结论：" + QG.insufficient_text(rc, plain=True))
     if res.get("pareto") and res["pareto"].get("top"):
         s.append("Pareto 首位：%s（占比 %.1f%%）"
                  % (res["pareto"]["top"]["item"], res["pareto"]["top"]["pct"]))
@@ -4052,11 +4070,9 @@ def build_report(res, work, spc_res, corr, assoc, pare, root, gaps, conf,
                                 % len(_gaps))
         else:
             if root.get("evidence_insufficient"):
-                rep.callout(s8, "本次数据<b>支撑不出根因结论</b>：所有候选参数的关联强度都很弱"
-                                "（最高分 %.2f，低于 0.20 的证据门槛）。下表仅供排查方向参考，"
-                                "<b>不应据此调整工艺参数</b>。请先补充关键检测数据或核对列名含义。"
-                                % (root["candidates"][0]["score"] if root.get("candidates") else 0),
-                            "warn")
+                rep.callout(s8, "本次数据<b>支撑不出根因结论</b>：" +
+                            QG.insufficient_text(root, plain=False) +
+                            " 请先补充关键检测数据或核对列名含义。", "warn")
             if root.get("data_driven"):
                 rep.callout(s8, "本次未指定缺陷类型，未启用缺陷机理库。下表为 <b>纯数据驱动</b> 的参数归因，"
                                 "只能说明「哪些参数与目标指标同步变化」，不等于已确认根因。"

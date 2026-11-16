@@ -75,6 +75,26 @@ check("证据不足不算 strong", not QG.rc_strong({"candidates": [{"evidence_s
 check("证据充分算 strong", QG.rc_strong({"candidates": [{"evidence_score": 0.35}]}))
 check("标记 insufficient 不算 strong",
       not QG.rc_strong({"evidence_insufficient": True, "candidates": [{"evidence_score": 0.9}]}))
+# 候选注入后必须解锁（实测 S4：旧榜首 0.0649 判不足，注入位置候选 0.691 后应可进 D4）
+_s4 = {"evidence_insufficient": True,
+       "insufficient_reason": "所有候选的统计证据都太弱",
+       "candidates": [{"param_name": "位置 = 尾部", "evidence_score": 0.691}]}
+check("注入硬证据候选后重算：不足标志应解锁",
+      QG.reevaluate_insufficiency(_s4) and not _s4["evidence_insufficient"]
+      and QG.rc_strong(_s4))
+_blind = {"evidence_insufficient": True,
+          "insufficient_reason": "列名识别率过低（9%），无法确定各列测的是什么，相关关系无法解读",
+          "candidates": [{"param_name": "某列", "evidence_score": 0.9}]}
+check("列名识别率过低不得靠注入候选解锁",
+      not QG.reevaluate_insufficiency(_blind) and _blind["evidence_insufficient"])
+_weak = {"evidence_insufficient": True,
+         "insufficient_reason": "所有候选的统计证据都太弱",
+         "candidates": [{"param_name": "某列", "evidence_score": 0.1}]}
+check("榜首仍弱时重算不解锁", not QG.reevaluate_insufficiency(_weak))
+check("文案不把 0.69 说成低于 0.20 门槛",
+      "低于" not in QG.insufficient_text({"evidence_insufficient": True,
+          "insufficient_reason": "所有候选的统计证据都太弱",
+          "candidates": [{"param_name": "位置 = 尾部", "evidence_score": 0.691}]}))
 p, n = QG.pick_process([])
 check("无工序特征时不选工序", p is None and n)
 p, n = QG.pick_process([("pv_cell_el", 0.5)])

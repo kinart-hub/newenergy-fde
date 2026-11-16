@@ -313,6 +313,74 @@ def rc_strong(rc):
     return float(lead.get("evidence_score") or 0) >= EVIDENCE_GATE
 
 
+def reevaluate_insufficiency(rc):
+    """候选集被后处理（位置聚集 / 单元热点）注入之后，重算「证据不足」标志。
+
+    为什么必须重算：data_driven_rootcause 在注入之前算出 insufficient（当时榜首
+    只是弱相关的数据列），之后主流程把有硬统计证据的位置/热点候选顶到榜首
+    （实测 S4：旧榜首 0.0649 判 insufficient=True，注入后榜首 0.691、p_adj≈6e-110、
+    supported_by_data=True）。标志不重算 → 够格根因被藏起来，报告还拿新榜首的
+    0.69 去配旧的「低于 0.20 门槛」文案，数值自相矛盾。
+
+    只解锁 weak 造成的不足；列名识别率过低（blind）是独立的认知障碍，
+    即使某个候选系数高也不能解锁——连列测什么都不知道，r 再大也不能解读。
+    返回 True 表示本次确实改了标志（供调用方记 note / 自检断言）。
+    """
+    if not rc or not rc.get("evidence_insufficient"):
+        return False
+    reason = rc.get("insufficient_reason") or ""
+    if "识别率" in reason:          # blind，不能靠注入候选解锁
+        return False
+    if rc_strong_core(rc):
+        rc["evidence_insufficient"] = False
+        rc["insufficient_reason"] = None
+        return True
+    return False
+
+
+def rc_strong_core(rc):
+    """只按候选证据判断，不看 evidence_insufficient 标志——供重算与文案使用。
+
+    与 rc_strong 区别：rc_strong 把标志当硬否决；core 只看「有没有够格的榜首」。
+    重算时若复用 rc_strong，标志为 True 会永远锁死自己，永远解不开。
+    """
+    if not rc or not rc.get("candidates"):
+        return False
+    lead = rc["candidates"][0]
+    return float(lead.get("evidence_score") or 0) >= EVIDENCE_GATE
+
+
+def insufficient_text(rc, plain=True):
+    """「支撑不出根因」的原因文案，按**真实**失败原因分支。
+
+    不能统一写「得分 X 低于门槛」：实测 S4 榜首 0.69 高于 0.20，
+    文案却说低于门槛，是数值自相矛盾。失败原因只有三种：
+      ① 没有候选；② 列名识别率过低（blind）；③ 榜首证据分真的没过门槛。
+    plain=True 给摘要/8D 用纯文本；False 给报告 callout 用（带 <b>）。
+    """
+    rc = rc or {}
+    reason = rc.get("insufficient_reason") or ""
+    cands = rc.get("candidates") or []
+    if not cands:
+        return "未识别出任何候选根因（数据量或字段不足），D4 留空。"
+    lead = cands[0]
+    nm = lead.get("param_name") or lead.get("param") or "—"
+    ev = float(lead.get("evidence_score") or 0)
+    b = (lambda x: x) if plain else (lambda x: "<b>%s</b>" % x)
+    if "识别率" in reason:
+        return ("%s：%s。连各列测的是什么都无法确定，相关关系不可解读；"
+                "不应据此调整工艺参数。" % (b("列名识别率过低"), reason))
+    if ev < EVIDENCE_GATE:
+        return ("首要候选「%s」证据得分 %.2f，未达 %.2f 门槛，"
+                "仅作排查方向，不可据此调整工艺参数"
+                % (nm, ev, EVIDENCE_GATE))
+    # 兜底：标志说不足，但榜首分数其实够（理论上重算后不该走到这里）。
+    # 如实说"证据不足但榜首分数不低"，绝不编造一个低于门槛的假数字。
+    return ("首要候选「%s」证据得分 %.2f（已达 %.2f 门槛），"
+            "但其余证据仍不足（%s），暂不作根因结论"
+            % (nm, ev, EVIDENCE_GATE, reason or "原因未明"))
+
+
 def pick_process(proc_scores):
     """自动工序判定的护栏。返回 (process_key or None, note or None)。"""
     if not proc_scores:

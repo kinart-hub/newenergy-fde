@@ -446,10 +446,8 @@ def d4_status(res):
         return False, "未识别出候选根因（数据量或字段不足），D4 留空。", None
     if not QG.rc_strong(root):
         top = cands[0]
-        return False, ("首要候选「%s」证据强度不足（得分 %.2f，低于闸门 %.2f）。"
-                       "**D4 不得填写根因**，先完成现场验证或补数据后复跑。"
-                       % (top.get("param_name") or "—", top.get("score") or 0,
-                          getattr(QG, "EVIDENCE_GATE", 0.20))), top
+        return False, (QG.insufficient_text(root, plain=True) +
+                       "**D4 不得填写根因**，先完成现场验证或补数据后复跑。"), top
     return True, "", cands[0]
 
 
