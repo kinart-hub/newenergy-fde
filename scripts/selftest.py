@@ -6222,6 +6222,56 @@ def test_shift_scan_status():
           str((p1 or {}).get("shift_scan"))[:60])
 
 
+def test_deliver_chain():
+    """四份交付物端到端连贯：单一事实源 + 证据链贯穿 + 跨阶段一致性校验。
+
+    用户反复指出的范式缺陷（逻辑散乱/证据链断裂/各阶段无法连贯验证/报告
+    没有实证支撑）靠单点修补无效，必须用 deliver 编排根治。本测试验证：
+    正常事实源四份交付物互相印证且校验通过；注入断裂措施不同源必须被拦。
+    """
+    print("\n[四份交付物：单一事实源与跨阶段一致性]")
+    from lib import deliver as D
+
+    res = {
+        "target": "Y(mm)", "process_name": "工序A", "process": "proc_a",
+        "shape": [12, 3], "summary": ["工序判定：工序A"],
+        "spc": [{"column": "Y(mm)", "violations": [{"rule": 1}]}],
+        "pareto": {"top": {"item": "超差"}},
+        "rootcause": {"candidates": [
+            {"param_name": "温度", "score": 0.8, "evidence_score": 0.8,
+             "conclusion_status": "数据支持", "supported_by_data": True},
+            {"param_name": "压力", "score": 0.3, "evidence_score": 0.3,
+             "conclusion_status": "假设", "supported_by_data": False}]},
+        "eightd": {"d4_ok": True,
+                   "d5": {"rows": [{"category": "设备", "target": "温度",
+                                    "action": "点检温控"}]},
+                   "d7": {"rows": [{"action": "修订SOP", "detail": "纳入点检",
+                                    "doc_no": "WI-01", "owner": "现场", "due": "本周"}]},
+                   "fmea": {"rows": [{"item": "失效模式", "content": "温度漂移"}]}},
+    }
+    chain = D.build_chain(res, source_path="result.json")
+    ok, vio = D.validate_chain(chain, res)
+    check("deliver 正常事实源校验通过", ok and not vio, str(vio)[:160])
+    check("榜首根因证据ID稳定", chain["lead_fact_id"] == "F-CAU-01",
+          str(chain["lead_fact_id"]))
+    check("措施响应榜首根因",
+          chain["facts"]["F-ACT-01"]["responds_to"] == "F-CAU-01")
+    # 四份交付物渲染都带同一个 chain_id（证据链可见）
+    texts = {k: fn(chain, res).render_md() for k, fn in D.RENDERERS.items()}
+    check("四份交付物齐全", len(texts) == 4, str(sorted(texts)))
+    check("四份都标注证据链",
+          all(chain["chain_id"] in t for t in texts.values()))
+
+    # 注入断裂：榜首换成压力，但 D5 措施 target 还写温度 → V7 必须翻红
+    broken = json.loads(json.dumps(res))
+    broken["rootcause"]["candidates"][0], broken["rootcause"]["candidates"][1] = \
+        broken["rootcause"]["candidates"][1], broken["rootcause"]["candidates"][0]
+    c2 = D.build_chain(broken, source_path="result.json")
+    ok2, vio2 = D.validate_chain(c2, broken)
+    check("deliver 拦住跨阶段脱节(措施≠榜首)",
+          (not ok2) and any("V7" in x for x in vio2), str(vio2)[:160])
+
+
 def test_workspace_hygiene_gate():
     """工作区卫生判据：清理不能靠人肉 ls，必须有机读判据且接进门禁。
 
@@ -6456,6 +6506,7 @@ if __name__ == "__main__":
     test_rootcause_interface_wiring()
     test_shift_scan_status()
     test_workspace_hygiene_gate()
+    test_deliver_chain()
     test_rootcause_chain_consistency()
     test_temporal_precedence()
     test_quality_manager_guide()

@@ -677,6 +677,9 @@ AUDIT_FILES = [
     # 规则 #89 的变异目标就是它本身；不进 AUDIT_FILES 时副本里读不到，
     # 会报"副本下基线就没过"——那不是判据失败，是副本不全（已知坑）。
     os.path.join("scripts", "workspace_hygiene.py"),
+    # 规则 #91 的四交付物连贯判据要在这两个文件里注入缺陷；缺了会静默 SKIP。
+    os.path.join("scripts", "deliver.py"),
+    os.path.join("lib", "deliver.py"),
     os.path.join("lib", "pipeline.py"),
     os.path.join("lib", "exclude.py"),
     os.path.join("lib", "context.py"),
@@ -3539,6 +3542,50 @@ def rule_weights_status_all_paths():
     return _r(True, "", {"ok": True, "n": n})
 
 
+def rule_deliver_chain_integrity():
+    """四份交付物必须从单一事实源产出并做跨阶段一致性校验。
+
+    用户反复指出的范式级缺陷：逻辑散乱/证据链断裂/各阶段函数无法连贯验证/
+    报告结果没有实证支撑。根因不是某个函数写错，而是四份交付物各自为政。
+    根治形态是 deliver 编排：result.json -> 证据账本(带F-ID) -> 四份交付物
+    -> 交叉校验。本规则钉住四个不变量，任一退化即 FAIL：
+      1. build_chain 从 result 单一事实源建账本（不许交付物自己造事实）
+      2. V7 措施目标必须 == 榜首根因（跨阶段同源，实测注入断裂能翻红）
+      3. 四个渲染器都注册且都标注 chain_id（证据链可见）
+      4. deliver 入口在校验失败时退出码非 0（不许静默出矛盾报告）
+    """
+    mod = _read(os.path.join("lib", "deliver.py")) or ""
+    cli = _read(os.path.join("scripts", "deliver.py")) or ""
+    if not mod or not cli:
+        return _r(False, "读不到 lib/deliver.py 或 scripts/deliver.py")
+
+    problems = []
+    if not re.search(r"def build_chain\(res", mod):
+        problems.append("缺 build_chain 单一事实源入口")
+    if '"rootcause": render_rootcause' not in mod or '"eightd": render_eightd' not in mod:
+        problems.append("四渲染器注册表不完整（工艺/根因/SOP+FMEA/8D 必须齐全）")
+    # 判据必须钉住 V7 的**守卫与比对逻辑**，不能只查错误文案字符串——
+    # 变异只改守卫(if d4 and cands -> if False)时，文案还在，字符串判据会假绿。
+    if not re.search(r"if d4 and cands:\s*\n\s*top_name\s*=\s*str\(cands\[0\]", mod):
+        problems.append("缺 V7 措施与榜首根因同源判据（跨阶段脱节抓不到）")
+    if "tgt != top_name" not in mod:
+        problems.append("V7 缺措施目标与榜首根因的实际比对")
+    if "chain_id" not in mod or "chain_id" not in cli:
+        problems.append("证据链编号未贯穿模块与入口")
+    if not re.search(r"shutil\.copy2\(res_path,\s*archived\)", mod):
+        problems.append("缺事实源归档调用（证据链出处会指向临时目录，不可复核）")
+    # 校验失败必须非0退出（不许静默出四份矛盾报告）
+    if not re.search(r"return\s+0\s+if\s+r\[.ok.\]\s+else\s+2", cli):
+        problems.append("deliver 校验失败未以退出码2拒绝")
+    # 自检必须存在且带翻红用例
+    if not re.search(r"def _check\(\)", cli) or "翻红用例" not in cli:
+        problems.append("deliver 判据自检或翻红用例缺失")
+
+    if problems:
+        return _r(False, "；".join(problems))
+    return _r(True, "", {"ok": True})
+
+
 def rule_spec_entry_any_shape():
     """规格条目必须按"可能是单版本 dict、也可能是多版本 list"来消费。
 
@@ -5149,6 +5196,25 @@ AUDIT_RULES = [
                   _sub('    if args.gate and ev["new"]:',
                        '    if False:'),
                   os.path.join("scripts", "workspace_hygiene.py"))]),
+    Rule("四份交付物必须从单一事实源产出并跨阶段一致",
+         rule_deliver_chain_integrity,
+         "用户反复指出：逻辑散乱/证据链断裂/各阶段函数无法连贯验证/报告没有实证支撑。"
+         "根因是工艺/根因/SOP+FMEA/8D 各自为政、没有统一事实源与交叉校验。"
+         "deliver 编排把它们钉在同一 result.json 上，用 F-ID 贯穿并用 V1-V7 校验。"
+         "实测注入『榜首换人但措施没跟上』→ V7 翻红、退出码2。",
+         os.path.join("lib", "deliver.py"),
+         [          _mutant("V7 措施同源判据被摘掉（修复退化：跨阶段脱节抓不到）",
+                  _sub('    if d4 and cands:\n        top_name = str(cands[0].get("param_name") or "")',
+                       '    if False:  # MUTANT: V7 失效\n        pass\n        top_name = ""'),
+                  os.path.join("lib", "deliver.py")),
+          _mutant("校验失败被静默放行（修复退化：矛盾报告照样出）",
+                  _sub('    return 0 if r["ok"] else 2',
+                       '    return 0  # MUTANT: 校验失败也放行'),
+                  os.path.join("scripts", "deliver.py")),
+          _mutant("事实源归档被摘掉（修复退化：出处指向临时目录不可复核）",
+                  _sub('        shutil.copy2(res_path, archived)',
+                       '        pass  # MUTANT: 不归档事实源'),
+                  os.path.join("lib", "deliver.py"))]),
 ]
 
 
@@ -5746,6 +5812,40 @@ def flow_defectchar(args):
     print("说明：%s" % rep["note"])
     print("=" * 68)
     return 0
+
+
+def flow_deliver(args):
+    """四份连贯交付物：从 result.json 单一事实源产出并交叉校验。"""
+    sys.path.insert(0, ROOT)
+    from lib import deliver as D
+
+    rp = getattr(args, "result", None)
+    if not rp:
+        print("deliver 必须给 --result（result.json 或其所在目录）")
+        return 2
+    if os.path.isdir(rp):
+        rp = os.path.join(rp, "result.json")
+    if not os.path.exists(rp):
+        print("结果文件不存在：%s（先跑 analyze 产出 result.json）" % rp)
+        return 2
+    # --out 与 --outdir 都接受（config 用 --out，deliver 兼容之）
+    _target = getattr(args, "out", None) or getattr(args, "outdir", "output")
+    outdir = os.path.abspath(_target)
+    r = D.deliver(rp, outdir)
+    print("=" * 68)
+    print("端到端连贯交付 · 证据链 %s" % r["chain_id"])
+    print("=" * 68)
+    print("登记事实 %d 条｜四份交叉校验 %s"
+          % (r["fact_count"], "通过" if r["ok"] else "未通过"))
+    for x in r["violations"]:
+        print("  ✗ %s" % x)
+    for k, p in r["files"].items():
+        print("  · %-10s %s" % (k, p))
+    print("  · chain      %s" % r["chain_path"])
+    print("=" * 68)
+    if not r["ok"]:
+        print("⚠ 交叉校验未通过：交付物存在互相矛盾的结论，禁止对外。")
+    return 0 if r["ok"] else 2
 
 
 def flow_fmea(args):
@@ -6551,11 +6651,12 @@ def main(argv=None):
     ap = argparse.ArgumentParser(
         description="newenergy-fde 唯一入口编排器（流程代码化 + 证据落盘）")
     ap.add_argument("flow",
-                    choices=["audit", "verify", "analyze", "release", "config",
+                    choices=["audit", "verify", "analyze", "deliver", "release", "config",
                              "kb", "ops", "reliability", "fmea",
                              "window", "toolmatch", "recipe", "defectchar"],
                     help="audit=约定落地核查  verify=质量闸门  "
-                         "analyze=交付主流程  release=发布  "
+                         "analyze=交付主流程  "
+                         "deliver=四份连贯交付物(工艺/根因/SOP+FMEA/8D)  release=发布  "
                          "config=可调参数清单与企业规格模板  "
                          "kb=知识生命周期与出处覆盖率审计  "
                          "ops=可观测性运维视图（结构化日志回读）  "
@@ -6566,7 +6667,8 @@ def main(argv=None):
                          "recipe=配方对比与切换影响  "
                          "defectchar=缺陷表征结果接入（不解读图像）")
     ap.add_argument("--input", "-i", nargs="+", help="analyze：数据文件")
-    ap.add_argument("--outdir", "-o", default="output", help="analyze：输出目录")
+    ap.add_argument("--outdir", "-o", default="output", help="analyze/deliver：输出目录")
+    ap.add_argument("--result", help="deliver：result.json 或其所在目录（唯一事实源）")
     ap.add_argument("--target", help="analyze：目标指标列")
     ap.add_argument("--process", help="analyze：工序 key")
     ap.add_argument("--defect", help="analyze：缺陷类型")
@@ -6682,6 +6784,8 @@ def main(argv=None):
         return flow_reliability(args)
     if args.flow == "fmea":
         return flow_fmea(args)
+    if args.flow == "deliver":
+        return flow_deliver(args)
     if args.flow == "window":
         return flow_window(args)
     if args.flow == "toolmatch":
