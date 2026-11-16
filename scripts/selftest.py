@@ -6271,6 +6271,57 @@ def test_deliver_chain():
     check("deliver 拦住跨阶段脱节(措施≠榜首)",
           (not ok2) and any("V7" in x for x in vio2), str(vio2)[:160])
 
+    # 以下四条是实测交付物里真出现过的缺陷：闸门只比账本内部时会自洽假绿，
+    # 必须拿独立来源（warnings / 渲染正文 / pareto.note / fmea.rows）交叉验。
+    stale = json.loads(json.dumps(res))
+    stale["warnings"] = ["根因归因不可用：榜首证据分 0.06 低于门槛"]
+    ok3, vio3 = D.validate_chain(chain, stale)
+    check("deliver 拦住旧告警与新根因并存",
+          (not ok3) and any("V8" in x for x in vio3), str(vio3)[:160])
+    ok4, vio4 = D.validate_chain(
+        chain, res, rendered={"01": "## 1. A\n## 3. C\n****\n{'rule': 1}\n见第 10 节"})
+    check("deliver 拦住破损排版与字典原文",
+          (not ok4) and sum(1 for x in vio4 if "V9" in x) >= 4, str(vio4)[:160])
+    dishonest = json.loads(json.dumps(res))
+    dishonest["pareto"] = {"top": {"item": "中部", "pct": 38.5},
+                           "note": "按「位置」对目标的累计值拆解"}
+    dc = D.build_chain(dishonest, source_path="result.json")
+    dc["facts"]["F-SIG-P1"]["claim"] = "不良结构首要项＝中部"
+    ok5, vio5 = D.validate_chain(dc, dishonest)
+    check("deliver 拦住把测量值累计写成不良数",
+          (not ok5) and any("V10" in x for x in vio5), str(vio5)[:160])
+    hollow = json.loads(json.dumps(res))
+    hollow["eightd"]["fmea"]["rows"][0]["content"] = "（待填写）"
+    ok6, vio6 = D.validate_chain(D.build_chain(hollow, source_path="result.json"), hollow)
+    check("deliver 拦住零实证的 FMEA",
+          (not ok6) and any("V11" in x for x in vio6), str(vio6)[:160])
+
+
+def test_summary_and_fmea_evidence():
+    """摘要与 FMEA 必须携带可核对的实证，不能靠空占位交差。"""
+    print("\n[摘要口径与 FMEA 实证]")
+    from lib import pipeline as P, eightd as E
+    spc = [{"column": "P%d" % i, "param_name": "参数%d" % i,
+            "violations": [{"rule": 1, "count": 1}]} for i in range(5)]
+    line = [x for x in P.build_summary({"process_name": "工序A", "shape": [8, 6],
+                                        "spc": spc}) if x.startswith("SPC 判异")][0]
+    check("摘要列出全部判异参数（不是只列前三个）",
+          all("参数%d" % i in line for i in range(5)), line)
+    pareto = {"top": {"item": "尾部", "pct": 93.3},
+              "note": "按位置对目标的累计值拆解（连续量，非缺陷数）"}
+    line2 = [x for x in P.build_summary({"process_name": "工序A", "shape": [8, 6],
+                                         "pareto": pareto}) if "首位" in x][0]
+    check("累计量 Pareto 明示非不良数", "非不良数" in line2, line2)
+    lead = {"param_name": "位置 = 尾部", "evidence_score": 0.691,
+            "source": "单元级异常检验", "note": "显著偏低",
+            "detail": {"level": "尾部", "mean": 7.389, "others_mean": 11.97,
+                       "p_adj": 6.09e-110}}
+    fm = E.derive_d7_fmea({"target": "Y(mm)"}, lead, None)
+    c0, c1 = fm["rows"][0]["content"], fm["rows"][1]["content"]
+    check("FMEA 失效模式带可测量数据", "7.389" in c0 and "p=" in c0, c0[:100])
+    check("FMEA 潜在原因带证据分与出处", "0.691" in c1 and "单元级异常检验" in c1,
+          c1[:100])
+
 
 def test_workspace_hygiene_gate():
     """工作区卫生判据：清理不能靠人肉 ls，必须有机读判据且接进门禁。
@@ -6507,6 +6558,7 @@ if __name__ == "__main__":
     test_shift_scan_status()
     test_workspace_hygiene_gate()
     test_deliver_chain()
+    test_summary_and_fmea_evidence()
     test_rootcause_chain_consistency()
     test_temporal_precedence()
     test_quality_manager_guide()

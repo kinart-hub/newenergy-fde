@@ -23,6 +23,17 @@ import io
 import datetime
 
 
+def _caption(text):
+    """表格说明加粗，但不制造嵌套 `**`。
+
+    实测：说明文本自身含 `**局部硬件状态**` 这类强调时，外面再套一层 `**`
+    会渲染成 `**...**局部硬件状态**...`，Markdown 直接破相。此处只在文本
+    本来没有强调标记时加粗；有就原样输出，语义不丢、排版不乱。
+    """
+    s = str(text or "")
+    return s if "**" in s else "**%s**" % s
+
+
 def _fmt(v, nd=4):
     if v is None:
         return "—"
@@ -97,7 +108,7 @@ class Report(object):
         if t == "table":
             lines = []
             if b.get("caption"):
-                lines.append("**%s**" % b["caption"])
+                lines.append(_caption(b["caption"]))
                 lines.append("")
             hs = b["headers"]
             lines.append("| " + " | ".join(str(h) for h in hs) + " |")

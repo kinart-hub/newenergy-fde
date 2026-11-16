@@ -3553,9 +3553,14 @@ def rule_deliver_chain_integrity():
       2. V7 措施目标必须 == 榜首根因（跨阶段同源，实测注入断裂能翻红）
       3. 四个渲染器都注册且都标注 chain_id（证据链可见）
       4. deliver 入口在校验失败时退出码非 0（不许静默出矛盾报告）
+      5. V8–V11 钉住实测交付物里漏出的四类真缺陷：旧告警没撤 / 破损排版 /
+         Pareto 口径冒充不良数 / FMEA 零实证。少了任一守卫，13 步门禁仍全绿但
+         交付物照旧自相矛盾（2026-11-16 实测：全绿报告里仍有这些缺陷）。
     """
     mod = _read(os.path.join("lib", "deliver.py")) or ""
     cli = _read(os.path.join("scripts", "deliver.py")) or ""
+    pipe = _read(PIPELINE_FILE) or ""
+    e8 = _read(os.path.join("lib", "eightd.py")) or ""
     if not mod or not cli:
         return _r(False, "读不到 lib/deliver.py 或 scripts/deliver.py")
 
@@ -3570,6 +3575,27 @@ def rule_deliver_chain_integrity():
         problems.append("缺 V7 措施与榜首根因同源判据（跨阶段脱节抓不到）")
     if "tgt != top_name" not in mod:
         problems.append("V7 缺措施目标与榜首根因的实际比对")
+    # 判据必须钉守卫本身（不是只查文案）：变异摘掉 if 时文案还在，字符串假绿。
+    if 'w.startswith("根因归因不可用")' not in mod:
+        problems.append("缺 V8 旧告警与重算标志同源判据")
+    if 'if "****" in text:' not in mod or "字典原文当结论输出" not in mod:
+        problems.append("缺 V9 破损排版/字典原文守卫")
+    if "_pareto_is_measure_sum(par)" not in mod or "不良结构首要项" not in mod:
+        problems.append("缺 V10 Pareto 口径诚实守卫")
+    if "lead_ev not in fmea_text" not in mod:
+        problems.append("缺 V11 FMEA 实证守卫")
+    if "while _stale_warning in _ws:" not in pipe or "_ws.remove(_stale_warning)" not in pipe:
+        problems.append("缺旧告警撤销实现（重算标志后 warning 仍说归因不可用）")
+    if 'r"第\\s*(\\d+)\\s*节"' not in mod or "            if _xref:" not in mod:
+        problems.append("缺 V9 悬空章节引用守卫（8D 单发时『第10节』并不存在）")
+    if "统计候选已落定（待现场验证）" not in mod:
+        problems.append("根因状态不得只写『已落定』（会被读成现场真因已确认）")
+    if 'root["status"] = _rc_status' not in pipe:
+        problems.append("根因环节未落统一 status（契约会报算过却说不清）")
+    if "指标偏离贡献与 Pareto（非不良数）" not in pipe:
+        problems.append("主报告第 7 节不得把连续量累计写成不良分类")
+    if 'def classify_root_label(' not in e8 or "classify_root_label(lead, res)" not in e8:
+        problems.append("5M1E 归属不得直接输出内部 kind（position/param 不是人话）")
     if "chain_id" not in mod or "chain_id" not in cli:
         problems.append("证据链编号未贯穿模块与入口")
     if not re.search(r"shutil\.copy2\(res_path,\s*archived\)", mod):
@@ -5200,8 +5226,9 @@ AUDIT_RULES = [
          rule_deliver_chain_integrity,
          "用户反复指出：逻辑散乱/证据链断裂/各阶段函数无法连贯验证/报告没有实证支撑。"
          "根因是工艺/根因/SOP+FMEA/8D 各自为政、没有统一事实源与交叉校验。"
-         "deliver 编排把它们钉在同一 result.json 上，用 F-ID 贯穿并用 V1-V7 校验。"
-         "实测注入『榜首换人但措施没跟上』→ V7 翻红、退出码2。",
+         "deliver 编排把它们钉在同一 result.json 上，用 F-ID 贯穿并用 V1-V11 校验。"
+         "实测注入『榜首换人但措施没跟上』→ V7 翻红、退出码2；"
+         "V8-V11 钉住全绿门禁漏掉的旧告警/破损排版/Pareto 口径/FMEA 空实证。",
          os.path.join("lib", "deliver.py"),
          [          _mutant("V7 措施同源判据被摘掉（修复退化：跨阶段脱节抓不到）",
                   _sub('    if d4 and cands:\n        top_name = str(cands[0].get("param_name") or "")',
@@ -5214,6 +5241,26 @@ AUDIT_RULES = [
           _mutant("事实源归档被摘掉（修复退化：出处指向临时目录不可复核）",
                   _sub('        shutil.copy2(res_path, archived)',
                        '        pass  # MUTANT: 不归档事实源'),
+                  os.path.join("lib", "deliver.py")),
+          _mutant("V8 旧告警判据被摘掉（修复退化：新根因配旧归因不可用）",
+                  _sub('    if d4 and any(w.startswith("根因归因不可用") for w in warns):',
+                       '    if False:  # MUTANT: V8 失效'),
+                  os.path.join("lib", "deliver.py")),
+          _mutant("V9 排版判据被摘掉（修复退化：破损 Markdown 出关）",
+                  _sub('            if "****" in text:',
+                       '            if False:  # MUTANT: V9 失效'),
+                  os.path.join("lib", "deliver.py")),
+          _mutant("V11 FMEA 实证判据被摘掉（修复退化：空措施出关）",
+                  _sub('        if (not lead_name or (lead_name not in fmea_text and lead_ev not in fmea_text)):',
+                       '        if False:  # MUTANT: V11 失效'),
+                  os.path.join("lib", "deliver.py")),
+          _mutant("旧告警撤销被摘掉（修复退化：新根因配旧归因不可用）",
+                  _sub('                while _stale_warning in _ws:',
+                       '                if False:  # MUTANT: 旧告警不撤'),
+                  PIPELINE_FILE),
+          _mutant("悬空章节引用守卫被摘掉（修复退化：8D 引用不存在的第10节）",
+                  _sub('            if _xref:',
+                       '            if False:  # MUTANT: 悬空引用不拦'),
                   os.path.join("lib", "deliver.py"))]),
 ]
 

@@ -84,6 +84,35 @@ def _check():
     ok6, vio6 = D.validate_chain(c6, broken)
     ck((not ok6) and any("V7" in x for x in vio6), "D5措施须与榜首根因同源")
 
+    # 翻红用例5：根因已落定但 warnings 还留旧「归因不可用」告警 → 自相矛盾
+    stale = json.loads(json.dumps(res))
+    stale["warnings"] = ["根因归因不可用：榜首证据分 0.06 低于门槛"]
+    ok5, vio5 = D.validate_chain(chain, stale)
+    ck((not ok5) and any("V8" in x for x in vio5), "标志重算后旧告警必须撤掉")
+
+    # 翻红用例6：破损 Markdown / 字典原文 / 断号章节，任一出现都不许出关
+    ok6, vio6 = D.validate_chain(
+        chain, res, rendered={"01": "## 1. A\n## 3. C\n样本规模：[10, 3]\n****\n{'rule': 1}\n见第 10 节"})
+    ck((not ok6) and sum(1 for x in vio6 if "V9" in x) >= 5,
+       "交付物文本缺陷必须翻红（强调/原文/规模/断号/悬空引用）")
+
+    # 翻红用例7：测量值累计的 Pareto 不许写成「不良结构首要项」
+    misleading = json.loads(json.dumps(res))
+    misleading["pareto"] = {"top": {"item": "中部", "pct": 38.5},
+                            "note": "按「位置」对目标的累计值拆解"}
+    mc = D.build_chain(misleading, source_path="result.json")
+    # 注入缺陷：账本把测量值累计写成「不良结构」——build_chain 自己已写对，
+    # 必须篡改账本，否则校验器根本没被触达（假绿）。
+    mc["facts"]["F-SIG-P1"]["claim"] = "不良结构首要项＝中部"
+    ok7, vio7 = D.validate_chain(mc, misleading)
+    ck((not ok7) and any("V10" in x for x in vio7), "Pareto 口径不得冒充不良数")
+
+    # 翻红用例8：根因已落定，FMEA 全空 → 无实证的空措施
+    hollow = json.loads(json.dumps(res))
+    hollow["eightd"]["fmea"]["rows"][0]["content"] = "（待填写）"
+    ok8, vio8 = D.validate_chain(D.build_chain(hollow, source_path="result.json"), hollow)
+    ck((not ok8) and any("V11" in x for x in vio8), "FMEA 不得零实证")
+
     # 无候选时不得假装有榜首根因
     empty = json.loads(json.dumps(res))
     empty["rootcause"]["candidates"] = []

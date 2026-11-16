@@ -19,7 +19,7 @@
    让负责人在卡片上现场填；编一个假名字（"质量经理"）反而会让现场以为
    已经指派过了，这是最危险的失实。
 2. **设定值不替人拍**。D5 明确"不给参数设定值，由 DOE 待验证方案给"。卡片里
-   "建议取值/范围"这一栏，有 DOE 结论就填 DOE 结论，没有就写"见报告第 10 节 DOE"，
+   "建议取值/范围"这一栏，有 DOE 结论就填 DOE 结论，没有就写"见随附分析报告的 DOE 方案"，
    不自己拍一个数。
 
 导出：JSON 给 MES/工单系统对接，CSV 给现场打印后在白板上回填。
@@ -156,7 +156,7 @@ def _d6_cards(d6):
         "category": "验证方案",
         "target": metric,
         "objective": "按下方成功判据，用足够样本验证永久对策是否真的改善「%s」" % metric,
-        "suggested_value": None,     # 设定值由 DOE 给，见报告第 10 节
+        "suggested_value": None,     # 设定值由 DOE 给，见随附分析报告的 DOE 方案
         "verification_batches": batches,
         "success_criteria": "; ".join(d6.get("criteria") or []),
         "owner_role": None,          # 待填：谁执行验证由现场排产定

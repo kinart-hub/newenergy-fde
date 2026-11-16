@@ -17,7 +17,7 @@
 
 2. **D5–D8 只生成「待验证方案 / 动作清单 / 检查清单」，不生成结论。**
    - D5 给对策**方向与类别**，**绝不给具体参数设定值**（那是决策，且 DOE 边界外下单参数有风险）。
-     具体数值只能来自第 10 节 DOE 的**待验证实验方案**。
+     具体数值只能来自随附分析报告的 DOE **待验证实验方案**。
    - D6 给**验证方案**（样本量、判定标准、周期、副作用观察项），不是验证结果。
    - D7 给**文件化动作清单**（根因类型 → 必改文件映射），这是确定性映射，最适合自动化。
    - D8 给**结案条件**，未全部满足不得结案。
@@ -216,7 +216,7 @@ def computed_reference(res):
     if eq is None:
         for gc in (res.get("group_compare") or []):
             if gc.get("dimension"):
-                eq = "按「%s」分层（详见报告第 9 节）" % gc["dimension"]
+                eq = "按「%s」分层（详见随附工艺分析报告）" % gc["dimension"]
                 break
     ref["where_equip"] = eq
 
@@ -480,9 +480,11 @@ PCA_BY_KIND = {
         ("检测方法", "复核检测方法与抽样方案是否能检出该类缺陷"),
     ],
     "position": [
-        ("设备维护", "该位置对应的工装/压针/加热板/排版单元做点检与保养；"
+        # 不写某行业的具体部件（压针/加热板/排版单元/电池片）：位置类根因
+        # 跨工序通用，部件名属产品参数，必须由现场按设备实际构成填写。
+        ("设备维护", "对该位置对应的承载/夹持/加工单元做点检与保养（具体部件由现场填写）；"
                      "位置聚集通常指向**局部硬件状态**，而不是全局参数"),
-        ("来料管控", "反查该位置所用电池片/硅片的供应商与批次，确认是否与来料批次重合"),
+        ("来料管控", "反查该位置所用物料的供应商与批次，确认是否与来料批次重合"),
     ],
     "unknown": [
         ("验证优先", "根因归属未定，**先做验证实验再谈对策**；"
@@ -503,6 +505,19 @@ _KIND_HINT = (
 # 或**料（该位置对应的那批电池片）**。归成 unknown 会让 D5/D7 掉进"什么都说不了"的分支，
 # 反而丢信息；归成 position 则能给出两条可验证的方向。
 _POSITION_WORDS = ("列", "行", "位", "区", "zone", "col", "row", "string", "位置")
+
+
+def classify_root_label(lead, res):
+    """把内部 kind 翻成 5M1E 人话；内部值（position/param）不许直接印给客户。"""
+    kind = classify_root(lead, res)
+    return {
+        "equipment": "机（设备/工装）",
+        "material": "料（来料/批次）",
+        "method": "法（作业方法）",
+        "measurement": "测（测量系统）",
+        "param": "机/参数（须现场确认可控性）",
+        "position": "机/料（位置聚集：具体归属待现场判定）",
+    }.get(kind, "待判定（证据不足，不强行归 5M1E）")
 
 
 def classify_root(lead, res):
@@ -542,7 +557,7 @@ def derive_d5(res, lead=None):
             "category": cat,
             "target": (lead.get("param_name") or "—") if lead else "（根因未确认）",
             "action": detail,
-            "verify_by": "小批验证 / DOE（见报告第 10 节）",
+            "verify_by": "小批验证 / DOE（见随附分析报告的 DOE 待验证方案）",
             "approver": "工艺负责人 + 设备负责人 + 质量经理",
             "signed": False,
         })
@@ -658,8 +673,8 @@ D7_MAP = {
     ],
     "position": [
         ("设备保养项按位置细化", "把该位置纳入开班点检项，保养记录要能定位到具体位置"),
-        ("来料批次追溯", "记录每个位置所用电池片/硅片的批次，保证位置聚集可反查到料"),
-        ("增加位置维度的 SPC/EL 抽检", "按位置分层监控，避免整体均值掩盖局部聚集"),
+        ("来料批次追溯", "记录每个位置所用物料的批次，保证位置聚集可反查到料"),
+        ("增加位置维度的分层抽检", "按位置分层监控，避免整体均值掩盖局部聚集"),
     ],
     "unknown": [
         ("根因确认后再文件化", "**根因未确认就改文件，等于把猜测固化成标准**"),
@@ -766,7 +781,7 @@ def classify_three_causes(res, lead):
         "D4 未通过证据闸门，根因留空"
     # 流出原因：候选里若指向测量/检验环节则给出，否则给方向
     escape, escape_ev = "（待判定）", \
-        "对照第 9 节分层与现行检验方案：现有检验能否检出该类缺陷？"
+        "对照随附工艺分析报告的分层结论与现行检验方案：现有检验能否检出该类缺陷？"
     for c in cands:
         nm = str(c.get("param_name") or "")
         if any(w in nm for w in ("测量", "检验", "量具", "MSA", "msa")):
@@ -798,7 +813,7 @@ def classify_three_causes(res, lead):
 # D2+D4 / D4 / D5，且都要具体可测量；「加强自检」这类虚措施是退稿项。
 FMEA_ROWS = [
     ("失效模式", "对应 D2 问题描述 + D4 根本原因",
-     "必须具体可测量（如「螺纹滑牙力矩<10N·m」）；写「外观不良」是退稿项"),
+     "必须具体可测量（如「目标指标低于规格下限 X」）；写「外观不良」是退稿项"),
     ("潜在原因", "对应 D4 根本原因分析",
      "用技术语言描述（如「刀具磨损导致中径偏大」）；停留在「操作失误」等于没分析"),
     ("现行控制", "对应 D5 永久对策",
@@ -830,13 +845,41 @@ def derive_d7_fmea(res, lead=None, card=None):
         defect = card.get("what")
     if not defect:
         defect = (res.get("rootcause") or {}).get("defect")
+    # FMEA 不能全是「（待填写）」：d4_ok 时数据里已有可测量的差异证据，
+    # 至少要把它写进失效模式/潜在原因，否则 03 报告叫「改善措施」却零实证。
+    # S/O/D 与现行控制没有台账支撑，仍留空并说明原因——不代填评分。
+    target = res.get("target") or "分析目标"
+    ld = (lead or {}).get("detail") or {}
+    mode = None
+    if ld.get("mean") is not None and ld.get("others_mean") is not None:
+        mode = "%s：%s 均值 %.4g，其余水平 %.4g" % (
+            target, ld.get("level") or "异常水平", ld["mean"], ld["others_mean"])
+        p = ld.get("p_adj") if ld.get("p_adj") is not None else ld.get("p")
+        if p is not None:
+            mode += "，校正 p=%.3g" % p
+    elif target and defect:
+        mode = "%s：%s（须按企业规格改写为可测量判定）" % (target, defect)
+    if mode:
+        mode += "；须按企业规格改写为可测量表述"
+    cause = None
+    if lead:
+        cause = "%s（证据分 %.3f，来源：%s）" % (
+            lead.get("param_name") or "—",
+            float(lead.get("evidence_score") or 0),
+            lead.get("source") or "数据分析")
+        if lead.get("note"):
+            cause += "；%s" % lead["note"]
+        cause += "；须改写成技术语言并现场验证"
     rows = []
     for item, src, req in FMEA_ROWS:
         pre = "（待填写）"
-        if item == "失效模式" and defect:
-            pre = "%s（来自 D2/D4，**须改写成可测量表述**）" % defect
-        elif item == "潜在原因" and lead:
-            pre = "%s（来自 D4 首要候选，**须改写成技术语言**）" % (lead.get("param_name") or "—")
+        if item == "失效模式":
+            pre = mode or ("%s（来自 D2/D4，**须改写成可测量表述**）" % defect if defect
+                           else "（待填写：数据未提供可测量的失效描述）")
+        elif item == "潜在原因" and cause:
+            pre = cause
+        elif item == "现行控制" and not card:
+            pre = "（待填写：本次数据未包含现行检验方案与检出能力）"
         rows.append({"item": item, "source": src, "content": pre, "requirement": req})
     return {
         "defect": defect or "（待填：来自 D2 问题描述）",
@@ -1168,7 +1211,8 @@ def render_8d(rep, res, card=None, conflicts=None, parent=None):
     # ---- D3 ----
     s = rep.section("D3 临时遏制措施（ICA）", level=3)
     hs = res.get("unit_hotspots") or []
-    scope = "按第 9 节分层结论锁定嫌疑单元" if hs else "按第 7/9 节 Pareto 与分层结果界定"
+    scope = ("按随附工艺分析报告的分层结论锁定嫌疑单元" if hs
+             else "按随附报告的 Pareto 与分层结果界定")
     rep.table(s, ["#", "措施", "责任人", "完成日期", "验证结果"],
               [["1", "隔离异常时段/批次产品（范围：%s）" % scope, "（待指定）", "（待定）", "（待填）"],
                ["2", "加严检验：该参数抽检频次提至 2 倍或 100%", "（待指定）", "（待定）", "（待填）"],
@@ -1189,10 +1233,27 @@ def render_8d(rep, res, card=None, conflicts=None, parent=None):
     # ---- D4 ----
     s = rep.section("D4 根本原因", level=3)
     if ok4 and lead:
+        # 知识库机理没有命中时不能写「—」就完事：数据里已有的统计证据
+        # （水平均值、校正 p 值、效应量）本身就是 D4 的证据，只是**不是机理**。
+        # 分开写清楚，既不留空，也不把统计关联冒充工艺机理。
+        _mech = (root or {}).get("mechanism")
+        if not _mech:
+            _d = lead.get("detail") or {}
+            if _d.get("mean") is not None and _d.get("others_mean") is not None:
+                _p = _d.get("p_adj") if _d.get("p_adj") is not None else _d.get("p")
+                _mech = "数据证据：该水平均值 %.4g vs 其余 %.4g" % (
+                    _d["mean"], _d["others_mean"])
+                if _p is not None:
+                    _mech += "，校正后 p=%.3g" % _p
+                _mech += "；机理待现场确认（数据只证明差异，不证明为什么）"
+            elif lead.get("note"):
+                _mech = "数据证据：%s；机理待现场确认" % lead["note"]
+            else:
+                _mech = "—（机理未识别，禁止用统计关联冒充机理）"
         rep.kv(s, [("最可能根因", "%s（综合得分 %.2f）" % (lead.get("param_name") or "—",
                                                     lead.get("score") or 0)),
-                   ("机理", root.get("mechanism") or "—"),
-                   ("归属（5M1E）", classify_root(lead, res))])
+                   ("机理", _mech),
+                   ("归属（5M1E）", classify_root_label(lead, res))])
     else:
         rep.kv(s, [("D4 最可能根因", "【留空】%s" % why4)])
     # 三类原因分离：行业口径要求 D4 至少区分发生/流出/系统三层。
@@ -1228,7 +1289,7 @@ def render_8d(rep, res, card=None, conflicts=None, parent=None):
                for r in d5["rows"]],
               caption=d5["note"])
     rep.callout(s, "**本 Skill 不下发任何参数到设备。** "
-                "具体设定值只能来自第 10 节 DOE 的待验证实验方案，并经企业审批流程。", "warn")
+                "具体设定值只能来自随附分析报告的 DOE 待验证方案，并经企业审批流程。", "warn")
 
     # ---- D6 ----
     s = rep.section("D6 实施与验证（方案）", level=3)

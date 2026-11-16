@@ -20,6 +20,8 @@ import json
 import hashlib
 import datetime
 
+from . import status as ST
+
 SCHEMA = "fde-chain-v1"
 
 # 四份交付物的稳定文件名（只定义命名，不含任何内容模板）
@@ -42,6 +44,52 @@ def _canon(obj):
 
 def _sha(obj):
     return hashlib.sha256(_canon(obj).encode("utf-8")).hexdigest()[:16]
+
+
+def _shape_text(shape):
+    if isinstance(shape, (list, tuple)) and len(shape) >= 2:
+        return "%s 行 × %s 列" % (shape[0], shape[1])
+    return str(shape or "—")
+
+
+def _spc_claim(sp):
+    """把 Python 字典原文改写成人能读的判异事实（原文仍留在账本里可机查）。"""
+    col = sp.get("column") or sp.get("param_name") or "—"
+    parts = []
+    for v in (sp.get("violations") or sp.get("rules") or []):
+        if isinstance(v, dict):
+            rule = v.get("rule")
+            desc = str(v.get("desc") or v.get("hint") or "").strip()
+            n = v.get("count")
+            if n is None:
+                n = len(v.get("indexes") or [])
+            parts.append("规则%s（%s）%s点" % (
+                rule if rule is not None else "?", desc or "未命名规则", n))
+        else:
+            parts.append(str(v))
+    sample = ""
+    first = next((v for v in (sp.get("violations") or []) if isinstance(v, dict)), None)
+    if first and first.get("indexes"):
+        sample = "；样例样本序号=%s" % ", ".join(str(i) for i in first["indexes"][:8])
+    return "%s 判异：%s%s" % (col, "；".join(parts) or "无判异规则", sample)
+
+
+def _pareto_is_measure_sum(par):
+    note = str((par or {}).get("note") or "")
+    return ("累计值" in note
+            or ("累计" in note and ("非缺陷数" in note or "非不良数" in note)))
+
+
+def _pareto_claim(par):
+    top = (par or {}).get("top")
+    if not top:
+        return "本次无可拆解的 Pareto 项"
+    if not isinstance(top, dict):
+        return "Pareto 首要项＝%s（上游只给了名称，无占比与口径）" % top
+    label = "指标累计贡献首位（非不良数）" if _pareto_is_measure_sum(par) else "不良结构首要项"
+    return "%s＝%s（占比 %.1f%%；口径：%s）" % (
+        label, top.get("item"), float(top.get("pct") or 0),
+        (par or {}).get("note") or "未登记口径")
 
 
 def build_chain(res, source_path=None):
@@ -73,12 +121,11 @@ def build_chain(res, source_path=None):
         if not viol:
             continue
         add("F-SIG-%02d" % (i + 1), "signal", "spc[%d]" % i,
-            "%s 触发判异：%s" % (col, "、".join(str(v) for v in viol)[:120]),
-            column=col, violations=viol)
+            _spc_claim(sp), column=col, violations=viol)
     par = res.get("pareto") or {}
     if par.get("top"):
         add("F-SIG-P1", "signal", "pareto.top",
-            "不良结构首要项＝%s" % str(par["top"])[:120], item=par["top"])
+            _pareto_claim(par), item=par["top"], note=par.get("note"))
 
     # 根因候选事实：榜首固定 F-CAU-01，其余顺延（保证跨报告引用同一个 ID）
     cands = rc.get("candidates") or []
@@ -153,7 +200,10 @@ def _meta(chain):
         "事实源": os.path.basename(chain.get("source_result") or "result.json"),
         "工序": (f.get("F-CTX-02") or {}).get("value") or "未知工序",
         "分析目标": (f.get("F-CTX-01") or {}).get("value") or "—",
-        "根因状态": "已落定" if chain["d4_ok"] else "未确认（不得作 D4）",
+        # 统计候选落定 ≠ 现场真因落定。旧文案只写「已落定」，与摘要里
+        # 「置信度中低」并排时像自相矛盾；这里把层次写清楚。
+        "根因状态": ("统计候选已落定（待现场验证）" if chain["d4_ok"]
+                 else "未确认（不得作 D4）"),
     }
 
 
@@ -187,10 +237,10 @@ def render_process(chain, res):
     from lib import report as R
     rep = R.Report("工艺分析报告", _meta(chain))
     s = rep.section("1. 数据与工序")
-    rep.kv(s, [("样本规模", str(res.get("shape") or "—")),
+    rep.kv(s, [("样本规模", _shape_text(res.get("shape"))),
                ("工序", (chain["facts"].get("F-CTX-02") or {}).get("claim")),
                ("分析目标", (chain["facts"].get("F-CTX-01") or {}).get("claim"))])
-    s = rep.section("2. 判异与不良结构")
+    s = rep.section("2. 判异与指标结构")
     sig = [v for v in chain["facts"].values() if v["kind"] == "signal"]
     if sig:
         rep.bullets(s, ["[%s] %s" % (v["id"], v["claim"]) for v in sig])
@@ -237,8 +287,10 @@ def render_rootcause(chain, res):
     if rc.get("five_why"):
         s = rep.section("3. 5Why 链")
         rep.text(s, str(rc["five_why"])[:1200])
-    _fact_block(rep, chain, "4. 本报告引用的事实（证据链）", ("context", "signal", "rootcause"))
-    rep.callout(rep.section("5. 边界"),
+    _fact_no = len(rep.sections) + 1
+    _fact_block(rep, chain, "%d. 本报告引用的事实（证据链）" % _fact_no,
+                ("context", "signal", "rootcause"))
+    rep.callout(rep.section("%d. 边界" % (_fact_no + 1)),
                 "根因可能性 ≠ 现场真因。本报告与 8D/FMEA/SOP 共用证据链 %s；"
                 "最终归因须现场验证并签字。" % chain["chain_id"], "info")
     _stamp(rep)
@@ -325,6 +377,7 @@ RENDERERS = {
 # --------------------------------------------------------------------------
 def validate_chain(chain, res, rendered=None):
     """返回 (ok, violations)。每条违规都指出两个交付物之间具体不一致。"""
+    import re
     v = []
     f = chain["facts"]
     d4 = chain["d4_ok"]
@@ -383,6 +436,52 @@ def validate_chain(chain, res, rendered=None):
             tgt = str(r.get("target") or "")
             if tgt and tgt != top_name:
                 v.append("V7 D5措施[%d]目标「%s」≠榜首根因「%s」" % (i, tgt, top_name))
+
+    # V8 标志与告警同源时点：重算证据标志后，旧告警必须撤掉。
+    # 否则同一份 result 一边 d4_ok=True、一边 warnings 说「归因不可用」。
+    warns = [str(w) for w in (res.get("warnings") or [])]
+    if d4 and any(w.startswith("根因归因不可用") for w in warns):
+        v.append("V8 根因已落定，但 warnings 仍称归因不可用（标志与告警失配）")
+    if not d4 and (res.get("rootcause") or {}).get("status") == ST.SUCCESS \
+            and (res.get("rootcause") or {}).get("evidence_insufficient"):
+        v.append("V8 根因状态 SUCCESS 却带证据不足标志")
+
+    # V9 交付物可读性：原始 repr / 破损 Markdown / 断号章节，一律不许出关。
+    if rendered:
+        for name, text in rendered.items():
+            if "****" in text:
+                v.append("V9 %s 出现破损的 Markdown 强调标记（****）" % name)
+            if re.search(r"\{'[^']+':", text):
+                v.append("V9 %s 把字典原文当结论输出" % name)
+            if re.search(r"样本规模：\[\s*\d+\s*,\s*\d+\s*\]", text):
+                v.append("V9 %s 样本规模未格式化" % name)
+            _xref = re.findall(r"第\s*(\d+)\s*节", text)
+            if _xref:
+                v.append("V9 %s 引用了本交付物不存在的章节号：%s" % (name, _xref))
+            # 8D 有一节「## 0. 证据链声明」是前缀，不参与正文 1..N 编号
+            nums = [int(x) for x in re.findall(r"(?m)^##\s+(\d+)\.", text) if int(x) >= 1]
+            if nums and nums != list(range(1, len(nums) + 1)):
+                v.append("V9 %s 章节编号断裂：%s" % (name, nums))
+
+    # V10 Pareto 口径诚实：累计测量值不是不良数，不能标「不良结构」。
+    par = res.get("pareto") or {}
+    if _pareto_is_measure_sum(par):
+        _claim = str((f.get("F-SIG-P1") or {}).get("claim") or "")
+        if "不良结构" in _claim or "Pareto 首位" in _claim:
+            v.append("V10 Pareto 是测量值累计，账本却称不良结构")
+        for name, text in (rendered or {}).items():
+            if "不良结构首要项" in text or re.search(r"Pareto 首位：", text):
+                v.append("V10 %s 把测量值累计写成不良结构/Pareto 首位" % name)
+
+    # V11 FMEA 实证：根因已落定时，至少一行要带上榜首根因或其证据分，
+    # 不能整段「（待填写）」还叫「改善措施」。
+    if d4 and cands:
+        fmea_text = " ".join(str(r.get("content") or "")
+                             for r in ((e8.get("fmea") or {}).get("rows") or []))
+        lead_name = str(cands[0].get("param_name") or "")
+        lead_ev = "%.3f" % float(cands[0].get("evidence_score") or 0)
+        if (not lead_name or (lead_name not in fmea_text and lead_ev not in fmea_text)):
+            v.append("V11 FMEA 未引用榜首根因及其证据分（无实证的空措施）")
 
     return (not v), v
 

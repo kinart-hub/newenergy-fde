@@ -392,6 +392,10 @@ if _HAS8:
           E8.classify_root({"param_name": "电池列 = 7"}, {}))
     check("设备类归为 equipment",
           E8.classify_root({"param_name": "设备号 = CT-05"}, {}) == "equipment")
+    check("5M1E 归属不输出内部 kind",
+          "position" not in E8.classify_root_label({"param_name": "电池列 = 7"}, {})
+          and "机/料" in E8.classify_root_label({"param_name": "电池列 = 7"}, {}),
+          E8.classify_root_label({"param_name": "电池列 = 7"}, {}))
 
     # O7 D6 验证方案
     _d6 = E8.derive_d6({"spc": [{"column": "面密度", "sigma_within": 2.0}],

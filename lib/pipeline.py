@@ -175,7 +175,7 @@ if EV is not None and EV.__name__ != "lib.events":
 KB = PP.load_knowledge()
 _fmt = RPT._fmt
 
-ANALYZER_VERSION = "2.23.0"
+ANALYZER_VERSION = "2.24.0"
 
 
 # 空数据排查清单。
@@ -2259,10 +2259,19 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
         # data_driven 算标志时榜首还是弱相关的数据列；注入的候选可能带硬证据
         # （S4 实测：旧榜首 0.0649 判不足，注入后榜首 0.691、p_adj≈6e-110）。
         # 不重算 → 够格根因被藏，报告还拿新榜首去配旧的「低于门槛」文案。
+        _old_insufficient_reason = (root or {}).get("insufficient_reason")
         if root and QG.reevaluate_insufficiency(root):
             root.setdefault("notes", []).append(
                 "后注入的候选（位置聚集/单元热点）带硬统计证据，"
                 "已重算证据门槛：原「证据不足」标志解除，榜首可进入 D4。")
+            # 标志重算了，warnings 里那条按旧原因生成的告警也必须同步撤掉。
+            # 只改标志不改告警 = 同一份 result.json 一边说「根因已落定」、
+            # 一边说「根因归因不可用」，报告与摘要各取一半就自相矛盾。
+            if _old_insufficient_reason:
+                _stale_warning = "根因归因不可用：%s" % _old_insufficient_reason
+                _ws = result.setdefault("warnings", [])
+                while _stale_warning in _ws:
+                    _ws.remove(_stale_warning)
 
         # v1.11：负例判定。归一化之后所有工艺参数都解释不动目标 —— 真相是
         # "测试方法没归一"，不是"某个参数调错了"。此时必须明说没有根因。
@@ -2317,6 +2326,14 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
         else:
             result["msa_unverified"] = MSA.unverified_notice()
         result["msa"] = _msa
+        # 根因环节必须有统一状态，否则数据契约只报「算过却说不清算没算成功」，
+        # 下游无法区分 SUCCESS / INSUFFICIENT_DATA / NO_FINDING。
+        if root:
+            _rc_status = (ST.INSUFFICIENT_DATA if root.get("evidence_insufficient")
+                          else ST.SUCCESS if root.get("candidates")
+                          else ST.NO_FINDING)
+            root["status"] = _rc_status
+            root["status_text"] = ST.describe(_rc_status)
         result["rootcause"] = root
         gaps = RC.assess_gaps(work, defect_name, y_col, groups)
         # 必须把 root 传进去：置信度是**结论层面**的属性，
@@ -2366,6 +2383,19 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
             yv = work.numeric_column(y_col)
             gv = work.column(g)
             is_rate = any(k in PP._norm_name(y_col) for k in ["率", "rate", "yield", "percent", "%"])
+            # 连续指标不能直接求和当「不良贡献」：实测 S4 按少子寿命累计值，
+            # 榜首是「中部」，而显著偏低的异常在「尾部」——报告里两句话打架。
+            # 若榜首是分组水平且给出了方向（显著偏低/偏高），改按同一方向的
+            # 基线偏离量拆解，口径写明「非缺陷数」，让 Pareto 与根因指向一致。
+            _lead = ((root or {}).get("candidates") or [None])[0]
+            _ld = (_lead.get("detail") if isinstance(_lead, dict) else None) or {}
+            _dir_sign = 0
+            _dir_base = None
+            if (isinstance(_ld, dict) and _ld.get("level")
+                    and _ld.get("mean") is not None
+                    and _ld.get("others_mean") is not None and not is_rate):
+                _dir_sign = -1 if _ld["mean"] < _ld["others_mean"] else 1
+                _dir_base = S.quantile([v for v in yv if v is not None], 0.5)
             cnt_col = None
             for c in work.columns:
                 n = PP._norm_name(c)
@@ -2380,12 +2410,23 @@ def analyze(paths, outdir="output", target=None, process=None, defect=None,
                 k = str(b)
                 if is_rate and cnt is not None and cnt[i] is not None:
                     agg[k] = agg.get(k, 0) + (a / 100.0 if a > 1.5 else a) * cnt[i]
+                elif _dir_sign and _dir_base is not None:
+                    # 只累计与榜首异常同向、且超出中位基线的部分；反向波动不记贡献
+                    agg[k] = agg.get(k, 0) + max(0.0, (_dir_base - a) if _dir_sign < 0
+                                                else (a - _dir_base))
                 else:
                     agg[k] = agg.get(k, 0) + abs(a)
                 agg_n[k] = agg_n.get(k, 0) + 1
             pare = RC.pareto(agg)
+            _dir_used = bool(_dir_sign and _dir_base is not None
+                             and sum(agg.values()) > 0)
             if is_rate and cnt_col:
                 pare["note"] = "按「%s」拆解，使用 %s × %s 折算不良数" % (g, y_col, cnt_col)
+            elif _dir_used:
+                pare["note"] = ("按「%s」对 %s 相对基线 %.4f 的%s偏离累计拆解"
+                                "（连续量，非缺陷数；方向与榜首根因一致）"
+                                % (g, y_col, _dir_base,
+                                   "低侧" if _dir_sign < 0 else "高侧"))
             else:
                 # 无产量列时，比率类指标改为按"异常超出基线的部分"加权，至少量纲一致
                 base = S.quantile([v for v in yv if v is not None], 0.25)
@@ -3268,7 +3309,9 @@ def build_summary(res):
     spc = res.get("spc") or []
     out_of_ctrl = [d for d in spc if d.get("violations")]
     if out_of_ctrl:
-        names = "、".join(d["param_name"] or d["column"] for d in out_of_ctrl[:3])
+        names = "、".join(d["param_name"] or d["column"] for d in out_of_ctrl[:8])
+        if len(out_of_ctrl) > 8:
+            names += " 等"
         s.append("SPC 判异：%d 个参数触发判异规则（%s）" % (len(out_of_ctrl), names))
     else:
         s.append("SPC 判异：未检出违反 Nelson 规则的参数")
@@ -3312,8 +3355,15 @@ def build_summary(res):
         else:
             s.append("支撑不出根因结论：" + QG.insufficient_text(rc, plain=True))
     if res.get("pareto") and res["pareto"].get("top"):
-        s.append("Pareto 首位：%s（占比 %.1f%%）"
-                 % (res["pareto"]["top"]["item"], res["pareto"]["top"]["pct"]))
+        _p = res["pareto"]
+        _pn = str(_p.get("note") or "")
+        # 累计值拆解是「指标贡献」，不是「不良数占比」。实测 S4 曾把
+        # 少子寿命累计最大的中部写成「不良结构首要项」，而真异常在尾部。
+        _measure_sum = ("累计值" in _pn
+                        or ("累计" in _pn and ("非缺陷数" in _pn or "非不良数" in _pn)))
+        s.append("%s：%s（占比 %.1f%%）"
+                 % ("指标累计贡献首位（非不良数）" if _measure_sum else "Pareto 首位",
+                    _p["top"]["item"], _p["top"]["pct"]))
     s.append("结论置信度：%s（%.0f%%）" % (res["confidence"]["level"], res["confidence"]["score"] * 100)
              if res.get("confidence") else "结论置信度：未评估")
     return s
@@ -3996,14 +4046,24 @@ def build_report(res, work, spc_res, corr, assoc, pare, root, gaps, conf,
                     "严重" if v["collinear"] else "正常"] for v in res["vif"][:6]],
                   caption="多重共线性检查（VIF>5 不宜同时作为独立因子进入 DOE）")
 
-    # 7 不良 Pareto
-    s7 = rep.section("7. 不良分类与 Pareto")
+    # 7 Pareto：口径必须与算法一致。连续量按偏离累计拆解时，榜首是贡献最大的
+    # 水平，不是「不良项」；旧标题把两者混为一谈，跟根因报告互相打架。
+    _pare_note = str((pare or {}).get("note") or "")
+    _measure_sum = ("累计值" in _pare_note
+                    or ("累计" in _pare_note
+                        and ("非缺陷数" in _pare_note or "非不良数" in _pare_note)))
+    s7 = rep.section("7. 指标偏离贡献与 Pareto（非不良数）" if _measure_sum
+                     else "7. 不良分类与 Pareto")
     if pare:
-        add_chart(s7, CH.pareto_chart(pare["rows"]), "不良 Pareto（A 类为累计 80% 内的主因）")
-        rep.table(s7, ["不良项", "数量", "占比%", "累计%", "ABC 分级"],
+        add_chart(s7, CH.pareto_chart(pare["rows"]),
+                  "指标偏离贡献 Pareto（连续量，非不良数）" if _measure_sum
+                  else "不良 Pareto（A 类为累计 80% 内的主因）")
+        rep.table(s7, (["拆解项", "偏离贡献", "占比%", "累计%", "ABC 分级"] if _measure_sum
+                       else ["不良项", "数量", "占比%", "累计%", "ABC 分级"]),
                   [[r["item"], _fmt(r["value"], 2), _fmt(r["pct"], 2),
                     _fmt(r["cum_pct"], 2), r["abc"]] for r in pare["rows"]])
-        rep.text(s7, "A 类（累计 80%% 以内）是优先整改对象：%s"
+        rep.text(s7, ("偏离贡献最大项（非不良数，须与根因报告同向解读）：%s"
+                      if _measure_sum else "A 类（累计 80%% 以内）是优先整改对象：%s")
                  % "、".join(r["item"] for r in pare.get("vital_few", [])))
     else:
         rep.text(s7, "数据中未识别到缺陷分类列或分组维度，无法生成 Pareto。")
