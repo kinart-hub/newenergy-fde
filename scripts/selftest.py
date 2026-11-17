@@ -3119,6 +3119,91 @@ def test_doe_safety_boundary():
           str(g5["blockers"])[:80])
 
 
+def test_write_config_concurrent():
+    """P2-1 残留缺口：租户配置读-改-写必须跨线程/跨进程串行、落盘不得撕裂。
+
+    这不是"理论上该加锁"。write_config 曾与 hotswap 一样用 `<path>.tmp-<pid>`：
+    同进程 8 线程共用 PID → 临时文件互相覆盖、半成品被 replace；且整个
+    read-modify-write 无锁 → 8 个不同 patch 并发写，后写覆盖先写，肯定丢字段。
+    旧实现读侧会出现 json 解析失败与字段矛盾，最终配置只剩少数几个 key。
+
+    判据分三层，缺一不可：
+      1. 8 线程各写一个唯一 key → 最终 8 个 key 全在（不丢字段）；
+      2. 并发读期间不得读到撕裂内容（不是只看最终成品）；
+      3. 不得残留 .tmp 临时文件（唯一临时名必须被清理）。
+    """
+    import concurrent.futures as cf
+    from lib import tenancy as TN
+
+    d = tempfile.mkdtemp(prefix="fde_wcfg_")
+    orig_root = TN.root()
+    try:
+        TN.set_root(d)
+        TN.set_tenant("CFG")
+        target = TN.config_path("CFG")
+        # 预置一个版本，确保每个写线程都能读到"已有配置"再做合并
+        TN.write_config({"seed": 1})
+
+        stop = threading.Event()
+        stat = {"reads": 0, "bad": 0}
+
+        def _reader():
+            while not stop.is_set():
+                try:
+                    with io.open(target, "r", encoding="utf-8") as f:
+                        raw = f.read()
+                except (FileNotFoundError, PermissionError):
+                    # scan:keep 这是并发读者，读到"文件正被 replace 抢占"属预期竞争，
+                    # 立即重试即可；记成降级会把正常的 Windows 写锁竞争报成故障。
+                    # 真正的判据是下面的内容自洽校验（stat["bad"]）与最终字段完整性。
+                    continue
+                stat["reads"] += 1
+                try:
+                    obj = json.loads(raw)
+                except Exception:
+                    stat["bad"] += 1
+                    continue
+                if not isinstance(obj, dict) or "updated" not in obj:
+                    stat["bad"] += 1
+
+        def _writer(i):
+            TN.write_config({"key_%d" % i: i})
+
+        rt = threading.Thread(target=_reader, daemon=True)
+        rt.start()
+        fails = []
+        try:
+            with cf.ThreadPoolExecutor(max_workers=8) as ex:
+                for f in cf.as_completed([ex.submit(_writer, i) for i in range(8)]):
+                    try:
+                        f.result()
+                    except Exception as e:
+                        fails.append("%s: %s" % (type(e).__name__, str(e)[:60]))
+        finally:
+            stop.set()
+            rt.join(timeout=3)
+
+        check("write_config：8 线程全部写成功", not fails, str(fails[:2]))
+        check("write_config：并发读确实发生（测试不是空转）",
+              stat["reads"] > 0, "%d 次" % stat["reads"])
+        check("write_config：并发读不得读到撕裂内容",
+              stat["bad"] == 0, "%d/%d 损坏" % (stat["bad"], stat["reads"]))
+
+        final = TN.read_config("CFG")
+        missing = [i for i in range(8) if final.get("key_%d" % i) != i]
+        check("write_config：8 个并发 patch 一个都不能丢",
+              not missing, "丢失 key: %s" % missing)
+
+        leftover = [f for _dp, _ds, fs in os.walk(d) for f in fs if ".tmp" in f]
+        check("write_config：不得残留临时文件", not leftover, str(leftover[:3]))
+    except Exception as e:
+        check("write_config 并发测试未异常", False, "%s: %s" % (type(e).__name__, e))
+    finally:
+        TN.set_tenant(None)
+        TN.set_root(orig_root)
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def test_tenant_path_guard():
     """P2-1 租户路径越界防护（外部审计报告第八节点名的风险项）。
 
@@ -6530,6 +6615,7 @@ if __name__ == "__main__":
     test_d8_closure_gate()
     test_contract_schema()
     test_concurrent_write_integrity()
+    test_write_config_concurrent()
     test_tenant_path_guard()
     test_p1_field_mapping_confidence()
     test_p1_spc_exclusion_review()

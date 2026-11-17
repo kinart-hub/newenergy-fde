@@ -188,18 +188,39 @@ def read_config(tid=None):
 
 
 def write_config(patch, tid=None):
-    """合并式写入租户配置（原子写，不会写坏）"""
+    """合并式写入租户配置（跨进程串行 + 唯一临时名原子落盘）。
+
+    历史缺陷（台账 P2-1，2026-11-17 复核确认；同进程写撕裂在 hotswap 已修过一次，
+    但这条写路径绕开了 hotswap，成了漏网之鱼）：
+      · 临时名 `<path>.tmp-<pid>`：同进程多线程共用同一个 PID，线程 A 写一半时
+        B 会把那个半成品 replace 成正品 —— 实测读侧 70 次字段矛盾、6/8 写线程失败；
+      · 读-改-写序列无锁：两个并发 patch 各读旧值、各合并，后写覆盖先写（丢字段）；
+      · 裸 os.replace：Windows 并发读下约 1/3 概率被拒，而这里没有退避重试。
+    修法：整个 read-modify-write 用 tenancy.lock（mkdir 锁，跨进程）串行；落盘复用
+    hotswap.atomic_write_json（pid+线程 id+随机数唯一临时名、按路径锁、Windows 退避
+    重试、写前过租户闸门）。
+    """
     p = config_path(tid)
     if not p:
         raise RuntimeError("未启用租户，无法写租户配置")
-    os.makedirs(os.path.dirname(p), exist_ok=True)
-    cur = read_config(tid)
-    cur = deep_merge(cur, patch or {})
-    cur["updated"] = time.strftime("%Y-%m-%d %H:%M:%S")
-    tmp = "%s.tmp-%d" % (p, os.getpid())
-    with io.open(tmp, "w", encoding="utf-8") as f:
-        json.dump(cur, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, p)
+    # 显式 tid 与当前上下文不符时不能静默：落盘闸门 hotswap.guard_write_path
+    # 按"当前租户"校验，传一个别家的 tid 会被拒。与其让它变成一个难懂的 IOError，
+    # 不如在这里明确要求先切租户——形参收了就必须真正生效，不做 API 假承诺。
+    if tid is not None and _TENANT is not None and tenant_root(tid) != tenant_root():
+        raise ValueError(
+            "write_config(tid=%r) 的落点不在当前租户 %r 目录：请先 set_tenant(%r) 再写。"
+            % (tid, _TENANT, tid))
+    try:
+        from . import hotswap as HS
+    except Exception:
+        import hotswap as HS                         # noqa
+    # lock() 内部按 tenant_root() 定位 .lock 目录，租户之间天然互不干扰；
+    # 同一租户内严格串行，保证 read-modify-write 不丢字段。
+    with lock("config"):
+        cur = read_config(tid)
+        cur = deep_merge(cur, patch or {})
+        cur["updated"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        HS.atomic_write_json(p, cur)
     return cur
 
 

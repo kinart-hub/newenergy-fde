@@ -432,16 +432,17 @@ def register(profile, key, tenant=None, force=False):
     profile["source"]["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
     data["devices"][key] = profile
 
-    tmp = "%s.tmp-%d" % (target, os.getpid())
-    io.open(tmp, "w", encoding="utf-8").write(json.dumps(data, ensure_ascii=False, indent=2))
+    # 直接走 hotswap 原子写，不再自己拼 `<path>.tmp-<pid>`：
+    # 旧写法虽有 except 兜底，但兜底只在 os.replace 抛异常时触发；
+    # 同进程两线程共用 PID、写同一临时文件且 replace 成功却内容撕裂时，
+    # 异常不发生、兜底不触发，坏内容就悄悄落盘了（与 write_config 同一个坑）。
+    # hotswap 的唯一临时名（pid+线程 id+随机数）+ 按路径锁 + 退避重试把这条
+    # 漏网路径一起收口。
     try:
-        os.replace(tmp, target)
-    except Exception:                                 # Windows 并发读会拒绝 replace
-        try:
-            from . import hotswap as HS
-        except Exception:
-            import hotswap as HS                      # noqa
-        HS.atomic_write_json(target, data)
+        from . import hotswap as HS
+    except Exception:
+        import hotswap as HS                          # noqa
+    HS.atomic_write_json(target, data)
     try:
         DEV.invalidate_cache()
     except Exception as _dg_e:

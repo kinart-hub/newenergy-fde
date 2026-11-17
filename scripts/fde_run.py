@@ -690,6 +690,8 @@ AUDIT_FILES = [
     os.path.join("lib", "hotswap.py"),
     os.path.join("lib", "kbstore.py"),
     os.path.join("lib", "tenancy.py"),
+    # 规则 #92 的 deviceid 同类写路径变异目标；缺了副本里读不到会误报基线失败。
+    os.path.join("lib", "deviceid.py"),
     os.path.join("lib", "eightd.py"),
     os.path.join("lib", "rootcause.py"),
     os.path.join("lib", "views.py"),
@@ -3612,6 +3614,67 @@ def rule_deliver_chain_integrity():
     return _r(True, "", {"ok": True})
 
 
+def rule_write_config_locked():
+    """租户配置写入必须跨进程串行、落盘唯一临时名、显式 tid 真正生效。
+
+    P2-1 台账残留缺口，2026-11-17 复核确认：write_config 曾绕开 hotswap，
+    用 `<path>.tmp-<pid>` + 裸 os.replace 且无锁。同进程多线程共用 PID 会把
+    半成品 replace 成正品；read-modify-write 无锁会丢字段；裸 replace 在
+    Windows 并发读下约 1/3 被拒且无退避。这三点在 hotswap 早已根治，
+    唯独这条写路径是漏网之鱼。本规则钉住三个不变量，任一退化即 FAIL：
+      1. 整个 read-modify-write 被 tenancy.lock 串行（不是只在写时加锁）
+      2. 落盘走 hotswap.atomic_write_json（唯一临时名 + 退避 + 写前闸门）
+      3. 显式 tid 与当前租户不符时明确拒绝（不做收了参数不用的假承诺）
+    """
+    t = _read(os.path.join("lib", "tenancy.py")) or ""
+    if not t:
+        return _r(False, "读不到 lib/tenancy.py")
+
+    def _body(text):
+        i = text.find("def write_config(")
+        if i < 0:
+            return ""
+        j = text.find("\ndef ", i + 1)
+        return text[i:j if j > 0 else len(text)]
+
+    b = _body(t)
+    if not b:
+        return _r(False, "找不到 write_config 函数体")
+    problems = []
+    # 不变量 1：锁必须在读配置之前就拿起，覆盖整个 read-modify-write。
+    if not re.search(r"with lock\([\"']config[\"']\)\s*:", b):
+        problems.append("write_config 未用 tenancy.lock('config') 串行")
+    if "with lock(" in b and b.find("with lock(") > b.find("cur = read_config("):
+        problems.append("锁拿起得太晚（读配置之后才加锁盖不住 read-modify-write）")
+    # 不变量 2：落盘走 hotswap 原子写，不许裸 replace / 裸 .tmp-<pid>。
+    if "atomic_write_json" not in b:
+        problems.append("write_config 未走 hotswap.atomic_write_json 落盘")
+    if re.search(r"os\.replace\(", b) or re.search(r"\.tmp-%d", b):
+        problems.append("write_config 仍有裸 os.replace 或 %d 共 PID 临时名")
+    # 不变量 3：显式 tid 必须真正生效，不能收了不用。
+    if "tenant_root(tid) != tenant_root()" not in b:
+        problems.append("write_config 未校验显式 tid 与当前租户是否一致")
+
+    # 同类根治：deviceid.register 曾与 write_config 一样自拼 .tmp-<pid> + 裸
+    # os.replace（异常兜底盖不住"replace 成功但内容撕裂"的情形）。两条写路径
+    # 必须一起收口到 hotswap，否则"修一个漏一个"的老毛病又犯。
+    dev = _read(os.path.join("lib", "deviceid.py")) or ""
+    if not dev:
+        problems.append("读不到 lib/deviceid.py，无法核对同类写路径")
+    else:
+        di = dev.find("def register(")
+        dj = dev.find("\ndef ", di + 1)
+        db = dev[di:dj if dj > 0 else len(dev)]
+        if re.search(r"\.tmp-%d", db) or re.search(r"os\.replace\(", db):
+            problems.append("deviceid.register 仍有裸临时名/裸 replace（写撕裂漏网）")
+        if "atomic_write_json" not in db:
+            problems.append("deviceid.register 未走 hotswap 原子写")
+
+    if problems:
+        return _r(False, "；".join(problems))
+    return _r(True, "", {"ok": True})
+
+
 def rule_spec_entry_any_shape():
     """规格条目必须按"可能是单版本 dict、也可能是多版本 list"来消费。
 
@@ -5262,6 +5325,32 @@ AUDIT_RULES = [
                   _sub('            if _xref:',
                        '            if False:  # MUTANT: 悬空引用不拦'),
                   os.path.join("lib", "deliver.py"))]),
+    Rule("租户配置写入串行且原子（P2-1 写撕裂残留缺口）",
+         rule_write_config_locked,
+         "write_config 曾绕开 hotswap 用 .tmp-<pid> + 裸 os.replace 且无锁：同进程"
+         "多线程共 PID 写撕裂、read-modify-write 丢字段、Windows 并发读 replace 失败。"
+         "修复后整个读改写走 tenancy.lock 串行、落盘走 hotswap 原子写、显式 tid 真正生效。",
+         os.path.join("lib", "tenancy.py"),
+         [_mutant("锁被摘掉（修复退化：并发丢字段）",
+                  _sub('    with lock("config"):\n        cur = read_config(tid)',
+                       '    if True:\n        cur = read_config(tid)'),
+                  os.path.join("lib", "tenancy.py")),
+          _mutant("落盘退回裸 replace（修复退化：写撕裂）",
+                  _sub('        HS.atomic_write_json(p, cur)',
+                       '        tmp = "%s.tmp-%d" % (p, os.getpid())\n'
+                       '        io.open(tmp, "w", encoding="utf-8").write("{}")\n'
+                       '        os.replace(tmp, p)'),
+                  os.path.join("lib", "tenancy.py")),
+          _mutant("tid 校验被摘掉（修复退化：形参收了不用）",
+                  _sub('    if tid is not None and _TENANT is not None and tenant_root(tid) != tenant_root():',
+                       '    if False:'),
+                  os.path.join("lib", "tenancy.py")),
+          _mutant("deviceid 退回裸写（修复退化：同类写路径漏一个）",
+                  _sub('    HS.atomic_write_json(target, data)',
+                       '    tmp = "%s.tmp-%d" % (target, os.getpid())\n'
+                       '    io.open(tmp, "w", encoding="utf-8").write("{}")\n'
+                       '    os.replace(tmp, target)'),
+                  os.path.join("lib", "deviceid.py"))]),
 ]
 
 

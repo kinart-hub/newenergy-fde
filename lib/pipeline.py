@@ -175,7 +175,7 @@ if EV is not None and EV.__name__ != "lib.events":
 KB = PP.load_knowledge()
 _fmt = RPT._fmt
 
-ANALYZER_VERSION = "2.24.0"
+ANALYZER_VERSION = "2.25.0"
 
 
 # 空数据排查清单。
